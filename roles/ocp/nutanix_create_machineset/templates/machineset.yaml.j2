@@ -1,0 +1,49 @@
+apiVersion: machine.openshift.io/v1beta1
+kind: MachineSet
+metadata:
+  labels:
+    machine.openshift.io/cluster-api-cluster: {{ cluster_id }}
+    machine.openshift.io/cluster-api-machine-role: {{ pool_name }}
+    machine.openshift.io/cluster-api-machine-type: {{ pool_name }}
+  name: {{ machineset_name }}
+  namespace: openshift-machine-api
+spec:
+  replicas: {{ pool_replicas }}
+  selector:
+    matchLabels:
+      machine.openshift.io/cluster-api-cluster: {{ cluster_id }}
+      machine.openshift.io/cluster-api-machineset: {{ machineset_name }}
+  template:
+    metadata:
+      labels:
+        machine.openshift.io/cluster-api-cluster: {{ cluster_id }}
+        machine.openshift.io/cluster-api-machine-role: {{ pool_name }}
+        machine.openshift.io/cluster-api-machine-type: {{ pool_name }}
+        machine.openshift.io/cluster-api-machineset: {{ machineset_name }}
+    spec:
+      metadata:
+        labels:
+{{ pool_labels | to_nice_yaml | indent(10, true) }}
+      taints:
+{{ pool_taints | to_nice_yaml | indent(8, true) }}
+      providerSpec:
+        value:
+          apiVersion: machine.openshift.io/v1
+          kind: NutanixMachineProviderConfig
+          cluster:
+            type: uuid
+            uuid: {{ nutanix.prism_element.uuid }}
+          credentialsSecret:
+            name: nutanix-credentials
+          image:
+            name: {{ nutanix_image_name }}
+            type: name
+          memorySize: {{ pool_memory_gib }}Gi
+          subnets:
+            - type: uuid
+              uuid: {{ nutanix.prism_element.subnet_uuid }}
+          systemDiskSize: {{ pool_disk_gib }}Gi
+          userDataSecret:
+            name: worker-user-data
+          vcpuSockets: {{ pool_vcpu_sockets }}
+          vcpusPerSocket: {{ pool_cores_per_socket }}
