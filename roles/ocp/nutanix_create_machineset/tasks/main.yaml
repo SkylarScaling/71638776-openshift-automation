@@ -1,0 +1,75 @@
+---
+- name: Check if pool configuration is provided
+  ansible.builtin.assert:
+    that:
+      - pool_name is defined
+      - pool_replicas is defined
+      - pool_vcpu_sockets is defined
+      - pool_cores_per_socket is defined
+      - pool_memory_gib is defined
+      - pool_disk_gib is defined
+      - pool_labels is defined
+      - pool_taints is defined
+    msg: "Please define pool_name, pool_replicas, pool_vcpu_sockets, pool_cores_per_socket, pool_memory_gib, pool_disk_gib, pool_labels, and pool_taints."
+
+- name: Skip if requested replicas are 0
+  ansible.builtin.meta: end_host
+  when: pool_replicas | int == 0
+
+- name: Get Cluster Infrastructure Name (Cluster ID)
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ target_kubeconfig }}"
+    api_version: config.openshift.io/v1
+    kind: Infrastructure
+    name: cluster
+  register: infra_info
+
+- name: Set cluster_id fact
+  ansible.builtin.set_fact:
+    cluster_id: "{{ infra_info.resources[0].status.infrastructureName }}"
+
+- name: Get all MachineSets in the machine-api namespace
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ target_kubeconfig }}"
+    api_version: machine.openshift.io/v1beta1
+    kind: MachineSet
+    namespace: openshift-machine-api
+  register: all_machinesets
+
+- name: Extract the first worker MachineSet
+  ansible.builtin.set_fact:
+    worker_machineset: "{{ all_machinesets.resources | selectattr('metadata.name', 'search', '-worker-') | first | default(None) }}"
+
+- name: Verify a worker MachineSet was found
+  ansible.builtin.assert:
+    that:
+      - worker_machineset is not none
+    fail_msg: "Could not find any MachineSets with '-worker-' in the name. Please verify the cluster has provisioned worker nodes and your KUBECONFIG is correct."
+
+- name: Set image_name from the found worker MachineSet
+  ansible.builtin.set_fact:
+    nutanix_image_name: "{{ worker_machineset.spec.template.spec.providerSpec.value.image.name }}"
+
+- name: Set MachineSet name
+  ansible.builtin.set_fact:
+    machineset_name: "{{ cluster_id }}-{{ pool_name }}"
+
+- name: Display dynamically fetched Cluster ID and Image
+  ansible.builtin.debug:
+    msg:
+      - "Cluster ID: {{ cluster_id }}"
+      - "Image: {{ nutanix_image_name }}"
+      - "Building Pool: {{ pool_name }} ({{ pool_replicas }} replicas)"
+
+- name: Apply the generated MachineSet YAML to OpenShift cluster
+  kubernetes.core.k8s:
+    kubeconfig: "{{ target_kubeconfig }}"
+    state: present
+    definition: "{{ lookup('template', 'machineset.yaml.j2') | from_yaml }}"
+
+- name: Display MachineSet application status
+  ansible.builtin.debug:
+    msg: "Created MachineSet {{ machineset_name }} with {{ pool_replicas }} replicas."
+
+- name: Wait for newly created {{ pool_name }} Nodes to be Ready
+  include_tasks: wait_for_nodes.yaml

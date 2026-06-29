@@ -1,0 +1,90 @@
+apiVersion: v1
+baseDomain: {{ base_domain }}
+compute:
+- architecture: amd64
+  hyperthreading: Enabled
+  name: worker
+  platform:
+    nutanix:
+      cpus: {{ install_config.workers.vcpu_sockets | default(2) }}
+      coresPerSocket: {{ install_config.workers.cores_per_socket | default(2) }}
+      memoryMiB: {{ install_config.workers.memory_mib | default(8192) }}
+      osDisk:
+        diskSizeGiB: {{ install_config.workers.disk_gib | default(120) }}
+  replicas: {{ install_config.workers.replicas }}
+controlPlane:
+  architecture: amd64
+  hyperthreading: Enabled
+  name: master
+  platform:
+    nutanix:
+      cpus: {{ install_config.control_plane.vcpu_sockets | default(4) }}
+      coresPerSocket: {{ install_config.control_plane.cores_per_socket | default(2) }}
+      memoryMiB: {{ install_config.control_plane.memory_mib | default(16384) }}
+      osDisk:
+        diskSizeGiB: {{ install_config.control_plane.disk_gib | default(120) }}
+  replicas: 3
+metadata:
+  name: {{ install_config.cluster_name }}
+networking:
+  clusterNetwork:
+{% if install_config.cluster_network is defined %}
+  - cidr: {{ install_config.cluster_network.cidr }}
+    hostPrefix: {{ install_config.cluster_network.prefix }}
+{% else %}
+  - cidr: 10.128.0.0/14
+    hostPrefix: 23
+{% endif %}
+  machineNetwork:
+{% if install_config.machine_network is defined %}
+  - cidr: {{ install_config.machine_network.cidr }}
+{% else %}
+  - cidr: 10.0.0.0/16
+{% endif %}
+{% if install_config.network_type is defined %}
+  networkType: {{ install_config.network_type }}
+{% else %}
+  networkType: OVNKubernetes
+{% endif %}
+  serviceNetwork:
+{% if install_config.service_network is defined %}
+  - {{ install_config.service_network.cidr }}
+{% else %}
+  - 172.30.0.0/16
+{% endif %}
+platform:
+  nutanix:
+    apiVIPs:
+      - {{ nutanix.api_vip }}
+    ingressVIPs:
+      - {{ nutanix.ingress_vip }}
+    prismCentral:
+      endpoint:
+        address: {{ nutanix.prism_central.address }}
+        port: {{ nutanix.prism_central.port | default(9440) }}
+      username: {{ nutanix.prism_central.username }}
+      password: {{ nutanix.prism_central.password }}
+    prismElements:
+      - endpoint:
+          address: {{ nutanix.prism_element.address }}
+          port: {{ nutanix.prism_element.port | default(9440) }}
+        uuid: {{ nutanix.prism_element.uuid }}
+        subnetUUIDs:
+          - {{ nutanix.prism_element.subnet_uuid }}
+{% if nutanix.cluster_os_image is defined %}
+    clusterOSImage: {{ nutanix.cluster_os_image }}
+{% endif %}
+{% if install_config.infra_tags is defined %}
+    userTags:
+      {{ install_config.infra_tags | to_nice_yaml | indent(6) }}
+{% endif %}
+pullSecret: '{{ pull_secret | to_json }}'
+{% if ssh_key is defined %}
+sshKey: |
+   {{ ssh_key }}
+{% endif %}
+{% if nutanix.additional_trust_bundle is defined %}
+additionalTrustBundle: |
+{{ nutanix.additional_trust_bundle | indent(2, true) }}
+additionalTrustBundlePolicy: Always
+{% endif %}
