@@ -16,14 +16,20 @@
     state: present
   become: true
 
-- name: Install Ansible and required Python libraries via pip
+- name: Install Python libraries required by Ansible modules (system-wide)
   ansible.builtin.pip:
     name:
-      - ansible
       - kubernetes
       - openshift
       - boto3
       - setuptools
+    executable: pip3
+  become: true
+
+- name: Install Ansible via pip (user install)
+  ansible.builtin.pip:
+    name:
+      - ansible
     executable: pip3
     extra_args: "--user"
 
