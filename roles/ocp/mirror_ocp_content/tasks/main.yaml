@@ -71,6 +71,24 @@
   retries: 240
   delay: 30
   when: oc_mirror_job is defined and oc_mirror_job.ansible_job_id is defined
+  # rc=4 means partial success: some images failed but IDMS/CatalogSource were still generated.
+  # Common cause: oc-mirror v2 manifest format incompatibility with certain multi-arch images.
+  # Check working-dir/logs/mirroring_errors_*.txt for which images need manual attention.
+  failed_when:
+    - oc_mirror_result.finished
+    - oc_mirror_result.rc not in [0, 4]
+
+- name: Warn if oc-mirror completed with partial failures
+  ansible.builtin.debug:
+    msg:
+      - "WARNING: oc-mirror completed with some image failures (rc=4)."
+      - "IDMS and CatalogSource manifests were still generated and the playbook will continue."
+      - "Check {{ oc_mirror_workspace }}/working-dir/logs/ for the list of failed images."
+      - "Failed images may need to be manually mirrored before spoke provisioning works."
+  when:
+    - oc_mirror_result is defined
+    - oc_mirror_result.rc is defined
+    - oc_mirror_result.rc == 4
 
 - name: Find IDMS files in oc-mirror v2 cluster-resources output
   ansible.builtin.find:
