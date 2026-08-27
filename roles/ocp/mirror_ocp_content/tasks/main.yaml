@@ -43,11 +43,10 @@
 - name: Run oc-mirror to mirror content to registry
   ansible.builtin.command: >
     {{ bin_dir }}/oc-mirror
+    --v2
     --config {{ oc_mirror_workspace }}/imageset-config.yaml
-    docker://{{ mirror_registry_url }}/{{ mirror_base_path }}
-    --dest-skip-tls=false
-    --source-skip-tls=false
     --workspace file://{{ oc_mirror_workspace }}
+    docker://{{ mirror_registry_url }}/{{ mirror_base_path }}
   environment:
     XDG_RUNTIME_DIR: "{{ oc_mirror_workspace }}"
   args:
