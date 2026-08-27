@@ -1,0 +1,22 @@
+---
+- name: Create gitops repos directory
+  ansible.builtin.file:
+    state: directory
+    path: "{{ gitops_repos_dir }}"
+    mode: '0755'
+
+- name: Clone GitOps repositories for disconnected use
+  ansible.builtin.git:
+    repo: "{{ item.url }}"
+    dest: "{{ gitops_repos_dir }}/{{ item.name }}"
+    version: "{{ item.branch }}"
+    force: false
+  loop: "{{ gitops_repos }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Display cloned repositories
+  ansible.builtin.debug:
+    msg:
+      - "Cloned {{ gitops_repos | length }} GitOps repositories to {{ gitops_repos_dir }}"
+      - "{{ gitops_repos | map(attribute='name') | list }}"

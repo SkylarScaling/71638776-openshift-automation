@@ -1,0 +1,76 @@
+---
+# Allows the policy namespace to see clusters in the target set
+apiVersion: cluster.open-cluster-management.io/v1beta2
+kind: ManagedClusterSetBinding
+metadata:
+  name: "{{ spokes_clusterset }}"
+  namespace: {{ sigstore_policy_namespace }}
+spec:
+  clusterSet: "{{ spokes_clusterset }}"
+
+---
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: Placement
+metadata:
+  name: sigstore-featuregate-placement
+  namespace: {{ sigstore_policy_namespace }}
+spec:
+  clusterSets:
+    - "{{ spokes_clusterset }}"
+
+---
+apiVersion: policy.open-cluster-management.io/v1
+kind: Policy
+metadata:
+  name: enable-sigstore-feature-gate
+  namespace: {{ sigstore_policy_namespace }}
+  annotations:
+    policy.open-cluster-management.io/standards: Configuration Baseline
+    policy.open-cluster-management.io/categories: SI System and Information Integrity
+spec:
+  remediationAction: {{ policy_remediation_action }}
+  disabled: false
+  policy-templates:
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: sigstore-featuregate-config
+        spec:
+          remediationAction: {{ policy_remediation_action }}
+          severity: medium
+          object-templates:
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: config.openshift.io/v1
+                kind: FeatureGate
+                metadata:
+                  name: cluster
+                spec:
+                  featureSet: TechPreviewNoUpgrade
+
+---
+apiVersion: policy.open-cluster-management.io/v1beta1
+kind: PolicySet
+metadata:
+  name: sigstore-prerequisites
+  namespace: {{ sigstore_policy_namespace }}
+spec:
+  description: "Enables the TechPreviewNoUpgrade feature set required for cosign ImagePolicy enforcement"
+  policies:
+    - enable-sigstore-feature-gate
+
+---
+apiVersion: policy.open-cluster-management.io/v1
+kind: PlacementBinding
+metadata:
+  name: sigstore-featuregate-placement-binding
+  namespace: {{ sigstore_policy_namespace }}
+placementRef:
+  apiGroup: cluster.open-cluster-management.io
+  kind: Placement
+  name: sigstore-featuregate-placement
+subjects:
+  - apiGroup: policy.open-cluster-management.io
+    kind: PolicySet
+    name: sigstore-prerequisites

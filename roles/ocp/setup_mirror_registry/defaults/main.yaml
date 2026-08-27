@@ -1,0 +1,6 @@
+---
+mirror_registry_dir: "{{ working_dir }}/mirror-registry"
+mirror_registry_hostname: "{{ disconnected.mirror_registry.hostname }}"
+mirror_registry_port: "{{ disconnected.mirror_registry.port | default(8443) }}"
+mirror_registry_init_user: "{{ disconnected.mirror_registry.init_user | default('init') }}"
+mirror_registry_init_password: "{{ disconnected.mirror_registry.init_password }}"

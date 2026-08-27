@@ -1,0 +1,37 @@
+kind: ImageSetConfiguration
+apiVersion: mirror.openshift.io/v1alpha2
+storageConfig:
+  registry:
+    imageURL: {{ mirror_registry_url }}/{{ mirror_base_path }}/oc-mirror-metadata
+    skipTLS: false
+mirror:
+  platform:
+    channels:
+      - name: stable-{{ openshift_version }}
+        minVersion: {{ openshift_version }}.{{ ocp_patch_version }}
+        maxVersion: {{ openshift_version }}.{{ ocp_patch_version }}
+  operators:
+    - catalog: registry.redhat.io/redhat/redhat-operator-index:v{{ openshift_version }}
+      packages:
+{% for operator in disconnected.operators %}
+        - name: {{ operator.name }}
+{% if operator.channels is defined %}
+          channels:
+{% for channel in operator.channels %}
+            - name: {{ channel.name }}
+{% if channel.min_version is defined %}
+              minVersion: "{{ channel.min_version }}"
+{% endif %}
+{% if channel.max_version is defined %}
+              maxVersion: "{{ channel.max_version }}"
+{% endif %}
+{% endfor %}
+{% endif %}
+{% endfor %}
+  additionalImages:
+    - name: docker.io/gitea/gitea:1.22-rootless
+{% if disconnected.additional_images is defined and disconnected.additional_images | length > 0 %}
+{% for image in disconnected.additional_images %}
+    - name: {{ image }}
+{% endfor %}
+{% endif %}

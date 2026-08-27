@@ -1,0 +1,118 @@
+---
+- name: Create oc-mirror workspace directory
+  ansible.builtin.file:
+    state: directory
+    path: "{{ oc_mirror_workspace }}"
+    mode: '0755'
+
+- name: Template ImageSetConfiguration
+  ansible.builtin.template:
+    src: "{{ role_path }}/templates/imageset-config.yaml.j2"
+    dest: "{{ oc_mirror_workspace }}/imageset-config.yaml"
+    mode: '0644'
+
+- name: Display ImageSetConfiguration
+  ansible.builtin.debug:
+    msg: "ImageSetConfiguration written to {{ oc_mirror_workspace }}/imageset-config.yaml"
+
+- name: Check for existing oc-mirror results
+  ansible.builtin.find:
+    paths: "{{ oc_mirror_workspace }}"
+    patterns: "results-*"
+    file_type: directory
+  register: existing_results
+
+- name: Print log path for live monitoring
+  ansible.builtin.debug:
+    msg: >
+      Starting oc-mirror. This may take 30-60+ minutes depending on bandwidth.
+      Monitor progress: tail -f {{ oc_mirror_workspace }}/.oc-mirror.log
+
+- name: Create auth directory for oc-mirror credentials
+  ansible.builtin.file:
+    state: directory
+    path: "{{ oc_mirror_workspace }}/containers"
+    mode: '0700'
+
+- name: Write merged pull secret for oc-mirror authentication
+  ansible.builtin.copy:
+    src: "{{ mirror_registry_dir }}/pull-secret-merged.json"
+    dest: "{{ oc_mirror_workspace }}/containers/auth.json"
+    mode: '0600'
+
+- name: Run oc-mirror to mirror content to registry
+  ansible.builtin.command: >
+    {{ bin_dir }}/oc-mirror
+    --config {{ oc_mirror_workspace }}/imageset-config.yaml
+    docker://{{ mirror_registry_url }}/{{ mirror_base_path }}
+    --dest-skip-tls=false
+    --source-skip-tls=false
+    --workspace file://{{ oc_mirror_workspace }}
+  environment:
+    XDG_RUNTIME_DIR: "{{ oc_mirror_workspace }}"
+  args:
+    chdir: "{{ oc_mirror_workspace }}"
+  async: 7200
+  poll: 0
+  register: oc_mirror_job
+
+- name: Wait for oc-mirror to complete (up to 2 hours)
+  ansible.builtin.async_status:
+    jid: "{{ oc_mirror_job.ansible_job_id }}"
+  register: oc_mirror_result
+  until: oc_mirror_result.finished
+  retries: 240
+  delay: 30
+
+- name: Find the latest oc-mirror results directory
+  ansible.builtin.find:
+    paths: "{{ oc_mirror_workspace }}"
+    patterns: "results-*"
+    file_type: directory
+  register: results_dirs
+
+- name: Set oc-mirror results directory fact
+  ansible.builtin.set_fact:
+    oc_mirror_results_dir: >-
+      {{ (results_dirs.files | sort(attribute='path') | last).path }}
+
+- name: Find IDMS files in results
+  ansible.builtin.find:
+    paths: "{{ oc_mirror_results_dir }}"
+    patterns:
+      - "imageDigestMirrorSet*.yaml"
+      - "imageContentSourcePolicy*.yaml"
+    file_type: file
+  register: idms_files
+
+- name: Find CatalogSource files in results
+  ansible.builtin.find:
+    paths: "{{ oc_mirror_results_dir }}"
+    patterns: "catalogSource-*.yaml"
+    file_type: file
+  register: catalogsource_files
+
+- name: Read all IDMS manifests
+  ansible.builtin.slurp:
+    src: "{{ item.path }}"
+  loop: "{{ idms_files.files }}"
+  register: idms_contents
+
+- name: Read all CatalogSource manifests
+  ansible.builtin.slurp:
+    src: "{{ item.path }}"
+  loop: "{{ catalogsource_files.files }}"
+  register: catalogsource_contents
+
+- name: Set mirroring result facts for downstream roles
+  ansible.builtin.set_fact:
+    oc_mirror_idms_manifests: "{{ idms_contents.results | map(attribute='content') | map('b64decode') | list }}"
+    oc_mirror_catalogsource_manifests: "{{ catalogsource_contents.results | map(attribute='content') | map('b64decode') | list }}"
+
+- name: Display mirroring summary
+  ansible.builtin.debug:
+    msg:
+      - "oc-mirror completed successfully"
+      - "Results directory: {{ oc_mirror_results_dir }}"
+      - "IDMS manifests found: {{ idms_files.files | length }}"
+      - "CatalogSource manifests found: {{ catalogsource_files.files | length }}"

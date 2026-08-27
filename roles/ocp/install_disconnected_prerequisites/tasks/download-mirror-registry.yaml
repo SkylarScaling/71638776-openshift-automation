@@ -1,0 +1,40 @@
+---
+- name: Check if mirror-registry is already installed
+  ansible.builtin.stat:
+    path: "{{ bin_dir }}/mirror-registry"
+  register: mirror_registry_stat
+
+- name: Create temporary directory for mirror-registry download
+  ansible.builtin.tempfile:
+    state: directory
+    suffix: mirror-registry
+  register: mirror_registry_temp_dir
+  when: force_update | bool or not mirror_registry_stat.stat.exists
+
+- name: Download mirror-registry installer
+  ansible.builtin.get_url:
+    url: "{{ mirror_registry_installer_url }}"
+    dest: "{{ mirror_registry_temp_dir.path }}/mirror-registry.tar.gz"
+    mode: '0644'
+  when: force_update | bool or not mirror_registry_stat.stat.exists
+
+- name: Extract mirror-registry installer
+  ansible.builtin.unarchive:
+    src: "{{ mirror_registry_temp_dir.path }}/mirror-registry.tar.gz"
+    dest: "{{ mirror_registry_temp_dir.path }}"
+    remote_src: yes
+  when: force_update | bool or not mirror_registry_stat.stat.exists
+
+- name: Copy mirror-registry binary to bin_dir
+  ansible.builtin.copy:
+    src: "{{ mirror_registry_temp_dir.path }}/mirror-registry"
+    dest: "{{ bin_dir }}/mirror-registry"
+    mode: '0755'
+    remote_src: yes
+  when: force_update | bool or not mirror_registry_stat.stat.exists
+
+- name: Clean up temporary download directory
+  ansible.builtin.file:
+    path: "{{ mirror_registry_temp_dir.path }}"
+    state: absent
+  when: mirror_registry_temp_dir.path is defined

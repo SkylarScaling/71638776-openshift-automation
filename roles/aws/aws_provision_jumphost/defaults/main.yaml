@@ -1,0 +1,10 @@
+---
+jumphost_instance_type: "t3.large"
+jumphost_name: "disconnected-jumphost"
+jumphost_security_group: "disconnected-jumphost-sg"
+jumphost_ssh_user: "ec2-user"
+jumphost_ssh_private_key: "~/.ssh/id_ed25519"
+jumphost_key_pair_name: "{{ jumphost_name }}-key"
+jumphost_mirror_registry_port: "{{ disconnected.mirror_registry.port | default(8443) }}"
+jumphost_volume_size_gb: 500    # oc-mirror workspace can be 50-200 GB; leave headroom
+jumphost_aws_region: "{{ aws.aws_region }}"

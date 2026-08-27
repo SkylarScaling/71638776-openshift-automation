@@ -1,0 +1,86 @@
+---
+# ==============================================================================
+# PLAY 1: Provision EC2 Jumphost
+# Runs locally. Creates the key pair, security group, and EC2 instance, then
+# waits for SSH to become available before handing off to Play 2.
+# ==============================================================================
+- name: Provision EC2 Jumphost
+  hosts: hub_cluster
+  connection: local
+  gather_facts: false
+  vars:
+    jumphost_name: "disconnected-jumphost"
+    jumphost_ssh_user: "ec2-user"
+    jumphost_ssh_private_key: "~/.ssh/id_ed25519"
+    automation_repo_dest: "~/71638776-openshift-automation"
+  tasks:
+    - name: Install AWS CLI (if not already present)
+      ansible.builtin.include_role:
+        name: aws/aws_eip_quota
+      vars:
+        desired_eip_quota: "{{ aws.desired_eip_quota | default(5) }}"
+
+    - name: Provision jumphost EC2 instance
+      ansible.builtin.include_role:
+        name: aws/aws_provision_jumphost
+
+    - name: Register jumphost in dynamic inventory
+      ansible.builtin.add_host:
+        name: "{{ jumphost_name }}"
+        groups: jumphost
+        ansible_host: "{{ jumphost_public_ip }}"
+        ansible_user: "{{ jumphost_ssh_user }}"
+        ansible_ssh_private_key_file: "{{ jumphost_ssh_private_key }}"
+        ansible_ssh_extra_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+        # Pass through all inventory vars so the setup role can access pull_secret, aws, etc.
+        pull_secret: "{{ pull_secret }}"
+        aws: "{{ aws }}"
+        disconnected: "{{ disconnected }}"
+
+# ==============================================================================
+# PLAY 2: Configure the Jumphost
+# Runs on the newly provisioned EC2 instance via SSH. Installs packages,
+# copies credentials, and clones the automation repo.
+# ==============================================================================
+- name: Configure Jumphost
+  hosts: jumphost
+  gather_facts: true
+  tasks:
+    - name: Set up jumphost environment
+      ansible.builtin.include_role:
+        name: aws/setup_jumphost
+
+# ==============================================================================
+# PLAY 3: Print Connection Info
+# ==============================================================================
+- name: Jumphost Ready
+  hosts: hub_cluster
+  connection: local
+  gather_facts: false
+  vars:
+    jumphost_name: "disconnected-jumphost"
+    jumphost_ssh_user: "ec2-user"
+    jumphost_ssh_private_key: "~/.ssh/id_ed25519"
+    automation_repo_dest: "~/71638776-openshift-automation"
+  tasks:
+    - name: Print jumphost connection details
+      ansible.builtin.debug:
+        msg:
+          - "=================================================================="
+          - "Jumphost Provisioned and Ready"
+          - "=================================================================="
+          - "Instance:       {{ jumphost_name }}"
+          - "Public IP:      {{ jumphost_public_ip }}"
+          - "SSH:            ssh -i ~/.ssh/id_ed25519 {{ jumphost_ssh_user }}@{{ jumphost_public_ip }}"
+          - "Automation Repo: {{ automation_repo_dest }}"
+          - "------------------------------------------------------------------"
+          - "Next steps:"
+          - "  1. Update inventory-disconnected.yaml with:"
+          - "       disconnected.mirror_registry.hostname: {{ jumphost_public_ip }}"
+          - "  2. Copy your inventory to the jumphost:"
+          - "       scp -i ~/.ssh/id_ed25519 inventory-disconnected.yaml {{ jumphost_ssh_user }}@{{ jumphost_public_ip }}:{{ automation_repo_dest }}/playbooks/"
+          - "  3. SSH to the jumphost and run:"
+          - "       ssh -i ~/.ssh/id_ed25519 {{ jumphost_ssh_user }}@{{ jumphost_public_ip }}"
+          - "       cd {{ automation_repo_dest }}/playbooks"
+          - "       ansible-playbook hub-spoke-disconnected-setup.yaml -i inventory-disconnected.yaml"
+          - "=================================================================="

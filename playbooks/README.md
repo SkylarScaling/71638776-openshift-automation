@@ -11,6 +11,13 @@
 | `hub-spoke-setup.yaml` | Two-tier Hub+Spoke | Spokes via ACM/Hive |
 | `hub-spoke-ipi-setup.yaml` | Two-tier Hub+Spoke | All clusters via IPI |
 
+### Disconnected Playbooks
+
+| Playbook | Architecture | Spoke Provisioning |
+|---|---|---|
+| `provision-jumphost.yaml` | Jumphost provisioning only | N/A |
+| `hub-spoke-disconnected-setup.yaml` | Two-tier Hub+Spoke (Disconnected) | Spokes via ACM/Hive on AWS |
+
 ### Nutanix AHV Playbooks
 
 | Playbook | Architecture | Spoke Provisioning |
@@ -276,6 +283,252 @@ all:
               instance_type: "m6a.xlarge"
               replicas: "3"
 ```
+
+---
+
+## Provision Jumphost (AWS)
+
+If you don't have a stable jumphost with a public IP, use this playbook to provision an EC2 instance that will serve as the mirror registry host and automation control node.
+
+```bash
+cd playbooks
+ansible-playbook provision-jumphost.yaml -i inventory-disconnected.yaml
+```
+
+This will:
+1. Create an EC2 key pair from your `~/.ssh/id_ed25519.pub`
+2. Create a security group with ports 22 (SSH) and 8443 (mirror registry) open
+3. Launch a RHEL 9 `t3.large` instance with a 500 GB gp3 volume
+4. Install Ansible, Python dependencies, AWS CLI, and `git`
+5. Clone the automation repo to the instance
+6. Copy your pull secret and AWS credentials
+7. Print the SSH command and next steps
+
+After it completes, set `disconnected.mirror_registry.hostname` in your inventory to the printed public IP, then copy the inventory to the jumphost and run the disconnected playbook from there.
+
+**Customization** (override in inventory `all.vars`):
+
+| Variable | Default | Description |
+|---|---|---|
+| `jumphost_instance_type` | `t3.large` | EC2 instance type |
+| `jumphost_name` | `disconnected-jumphost` | EC2 instance Name tag |
+| `jumphost_volume_size_gb` | `500` | Root volume size (oc-mirror workspace can be 50-200 GB) |
+| `automation_repo_url` | GitHub SSH URL | Repo to clone onto the jumphost |
+| `automation_repo_branch` | `main` | Branch to check out |
+
+---
+
+## Disconnected Hub+Spoke (AWS)
+
+The disconnected playbook deploys the same Hub+Spoke architecture in an environment with limited or no internet access. It uses a local mirror registry on the jumphost to host OCP release images and operator catalogs.
+
+### Workflow
+
+The playbook has four phases, controlled via tags:
+
+1. **`jumphost`** — Installs tools (`oc-mirror`, `mirror-registry`), stands up a local Quay-based mirror registry, and mirrors OCP release images + operator catalogs. Run once.
+2. **`hub`** — Provisions the ACM Hub cluster via IPI using mirrored images, applies disconnected cluster configuration (IDMS, CatalogSource, pull secret), installs Day 2 operators via ArgoCD, and configures ACM for disconnected spoke provisioning.
+3. **`spokes`** — Provisions managed clusters via ACM/Hive with disconnected settings. Each spoke receives mirror configuration via ManifestWork.
+4. **`summary`** — Prints connection info for all clusters.
+
+### Prerequisites
+
+In addition to the [standard prerequisites](../README.md):
+
+- The jumphost must have internet access (even limited) to pull images from `registry.redhat.io`, `quay.io`, and `mirror.openshift.com`
+- The jumphost FQDN/IP must be reachable from all cluster nodes (hub and spokes) on the mirror registry port (default: 8443)
+- Sufficient disk space on the jumphost for mirrored content (~50-100 GB depending on operators selected)
+
+### Deploy the complete disconnected environment:
+
+```bash
+cd playbooks
+ansible-playbook hub-spoke-disconnected-setup.yaml -i inventory-disconnected.yaml
+```
+
+### Prepare jumphost only (mirror content first, deploy later):
+
+```bash
+ansible-playbook hub-spoke-disconnected-setup.yaml -i inventory-disconnected.yaml --tags jumphost
+```
+
+### Deploy hub after jumphost is ready:
+
+```bash
+ansible-playbook hub-spoke-disconnected-setup.yaml -i inventory-disconnected.yaml --tags hub
+```
+
+### Add spokes after hub is running:
+
+```bash
+ansible-playbook hub-spoke-disconnected-setup.yaml -i inventory-disconnected.yaml --tags spokes
+# Or a single spoke:
+ansible-playbook hub-spoke-disconnected-setup.yaml -i inventory-disconnected.yaml --tags spokes --limit managed-cluster-3
+```
+
+### Disconnected Hub+Spoke Inventory
+
+The disconnected inventory extends the standard Hub+Spoke inventory with a `disconnected` block in `all.vars`:
+
+```yaml
+all:
+  vars:
+    home_dir: /home/sscaling
+    tmp_dir: "{{ home_dir }}/tmp"
+    openshift_version: "4.20"
+    ocp_patch_version: "13"
+    force_update: true
+    base_domain: "example.com"
+    ssh_key: "{{ lookup('file', '~/.ssh/id_ed25519.pub') }}"
+    pull_secret: "{{ lookup('file', '~/pull-secret.json') | from_json }}"
+    aws:
+      account_id: <aws_account_id>
+      aws_access_key_id: <aws_access_key_id>
+      aws_secret_access_key: <aws_secret_access_key>
+      aws_region: <aws_region>
+    disconnected:
+      mirror_registry:
+        hostname: "jumphost.example.com"     # FQDN reachable by all cluster nodes
+        port: 8443                            # Mirror registry port (default: 8443)
+        init_user: "init"                     # Mirror registry admin user
+        init_password: "<registry_password>"  # Mirror registry admin password
+      mirror_base_path: "ocp4"               # Base path in mirror registry
+      operators:                              # Operators to mirror for the disconnected install
+        - name: advanced-cluster-management
+          channels:
+            - name: "release-2.12"
+        - name: multicluster-engine
+          channels:
+            - name: "stable-2.7"
+        - name: odf-operator
+          channels:
+            - name: "stable-4.17"
+        - name: openshift-gitops-operator
+          channels:
+            - name: "gitops-1.19"
+        - name: quay-operator
+          channels:
+            - name: "stable-3.13"
+      # Optional: additional images to mirror (not part of release or operator catalogs)
+      # additional_images:
+      #   - registry.redhat.io/ubi9/ubi:latest
+      gitea:
+        admin_password: "<gitea_admin_password>"  # Admin password for the internal Git server on the hub
+    smtp:
+      host: "smtp.gmail.com"
+      port: "587"
+      from_address: "<your_email>@gmail.com"
+      require_tls: "true"
+      username: "<your_username>@gmail.com"
+      app_password: "<16 char app password>"
+      default_to: "<default_email>@gmail.com"
+      esp_to: "<esp_rule_email>@gmail.com"
+  children:
+    hub_cluster:
+      hosts:
+        acm-hub:
+          ansible_connection: local
+          ocp_cluster:
+            name: "acm-hub"
+            spokes_clusterset: managed-clusters
+          install_config:
+            cluster_name: "{{ ocp_cluster.name }}"
+            control_plane:
+              instance_type: "m6a.2xlarge"
+            workers:
+              instance_type: "m6a.xlarge"
+              replicas: "3"
+            infra:
+              instance_type: "m6a.4xlarge"
+              replicas: "3"
+            storage:
+              instance_type: "m6a.4xlarge"
+              replicas: "3"
+    managed_clusters:
+      hosts:
+        site-1-cluster:
+          ansible_connection: local
+          gitops_version: "1.19"
+          ocp_cluster:
+            name: "site-1-cluster"
+            parent_clusterset: managed-clusters
+          install_config:
+            cluster_name: "{{ ocp_cluster.name }}"
+            control_plane:
+              instance_type: "m6a.xlarge"
+            workers:
+              instance_type: "m6a.xlarge"
+              replicas: "3"
+        site-2-cluster:
+          ansible_connection: local
+          gitops_version: "1.19"
+          ocp_cluster:
+            name: "site-2-cluster"
+            parent_clusterset: managed-clusters
+          install_config:
+            cluster_name: "{{ ocp_cluster.name }}"
+            control_plane:
+              instance_type: "m6a.xlarge"
+            workers:
+              instance_type: "m6a.xlarge"
+              replicas: "3"
+        site-3-cluster:
+          ansible_connection: local
+          gitops_version: "1.19"
+          ocp_cluster:
+            name: "site-3-cluster"
+            parent_clusterset: managed-clusters
+          install_config:
+            cluster_name: "{{ ocp_cluster.name }}"
+            control_plane:
+              instance_type: "m6a.xlarge"
+            workers:
+              instance_type: "m6a.xlarge"
+              replicas: "3"
+        site-4-cluster:
+          ansible_connection: local
+          gitops_version: "1.19"
+          ocp_cluster:
+            name: "site-4-cluster"
+            parent_clusterset: managed-clusters
+          install_config:
+            cluster_name: "{{ ocp_cluster.name }}"
+            control_plane:
+              instance_type: "m6a.xlarge"
+            workers:
+              instance_type: "m6a.xlarge"
+              replicas: "3"
+        site-5-cluster:
+          ansible_connection: local
+          gitops_version: "1.19"
+          ocp_cluster:
+            name: "site-5-cluster"
+            parent_clusterset: managed-clusters
+          install_config:
+            cluster_name: "{{ ocp_cluster.name }}"
+            control_plane:
+              instance_type: "m6a.xlarge"
+            workers:
+              instance_type: "m6a.xlarge"
+              replicas: "3"
+```
+
+### Inventory variable reference (Disconnected)
+
+**`disconnected` block (top-level `all.vars`):**
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `disconnected.mirror_registry.hostname` | Yes | — | FQDN or IP of the jumphost, reachable by all cluster nodes |
+| `disconnected.mirror_registry.port` | No | `8443` | Mirror registry port |
+| `disconnected.mirror_registry.init_user` | No | `init` | Mirror registry admin username |
+| `disconnected.mirror_registry.init_password` | Yes | — | Mirror registry admin password |
+| `disconnected.mirror_base_path` | No | `ocp4` | Base path prefix in the mirror registry |
+| `disconnected.operators` | Yes | — | List of operators to mirror (see example above) |
+| `disconnected.operators[].name` | Yes | — | Operator package name from the Red Hat catalog |
+| `disconnected.operators[].channels` | No | — | List of channels to mirror (omit to mirror default channel) |
+| `disconnected.additional_images` | No | `[]` | Extra images to mirror beyond release and operators |
+| `disconnected.gitea.admin_password` | No | `R3dH4t!gitea` | Admin password for the Gitea Git server deployed on the hub cluster |
 
 ---
 

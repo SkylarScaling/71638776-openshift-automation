@@ -1,0 +1,42 @@
+---
+- name: Check if repo exists in Gitea - {{ repo_name }}
+  ansible.builtin.uri:
+    url: "https://{{ gitea_route_host }}/api/v1/repos/{{ gitea_org }}/{{ repo_name }}"
+    validate_certs: false
+    status_code: [200, 404]
+    user: "{{ gitea_admin_user }}"
+    password: "{{ gitea_admin_password }}"
+    force_basic_auth: true
+  register: repo_check
+
+- name: Create repo in Gitea - {{ repo_name }}
+  ansible.builtin.uri:
+    url: "https://{{ gitea_route_host }}/api/v1/orgs/{{ gitea_org }}/repos"
+    method: POST
+    validate_certs: false
+    user: "{{ gitea_admin_user }}"
+    password: "{{ gitea_admin_password }}"
+    force_basic_auth: true
+    body_format: json
+    body:
+      name: "{{ repo_name }}"
+      private: false
+      auto_init: false
+    status_code: 201
+  when: repo_check.status == 404
+
+- name: Configure git remote and push - {{ repo_name }}
+  ansible.builtin.shell: |
+    cd {{ gitops_repos_dir }}/{{ repo_name }}
+    REMOTE_URL="https://{{ gitea_admin_user }}:{{ gitea_admin_password }}@{{ gitea_route_host }}/{{ gitea_org }}/{{ repo_name }}.git"
+    if git remote get-url gitea-internal 2>/dev/null; then
+      git remote set-url gitea-internal "${REMOTE_URL}"
+    else
+      git remote add gitea-internal "${REMOTE_URL}"
+    fi
+    git push gitea-internal --all --force
+    git push gitea-internal --tags --force
+  args:
+    executable: /bin/bash
+  environment:
+    GIT_SSL_NO_VERIFY: "true"

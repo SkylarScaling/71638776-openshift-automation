@@ -1,0 +1,3 @@
+---
+mirror_base_path: "{{ disconnected.mirror_base_path | default('ocp4') }}"
+oc_mirror_workspace: "{{ working_dir }}/oc-mirror-workspace"

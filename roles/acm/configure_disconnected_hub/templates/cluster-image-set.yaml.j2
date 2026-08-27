@@ -1,0 +1,9 @@
+apiVersion: hive.openshift.io/v1
+kind: ClusterImageSet
+metadata:
+  name: img{{ openshift_version }}.{{ ocp_patch_version }}-x86-64-appsub
+  labels:
+    channel: stable
+    visible: "true"
+spec:
+  releaseImage: {{ mirror_registry_url }}/{{ mirror_base_path }}/openshift-release-dev/ocp-release:{{ openshift_version }}.{{ ocp_patch_version }}-x86_64

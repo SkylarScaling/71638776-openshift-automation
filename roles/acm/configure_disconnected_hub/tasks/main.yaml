@@ -1,0 +1,39 @@
+---
+- name: Create ClusterImageSet pointing to mirrored release
+  kubernetes.core.k8s:
+    kubeconfig: "{{ target_kubeconfig }}"
+    state: present
+    template: "cluster-image-set.yaml.j2"
+
+- name: Verify ClusterImageSet was created
+  kubernetes.core.k8s_info:
+    kubeconfig: "{{ target_kubeconfig }}"
+    api_version: hive.openshift.io/v1
+    kind: ClusterImageSet
+    name: "img{{ openshift_version }}.{{ ocp_patch_version }}-x86-64-appsub"
+  register: cis_check
+  until:
+    - cis_check.resources | length > 0
+  retries: 5
+  delay: 5
+
+- name: Create ConfigMap with mirror registry CA for spoke provisioning
+  kubernetes.core.k8s:
+    kubeconfig: "{{ target_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: mirror-registry-ca-bundle
+        namespace: open-cluster-management
+      data:
+        ca-bundle.crt: |
+          {{ mirror_registry_ca_bundle | indent(10) }}
+
+- name: Display disconnected hub configuration summary
+  ansible.builtin.debug:
+    msg:
+      - "Disconnected hub configuration complete"
+      - "ClusterImageSet: img{{ openshift_version }}.{{ ocp_patch_version }}-x86-64-appsub"
+      - "Release image: {{ mirror_registry_url }}/{{ mirror_base_path }}/openshift-release-dev/ocp-release:{{ openshift_version }}.{{ ocp_patch_version }}-x86_64"

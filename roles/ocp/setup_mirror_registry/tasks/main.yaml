@@ -1,0 +1,94 @@
+---
+- name: Check if mirror registry is already running
+  ansible.builtin.uri:
+    url: "https://{{ mirror_registry_hostname }}:{{ mirror_registry_port }}/health/instance"
+    validate_certs: false
+    status_code: [200, 301]
+  register: registry_health
+  failed_when: false
+  changed_when: false
+
+- name: Skip mirror registry setup if already running
+  ansible.builtin.debug:
+    msg: "Mirror registry is already running at {{ mirror_registry_hostname }}:{{ mirror_registry_port }}, skipping setup."
+  when: registry_health.status is defined and registry_health.status in [200, 301]
+
+- name: Install and configure mirror registry
+  block:
+    - name: Create mirror registry data directory
+      ansible.builtin.file:
+        state: directory
+        path: "{{ mirror_registry_dir }}"
+        mode: '0755'
+
+    - name: Run mirror-registry installer
+      ansible.builtin.command: >
+        {{ bin_dir }}/mirror-registry install
+        --quayHostname {{ mirror_registry_hostname }}
+        --quayRoot {{ mirror_registry_dir }}
+        --initUser {{ mirror_registry_init_user }}
+        --initPassword {{ mirror_registry_init_password }}
+      register: mirror_registry_install
+      changed_when: "'has been installed' in mirror_registry_install.stdout"
+
+    - name: Display mirror registry install output
+      ansible.builtin.debug:
+        msg: "{{ mirror_registry_install.stdout_lines[-5:] }}"
+  when: registry_health.status is not defined or registry_health.status not in [200, 301]
+
+- name: Set mirror registry CA cert path
+  ansible.builtin.set_fact:
+    mirror_registry_ca_cert_path: "{{ mirror_registry_dir }}/quay-rootCA/rootCA.pem"
+
+- name: Read mirror registry CA certificate
+  ansible.builtin.slurp:
+    src: "{{ mirror_registry_ca_cert_path }}"
+  register: mirror_registry_ca_raw
+
+- name: Set mirror registry facts for downstream roles
+  ansible.builtin.set_fact:
+    mirror_registry_url: "{{ mirror_registry_hostname }}:{{ mirror_registry_port }}"
+    mirror_registry_ca_bundle: "{{ mirror_registry_ca_raw.content | b64decode }}"
+
+- name: Trust the mirror registry CA on the jumphost
+  ansible.builtin.copy:
+    content: "{{ mirror_registry_ca_bundle }}"
+    dest: "/etc/pki/ca-trust/source/anchors/mirror-registry-ca.pem"
+    mode: '0644'
+  become: true
+
+- name: Update CA trust store
+  ansible.builtin.command: update-ca-trust
+  become: true
+  changed_when: true
+
+- name: Build base64 auth token for mirror registry
+  ansible.builtin.set_fact:
+    mirror_registry_auth: "{{ (mirror_registry_init_user ~ ':' ~ mirror_registry_init_password) | b64encode }}"
+
+- name: Build merged pull secret with mirror registry credentials
+  ansible.builtin.set_fact:
+    disconnected_pull_secret: >-
+      {{
+        pull_secret | combine({
+          'auths': pull_secret.auths | combine({
+            mirror_registry_url: {
+              'auth': mirror_registry_auth,
+              'email': ''
+            }
+          })
+        })
+      }}
+
+- name: Write merged pull secret for oc-mirror authentication
+  ansible.builtin.copy:
+    content: "{{ disconnected_pull_secret | to_nice_json }}"
+    dest: "{{ mirror_registry_dir }}/pull-secret-merged.json"
+    mode: '0600'
+
+- name: Display mirror registry connection info
+  ansible.builtin.debug:
+    msg:
+      - "Mirror registry URL:    {{ mirror_registry_url }}"
+      - "CA certificate:         {{ mirror_registry_ca_cert_path }}"
+      - "Merged pull secret:     {{ mirror_registry_dir }}/pull-secret-merged.json"

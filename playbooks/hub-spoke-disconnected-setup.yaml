@@ -1,0 +1,396 @@
+---
+# ==============================================================================
+# JUMPHOST: Prepare Disconnected Environment
+# ==============================================================================
+# Installs tools, stands up a local mirror registry, and mirrors OCP release
+# images + operator catalogs. Run once before deploying any clusters.
+# ==============================================================================
+- name: Jumphost - Prepare Disconnected Environment
+  hosts: hub_cluster
+  connection: local
+  gather_facts: true
+  tags: ['jumphost']
+  tasks:
+    - name: Install disconnected prerequisites (oc, oc-mirror, mirror-registry)
+      ansible.builtin.include_role:
+        name: ocp/install_disconnected_prerequisites
+
+    - name: Setup local mirror registry
+      ansible.builtin.include_role:
+        name: ocp/setup_mirror_registry
+
+    - name: Mirror OCP release images and operator catalogs
+      ansible.builtin.include_role:
+        name: ocp/mirror_ocp_content
+
+    - name: Clone GitOps repositories for internal hosting
+      ansible.builtin.include_role:
+        name: ocp/clone_gitops_repos
+
+    - name: Print jumphost preparation summary
+      ansible.builtin.debug:
+        msg:
+          - "=================================================================="
+          - "Jumphost Preparation Complete"
+          - "=================================================================="
+          - "Mirror Registry:    {{ mirror_registry_url }}"
+          - "CA Certificate:     {{ mirror_registry_ca_cert_path }}"
+          - "IDMS Manifests:     {{ oc_mirror_idms_manifests | length }}"
+          - "CatalogSources:     {{ oc_mirror_catalogsource_manifests | length }}"
+          - "GitOps Repos:       {{ gitops_repos | map(attribute='name') | join(', ') }}"
+          - "=================================================================="
+
+# ==============================================================================
+# HUB: Provision Disconnected ACM Hub (IPI)
+# ==============================================================================
+- name: Hub - Provision Disconnected ACM Hub
+  hosts: hub_cluster
+  connection: local
+  gather_facts: false
+  tags: ['hub']
+  vars:
+    mirror_base_path: "{{ disconnected.mirror_base_path | default('ocp4') }}"
+    mirror_registry_dir: "{{ working_dir }}/mirror-registry"
+    oc_mirror_workspace: "{{ working_dir }}/oc-mirror-workspace"
+  tasks:
+    # ------------------------------------------------------------------
+    # Load disconnected facts from disk (idempotent — supports --tags hub
+    # without requiring --tags jumphost to have run in the same invocation)
+    # ------------------------------------------------------------------
+    - name: Derive mirror registry URL from inventory
+      ansible.builtin.set_fact:
+        mirror_registry_url: "{{ disconnected.mirror_registry.hostname }}:{{ disconnected.mirror_registry.port | default(8443) }}"
+      when: mirror_registry_url is not defined
+
+    - name: Read mirror registry CA certificate from disk
+      ansible.builtin.slurp:
+        src: "{{ mirror_registry_dir }}/quay-rootCA/rootCA.pem"
+      register: _ca_raw
+      when: mirror_registry_ca_bundle is not defined
+
+    - name: Set mirror registry CA bundle fact
+      ansible.builtin.set_fact:
+        mirror_registry_ca_bundle: "{{ _ca_raw.content | b64decode }}"
+      when: mirror_registry_ca_bundle is not defined
+
+    - name: Read merged pull secret from disk
+      ansible.builtin.slurp:
+        src: "{{ mirror_registry_dir }}/pull-secret-merged.json"
+      register: _ps_raw
+      when: disconnected_pull_secret is not defined
+
+    - name: Set merged pull secret fact
+      ansible.builtin.set_fact:
+        disconnected_pull_secret: "{{ _ps_raw.content | b64decode | from_json }}"
+      when: disconnected_pull_secret is not defined
+
+    - name: Find latest oc-mirror results directory
+      ansible.builtin.find:
+        paths: "{{ oc_mirror_workspace }}"
+        patterns: "results-*"
+        file_type: directory
+      register: _results_dirs
+      when: oc_mirror_idms_manifests is not defined
+
+    - name: Set oc-mirror results directory
+      ansible.builtin.set_fact:
+        _oc_mirror_results_dir: "{{ (_results_dirs.files | sort(attribute='path') | last).path }}"
+      when: oc_mirror_idms_manifests is not defined and _results_dirs.files | length > 0
+
+    - name: Find and read IDMS manifests from oc-mirror results
+      block:
+        - name: Find IDMS files
+          ansible.builtin.find:
+            paths: "{{ _oc_mirror_results_dir }}"
+            patterns:
+              - "imageDigestMirrorSet*.yaml"
+              - "imageContentSourcePolicy*.yaml"
+          register: _idms_files
+
+        - name: Read IDMS files
+          ansible.builtin.slurp:
+            src: "{{ item.path }}"
+          loop: "{{ _idms_files.files }}"
+          register: _idms_raw
+
+        - name: Set IDMS manifests fact
+          ansible.builtin.set_fact:
+            oc_mirror_idms_manifests: "{{ _idms_raw.results | map(attribute='content') | map('b64decode') | list }}"
+
+        - name: Find CatalogSource files
+          ansible.builtin.find:
+            paths: "{{ _oc_mirror_results_dir }}"
+            patterns: "catalogSource-*.yaml"
+          register: _cs_files
+
+        - name: Read CatalogSource files
+          ansible.builtin.slurp:
+            src: "{{ item.path }}"
+          loop: "{{ _cs_files.files }}"
+          register: _cs_raw
+
+        - name: Set CatalogSource manifests fact
+          ansible.builtin.set_fact:
+            oc_mirror_catalogsource_manifests: "{{ _cs_raw.results | map(attribute='content') | map('b64decode') | list }}"
+      when: oc_mirror_idms_manifests is not defined and _oc_mirror_results_dir is defined
+
+    # ------------------------------------------------------------------
+    # Provision Hub Cluster
+    # ------------------------------------------------------------------
+    - name: Request Elastic IP Quota Increase
+      ansible.builtin.include_role:
+        name: aws/aws_eip_quota
+
+    - name: Provision Hub via Disconnected IPI
+      ansible.builtin.include_role:
+        name: ocp/aws_provision_disconnected_ocp_ipi
+
+    - name: Set Hub Kubeconfig Path
+      ansible.builtin.set_fact:
+        hub_kubeconfig: "{{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig"
+
+    # ------------------------------------------------------------------
+    # Configure Cluster for Disconnected Operation
+    # ------------------------------------------------------------------
+    - name: Apply Disconnected Cluster Configuration (IDMS, CatalogSource, Pull Secret)
+      ansible.builtin.include_role:
+        name: ocp/configure_disconnected_cluster
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+
+    # ------------------------------------------------------------------
+    # Deploy Internal Git Server (Gitea) on Hub for GitOps repos
+    # ------------------------------------------------------------------
+    - name: Deploy Gitea Internal Git Server
+      ansible.builtin.include_role:
+        name: ocp/deploy_internal_gitserver
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+
+    # ------------------------------------------------------------------
+    # Optional Infrastructure Node Pools
+    # ------------------------------------------------------------------
+    - name: Create Infrastructure Node Pool
+      block:
+        - ansible.builtin.include_role:
+            name: ocp/aws_create_machineset
+          vars:
+            target_kubeconfig: "{{ hub_kubeconfig }}"
+            pool_name: "infra"
+            pool_replicas: "{{ install_config.infra.replicas }}"
+            pool_instance_type: "{{ install_config.infra.instance_type }}"
+            pool_labels:
+              node-role.kubernetes.io/infra: ""
+            pool_taints:
+              - effect: NoSchedule
+                key: node-role.kubernetes.io/infra
+      when: install_config.infra is defined
+
+    - name: Create ODF Storage Node Pool
+      block:
+        - ansible.builtin.include_role:
+            name: ocp/aws_create_machineset
+          vars:
+            target_kubeconfig: "{{ hub_kubeconfig }}"
+            pool_name: "storage"
+            pool_replicas: "{{ install_config.storage.replicas }}"
+            pool_instance_type: "{{ install_config.storage.instance_type }}"
+            pool_labels:
+              cluster.ocs.openshift.io/openshift-storage: ""
+              node-role.kubernetes.io/worker: ""
+              node-role.kubernetes.io/storage: ""
+            pool_taints:
+              - effect: NoSchedule
+                key: node.ocs.openshift.io/storage
+                value: "true"
+      when: install_config.storage is defined
+
+    # ------------------------------------------------------------------
+    # Day 2: GitOps + Operator Installation (from mirrored catalog)
+    # ------------------------------------------------------------------
+    - name: Install Hub GitOps
+      ansible.builtin.include_role:
+        name: ocp/install_openshift_gitops
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+
+    - name: Install Hub Day 2 Config
+      ansible.builtin.include_role:
+        name: "{{ item }}"
+      loop:
+        - argo/apps_install_acm
+        - argo/apps_install_odf
+        - argo/apps_install_mco
+        - argo/apps_install_quay
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+
+    - name: Configure Search Add-on for Hub (local-cluster)
+      ansible.builtin.include_role:
+        name: acm/configure_search_addon
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+        search_target_namespaces:
+          - "local-cluster"
+
+    - name: Wait For Argo Apps to Install
+      ansible.builtin.include_role:
+        name: ocp/waitfor_argo_apps
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+
+    - name: Apply Hive OpenAPI Schema Workaround (MCE 2.11.x)
+      ansible.builtin.include_role:
+        name: acm/workaround_hive_openapi_schema
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+
+    # ------------------------------------------------------------------
+    # ACM Policies for Spoke Configuration
+    # ------------------------------------------------------------------
+    - name: Install ACM Policies
+      ansible.builtin.include_role:
+        name: "{{ item }}"
+      loop:
+        - acm/policy_install_openshift_gitops_1.18
+        - acm/policy_install_openshift_gitops_1.19
+      vars:
+        spokes_clusterset: "{{ ocp_cluster.spokes_clusterset }}"
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+
+    - name: Deploy User Workload Monitoring Policy (optional)
+      ansible.builtin.include_role:
+        name: acm/policy_enable_uwm
+      vars:
+        spokes_clusterset: "{{ ocp_cluster.spokes_clusterset }}"
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+      when: enable_uwm | default(false) | bool
+
+    - name: Configure Managed Cluster Addons
+      ansible.builtin.include_role:
+        name: acm/configure_managed_cluster_addons
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+
+    # ------------------------------------------------------------------
+    # Configure Hub for Disconnected Spoke Provisioning
+    # ------------------------------------------------------------------
+    - name: Configure Disconnected Hub (ClusterImageSet, Mirror Config)
+      ansible.builtin.include_role:
+        name: acm/configure_disconnected_hub
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+
+    - name: Fetch Hub kubeadmin password
+      ansible.builtin.slurp:
+        src: "{{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeadmin-password"
+      register: hub_password_raw
+
+    - name: Print Hub Details
+      ansible.builtin.debug:
+        msg:
+          - "=================================================================="
+          - "Disconnected Hub Cluster: {{ ocp_cluster.name }}"
+          - "Web Console: https://console-openshift-console.apps.{{ ocp_cluster.name }}.{{ base_domain }}/"
+          - "Username:    kubeadmin"
+          - "Password:    {{ hub_password_raw.content | b64decode }}"
+          - "Mirror:      {{ mirror_registry_url }}"
+          - "=================================================================="
+
+# ==============================================================================
+# SPOKES: Provision Disconnected Managed Clusters (via ACM/Hive on Hub)
+# ==============================================================================
+- name: Spokes - Provision Disconnected Managed Clusters
+  hosts: managed_clusters
+  connection: local
+  gather_facts: false
+  tags: ['spokes']
+  vars:
+    mirror_base_path: "{{ disconnected.mirror_base_path | default('ocp4') }}"
+  tasks:
+    - name: Set Hub Kubeconfig
+      ansible.builtin.set_fact:
+        hub_kubeconfig: "{{ install_dir }}/{{ hostvars[groups['hub_cluster'][0]]['ocp_cluster']['name'] }}/auth/kubeconfig"
+
+    - name: Load disconnected facts from Hub host
+      ansible.builtin.set_fact:
+        mirror_registry_url: "{{ hostvars[groups['hub_cluster'][0]]['mirror_registry_url'] | default(disconnected.mirror_registry.hostname ~ ':' ~ (disconnected.mirror_registry.port | default(8443))) }}"
+        mirror_registry_ca_bundle: "{{ hostvars[groups['hub_cluster'][0]]['mirror_registry_ca_bundle'] }}"
+        disconnected_pull_secret: "{{ hostvars[groups['hub_cluster'][0]]['disconnected_pull_secret'] }}"
+        oc_mirror_idms_manifests: "{{ hostvars[groups['hub_cluster'][0]]['oc_mirror_idms_manifests'] }}"
+        oc_mirror_catalogsource_manifests: "{{ hostvars[groups['hub_cluster'][0]]['oc_mirror_catalogsource_manifests'] }}"
+
+    - name: Apply Hive Provisioning Manifests to Hub (Disconnected)
+      ansible.builtin.include_role:
+        name: acm/aws_provision_disconnected_cluster_via_acm
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+        parent_clusterset: "{{ ocp_cluster.parent_clusterset }}"
+
+    - name: Extract Kubeconfig for Managed Cluster
+      ansible.builtin.include_role:
+        name: acm/admin_extract_spoke_credentials
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+
+    - name: Set Spoke Kubeconfig Path
+      ansible.builtin.set_fact:
+        spoke_kubeconfig: "{{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig"
+
+    - name: Apply Disconnected Cluster Configuration to Spoke (IDMS, CatalogSource, Pull Secret)
+      ansible.builtin.include_role:
+        name: ocp/configure_disconnected_cluster
+      vars:
+        target_kubeconfig: "{{ spoke_kubeconfig }}"
+
+    - name: Configure Search Add-on for Managed Cluster on Hub
+      ansible.builtin.include_role:
+        name: acm/configure_search_addon
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+        search_target_namespaces:
+          - "{{ ocp_cluster.name }}"
+
+# ==============================================================================
+# SUMMARY: Final Environment Handoff
+# ==============================================================================
+- name: Deployment Summary
+  hosts: hub_cluster
+  connection: local
+  gather_facts: false
+  tags: ['summary']
+  tasks:
+    - name: Build per-cluster connection info
+      ansible.builtin.set_fact:
+        _summary_lines: "{{ _summary_lines | default([]) + _entry }}"
+      vars:
+        _name: "{{ hostvars[item]['ocp_cluster']['name'] }}"
+        _role: >-
+          {%- if item in groups['hub_cluster'] -%}Hub
+          {%- else -%}Managed Cluster{%- endif -%}
+        _pwd: "{{ lookup('file', install_dir + '/' + _name + '/auth/kubeadmin-password') }}"
+        _entry:
+          - ""
+          - "{{ _role }}:  {{ _name }}"
+          - "  Console:    https://console-openshift-console.apps.{{ _name }}.{{ base_domain }}/"
+          - "  Username:   kubeadmin"
+          - "  Password:   {{ _pwd }}"
+          - "  Kubeconfig: {{ install_dir }}/{{ _name }}/auth/kubeconfig"
+      loop: >-
+        {{
+          groups['hub_cluster'] +
+          (groups['managed_clusters'] | default([]))
+        }}
+
+    - name: Print Full Deployment Summary
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            ['==================================================================',
+             'Disconnected ACM Hub+Spoke Deployment Complete!',
+             '==================================================================',
+             'Mirror Registry: ' ~ (mirror_registry_url | default(disconnected.mirror_registry.hostname ~ ':' ~ (disconnected.mirror_registry.port | default(8443)))),
+             'Internal Gitea:  https://gitea.gitea.' ~ base_domain ~ ' (in-cluster: http://gitea.gitea.svc.cluster.local:3000)'] +
+            _summary_lines +
+            ['', '==================================================================']
+          }}

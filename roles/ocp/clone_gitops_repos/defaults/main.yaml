@@ -1,0 +1,15 @@
+---
+gitops_repos_dir: "{{ working_dir }}/gitops-repos"
+gitops_repos:
+  - name: gitops-install-acm
+    url: "{{ acm_git_repo_url | default('https://github.com/SkylarScaling/gitops-install-acm.git') }}"
+    branch: "{{ acm_git_repo_revision | default('main') }}"
+  - name: gitops-install-odf
+    url: "{{ odf_git_repo_url | default('https://github.com/SkylarScaling/gitops-install-odf.git') }}"
+    branch: "{{ odf_git_repo_revision | default('main') }}"
+  - name: gitops-install-mco
+    url: "{{ mco_git_repo_url | default('https://github.com/SkylarScaling/gitops-install-mco.git') }}"
+    branch: "{{ mco_git_repo_revision | default('main') }}"
+  - name: gitops-install-quay
+    url: "{{ quay_git_repo_url | default('https://github.com/SkylarScaling/gitops-install-quay.git') }}"
+    branch: "{{ quay_git_repo_revision | default('main') }}"

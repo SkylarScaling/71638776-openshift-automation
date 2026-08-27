@@ -1,0 +1,128 @@
+---
+# ==============================================================================
+# SYSTEM PACKAGES
+# ==============================================================================
+- name: Install required system packages
+  ansible.builtin.dnf:
+    name:
+      - git
+      - python3
+      - python3-pip
+      - podman
+      - unzip
+      - tar
+      - wget
+      - jq
+    state: present
+  become: true
+
+- name: Install Ansible and required Python libraries via pip
+  ansible.builtin.pip:
+    name:
+      - ansible
+      - kubernetes
+      - openshift
+      - boto3
+      - setuptools
+    executable: pip3
+    extra_args: "--user"
+
+- name: Install ansible posix collection
+  ansible.builtin.command: >
+    ~/.local/bin/ansible-galaxy collection install ansible.posix
+  changed_when: false
+
+# ==============================================================================
+# SSH KEY — needed to clone from GitHub via SSH
+# ==============================================================================
+- name: Ensure .ssh directory exists
+  ansible.builtin.file:
+    path: "~/.ssh"
+    state: directory
+    mode: '0700'
+
+- name: Copy SSH private key to jumphost
+  ansible.builtin.copy:
+    src: "~/.ssh/id_ed25519"
+    dest: "~/.ssh/id_ed25519"
+    mode: '0600'
+
+- name: Copy SSH public key to jumphost
+  ansible.builtin.copy:
+    src: "~/.ssh/id_ed25519.pub"
+    dest: "~/.ssh/id_ed25519.pub"
+    mode: '0644'
+
+- name: Add github.com to known_hosts
+  ansible.builtin.known_hosts:
+    name: github.com
+    key: "{{ lookup('pipe', 'ssh-keyscan github.com 2>/dev/null') }}"
+    state: present
+
+# ==============================================================================
+# PULL SECRET
+# ==============================================================================
+- name: Write pull secret to jumphost
+  ansible.builtin.copy:
+    content: "{{ pull_secret | to_json }}"
+    dest: "{{ jumphost_pull_secret_dest }}"
+    mode: '0600'
+
+# ==============================================================================
+# AUTOMATION REPO
+# ==============================================================================
+- name: Clone automation repository
+  ansible.builtin.git:
+    repo: "{{ automation_repo_url }}"
+    dest: "{{ automation_repo_dest }}"
+    version: "{{ automation_repo_branch }}"
+    accept_hostkey: true
+
+# ==============================================================================
+# AWS CREDENTIALS
+# ==============================================================================
+- name: Ensure .aws directory exists
+  ansible.builtin.file:
+    path: "~/.aws"
+    state: directory
+    mode: '0700'
+
+- name: Configure AWS credentials
+  ansible.builtin.template:
+    src: aws-credentials.j2
+    dest: "~/.aws/credentials"
+    mode: '0600'
+
+- name: Configure AWS default region
+  ansible.builtin.template:
+    src: aws-config.j2
+    dest: "~/.aws/config"
+    mode: '0600'
+
+# ==============================================================================
+# AWS CLI
+# ==============================================================================
+- name: Download AWS CLI v2
+  ansible.builtin.get_url:
+    url: "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip"
+    dest: "/tmp/awscliv2.zip"
+    mode: '0644'
+
+- name: Extract AWS CLI v2
+  ansible.builtin.unarchive:
+    src: "/tmp/awscliv2.zip"
+    dest: "/tmp"
+    remote_src: true
+
+- name: Install AWS CLI v2
+  ansible.builtin.command: /tmp/aws/install --update
+  become: true
+  changed_when: true
+
+- name: Clean up AWS CLI installer
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /tmp/awscliv2.zip
+    - /tmp/aws

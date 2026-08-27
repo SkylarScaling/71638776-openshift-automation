@@ -1,0 +1,115 @@
+---
+- name: Apply ImageDigestMirrorSet / ImageContentSourcePolicy manifests
+  kubernetes.core.k8s:
+    kubeconfig: "{{ target_kubeconfig }}"
+    state: present
+    definition: "{{ item | from_yaml_all | list }}"
+  loop: "{{ oc_mirror_idms_manifests }}"
+  loop_control:
+    label: "IDMS manifest {{ ansible_loop.index }}"
+
+- name: Disable default OperatorHub catalog sources
+  kubernetes.core.k8s:
+    kubeconfig: "{{ target_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: config.openshift.io/v1
+      kind: OperatorHub
+      metadata:
+        name: cluster
+      spec:
+        disableAllDefaultSources: true
+  when: disable_default_catalog_sources | bool
+
+- name: Apply mirrored CatalogSource manifests from oc-mirror
+  kubernetes.core.k8s:
+    kubeconfig: "{{ target_kubeconfig }}"
+    state: present
+    definition: "{{ item | from_yaml_all | list }}"
+  loop: "{{ oc_mirror_catalogsource_manifests }}"
+  loop_control:
+    label: "CatalogSource manifest {{ ansible_loop.index }}"
+
+- name: Create redhat-operators CatalogSource alias for compatibility
+  kubernetes.core.k8s:
+    kubeconfig: "{{ target_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: operators.coreos.com/v1alpha1
+      kind: CatalogSource
+      metadata:
+        name: redhat-operators
+        namespace: openshift-marketplace
+      spec:
+        sourceType: grpc
+        image: "{{ mirror_registry_url }}/{{ mirror_base_path }}/redhat/redhat-operator-index:v{{ openshift_version }}"
+        displayName: "Red Hat Operators (Mirrored)"
+        publisher: "Red Hat (Mirrored)"
+        updateStrategy:
+          registryPoll:
+            interval: 30m
+
+- name: Update global pull secret with mirror registry credentials
+  kubernetes.core.k8s:
+    kubeconfig: "{{ target_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: pull-secret
+        namespace: openshift-config
+      type: kubernetes.io/dockerconfigjson
+      data:
+        .dockerconfigjson: "{{ disconnected_pull_secret | to_json | b64encode }}"
+
+- name: Wait for MachineConfigPool updates to begin rolling out
+  ansible.builtin.debug:
+    msg: >
+      Disconnected cluster configuration applied. Node MachineConfigPools
+      will begin rolling out with the updated mirror configuration.
+      This may take 10-30 minutes as nodes are rebooted.
+
+- name: Wait for master MachineConfigPool to finish updating
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get mcp master
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.conditions[?(@.type=="Updated")].status}'
+  register: master_mcp
+  until: master_mcp.stdout == "True"
+  retries: 60
+  delay: 30
+  changed_when: false
+
+- name: Wait for worker MachineConfigPool to finish updating
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get mcp worker
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.conditions[?(@.type=="Updated")].status}'
+  register: worker_mcp
+  until: worker_mcp.stdout == "True"
+  retries: 60
+  delay: 30
+  changed_when: false
+
+- name: Verify CatalogSource pods are ready
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get catalogsource -n openshift-marketplace
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{range .items[*]}{.metadata.name}={.status.connectionState.lastObservedState}{"\n"}{end}'
+  register: catalog_status
+  until: >
+    catalog_status.stdout != "" and
+    (catalog_status.stdout_lines | reject('search', '=READY$') | reject('match', '^$') | list | length == 0)
+  retries: 30
+  delay: 10
+  changed_when: false
+
+- name: Display disconnected cluster configuration status
+  ansible.builtin.debug:
+    msg:
+      - "Disconnected cluster configuration complete"
+      - "Mirror registry: {{ mirror_registry_url }}"
+      - "Default catalog sources: {{ 'disabled' if disable_default_catalog_sources else 'enabled' }}"
+      - "MachineConfigPools: updated"
+      - "CatalogSource status: {{ catalog_status.stdout_lines }}"
