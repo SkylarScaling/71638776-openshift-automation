@@ -15,30 +15,37 @@
   ansible.builtin.debug:
     msg: "ImageSetConfiguration written to {{ oc_mirror_workspace }}/imageset-config.yaml"
 
-- name: Check for existing oc-mirror results
+- name: Check for existing oc-mirror v2 results
   ansible.builtin.find:
-    paths: "{{ oc_mirror_workspace }}"
-    patterns: "results-*"
-    file_type: directory
+    paths: "{{ oc_mirror_workspace }}/working-dir/cluster-resources"
+    patterns:
+      - "idms-*.yaml"
+      - "imageDigestMirrorSet*.yaml"
+    file_type: file
   register: existing_results
+  failed_when: false
 
 - name: Print log path for live monitoring
   ansible.builtin.debug:
     msg: >
-      Starting oc-mirror. This may take 30-60+ minutes depending on bandwidth.
+      Starting oc-mirror. This may take 60-120+ minutes depending on bandwidth.
       Monitor progress: tail -f {{ oc_mirror_workspace }}/.oc-mirror.log
+      or: watch -n 5 'du -sh {{ oc_mirror_workspace }}'
+  when: existing_results.files | default([]) | length == 0
 
 - name: Create auth directory for oc-mirror credentials
   ansible.builtin.file:
     state: directory
     path: "{{ oc_mirror_workspace }}/containers"
     mode: '0700'
+  when: existing_results.files | default([]) | length == 0
 
 - name: Write merged pull secret for oc-mirror authentication
   ansible.builtin.copy:
     src: "{{ mirror_registry_dir }}/pull-secret-merged.json"
     dest: "{{ oc_mirror_workspace }}/containers/auth.json"
     mode: '0600'
+  when: existing_results.files | default([]) | length == 0
 
 - name: Run oc-mirror to mirror content to registry
   ansible.builtin.command: >
@@ -54,6 +61,7 @@
   async: 7200
   poll: 0
   register: oc_mirror_job
+  when: existing_results.files | default([]) | length == 0
 
 - name: Wait for oc-mirror to complete (up to 2 hours)
   ansible.builtin.async_status:
@@ -62,6 +70,7 @@
   until: oc_mirror_result.finished
   retries: 240
   delay: 30
+  when: oc_mirror_job is defined and oc_mirror_job.ansible_job_id is defined
 
 - name: Find IDMS files in oc-mirror v2 cluster-resources output
   ansible.builtin.find:
