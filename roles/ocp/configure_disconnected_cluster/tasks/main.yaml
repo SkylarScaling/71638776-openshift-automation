@@ -6,7 +6,8 @@
     definition: "{{ item | from_yaml_all | list }}"
   loop: "{{ oc_mirror_idms_manifests }}"
   loop_control:
-    label: "IDMS manifest {{ ansible_loop.index }}"
+    index_var: _idms_idx
+    label: "IDMS manifest {{ _idms_idx + 1 }}"
 
 - name: Disable default OperatorHub catalog sources
   kubernetes.core.k8s:
@@ -28,7 +29,8 @@
     definition: "{{ item | from_yaml_all | list }}"
   loop: "{{ oc_mirror_catalogsource_manifests }}"
   loop_control:
-    label: "CatalogSource manifest {{ ansible_loop.index }}"
+    index_var: _cs_idx
+    label: "CatalogSource manifest {{ _cs_idx + 1 }}"
 
 - name: Create redhat-operators CatalogSource alias for compatibility
   kubernetes.core.k8s:
