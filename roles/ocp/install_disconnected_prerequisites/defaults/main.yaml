@@ -1,4 +1,4 @@
 ---
 force_update: false
 openshift_mirror_url: "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/{{ openshift_version }}.{{ ocp_patch_version }}"
-mirror_registry_installer_url: "https://github.com/quay/mirror-registry/releases/latest/download/mirror-registry-amd64.tar.gz"
+mirror_registry_installer_url: "https://mirror.openshift.com/pub/cgw/mirror-registry/latest/mirror-registry-amd64.tar.gz"
