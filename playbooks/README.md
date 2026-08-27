@@ -396,19 +396,19 @@ all:
       operators:                              # Operators to mirror for the disconnected install
         - name: advanced-cluster-management
           channels:
-            - name: "release-2.12"
+            - name: "release-2.17"
         - name: multicluster-engine
           channels:
-            - name: "stable-2.7"
+            - name: "stable-2.17"
         - name: odf-operator
           channels:
-            - name: "stable-4.17"
+            - name: "stable-4.22"
         - name: openshift-gitops-operator
           channels:
-            - name: "gitops-1.19"
+            - name: "gitops-1.21"
         - name: quay-operator
           channels:
-            - name: "stable-3.13"
+            - name: "stable-3.17"
       # Optional: additional images to mirror (not part of release or operator catalogs)
       # additional_images:
       #   - registry.redhat.io/ubi9/ubi:latest
