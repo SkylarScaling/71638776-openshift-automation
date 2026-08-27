@@ -12,7 +12,7 @@ mirror:
 {% for operator in disconnected.operators %}
         - name: {{ operator.name }}
 {% if operator.channels is defined %}
-          defaultChannel: {{ operator.default_channel | default(operator.channels[0].name) }}
+          defaultChannel: {{ operator.channels[0].name }}
           channels:
 {% for channel in operator.channels %}
             - name: {{ channel.name }}
