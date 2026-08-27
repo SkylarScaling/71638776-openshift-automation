@@ -17,8 +17,11 @@ spec:
       labels:
         app: gitea
     spec:
+      serviceAccountName: gitea
       securityContext:
+        runAsUser: 1000
         runAsNonRoot: true
+        fsGroup: 1000
         seccompProfile:
           type: RuntimeDefault
       containers:

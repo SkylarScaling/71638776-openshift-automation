@@ -12,6 +12,24 @@
       metadata:
         name: "{{ gitea_namespace }}"
 
+- name: Create Gitea ServiceAccount
+  kubernetes.core.k8s:
+    kubeconfig: "{{ target_kubeconfig }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: gitea
+        namespace: "{{ gitea_namespace }}"
+
+- name: Grant anyuid SCC to Gitea ServiceAccount
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc adm policy add-scc-to-user anyuid
+    -z gitea -n {{ gitea_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+  changed_when: true
+
 - name: Create Gitea PVC
   kubernetes.core.k8s:
     kubeconfig: "{{ target_kubeconfig }}"
