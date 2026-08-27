@@ -84,25 +84,13 @@
         disconnected_pull_secret: "{{ _ps_raw.content | b64decode | from_json }}"
       when: disconnected_pull_secret is not defined
 
-    - name: Find latest oc-mirror results directory
-      ansible.builtin.find:
-        paths: "{{ oc_mirror_workspace }}"
-        patterns: "results-*"
-        file_type: directory
-      register: _results_dirs
-      when: oc_mirror_idms_manifests is not defined
-
-    - name: Set oc-mirror results directory
-      ansible.builtin.set_fact:
-        _oc_mirror_results_dir: "{{ (_results_dirs.files | sort(attribute='path') | last).path }}"
-      when: oc_mirror_idms_manifests is not defined and _results_dirs.files | length > 0
-
-    - name: Find and read IDMS manifests from oc-mirror results
+    - name: Find and read IDMS manifests from oc-mirror v2 cluster-resources output
       block:
         - name: Find IDMS files
           ansible.builtin.find:
-            paths: "{{ _oc_mirror_results_dir }}"
+            paths: "{{ oc_mirror_workspace }}/working-dir/cluster-resources"
             patterns:
+              - "idms-*.yaml"
               - "imageDigestMirrorSet*.yaml"
               - "imageContentSourcePolicy*.yaml"
           register: _idms_files
@@ -119,8 +107,8 @@
 
         - name: Find CatalogSource files
           ansible.builtin.find:
-            paths: "{{ _oc_mirror_results_dir }}"
-            patterns: "catalogSource-*.yaml"
+            paths: "{{ oc_mirror_workspace }}/working-dir/cluster-resources"
+            patterns: "cs-*.yaml"
           register: _cs_files
 
         - name: Read CatalogSource files
@@ -132,7 +120,7 @@
         - name: Set CatalogSource manifests fact
           ansible.builtin.set_fact:
             oc_mirror_catalogsource_manifests: "{{ _cs_raw.results | map(attribute='content') | map('b64decode') | list }}"
-      when: oc_mirror_idms_manifests is not defined and _oc_mirror_results_dir is defined
+      when: oc_mirror_idms_manifests is not defined
 
     # ------------------------------------------------------------------
     # Provision Hub Cluster

@@ -63,31 +63,20 @@
   retries: 240
   delay: 30
 
-- name: Find the latest oc-mirror results directory
+- name: Find IDMS files in oc-mirror v2 cluster-resources output
   ansible.builtin.find:
-    paths: "{{ oc_mirror_workspace }}"
-    patterns: "results-*"
-    file_type: directory
-  register: results_dirs
-
-- name: Set oc-mirror results directory fact
-  ansible.builtin.set_fact:
-    oc_mirror_results_dir: >-
-      {{ (results_dirs.files | sort(attribute='path') | last).path }}
-
-- name: Find IDMS files in results
-  ansible.builtin.find:
-    paths: "{{ oc_mirror_results_dir }}"
+    paths: "{{ oc_mirror_workspace }}/working-dir/cluster-resources"
     patterns:
+      - "idms-*.yaml"
       - "imageDigestMirrorSet*.yaml"
       - "imageContentSourcePolicy*.yaml"
     file_type: file
   register: idms_files
 
-- name: Find CatalogSource files in results
+- name: Find CatalogSource files in oc-mirror v2 cluster-resources output
   ansible.builtin.find:
-    paths: "{{ oc_mirror_results_dir }}"
-    patterns: "catalogSource-*.yaml"
+    paths: "{{ oc_mirror_workspace }}/working-dir/cluster-resources"
+    patterns: "cs-*.yaml"
     file_type: file
   register: catalogsource_files
 
