@@ -25,13 +25,23 @@
     remote_src: yes
   when: force_update | bool or not mirror_registry_stat.stat.exists
 
-- name: Copy mirror-registry binary to bin_dir
-  ansible.builtin.copy:
-    src: "{{ mirror_registry_temp_dir.path }}/mirror-registry"
-    dest: "{{ bin_dir }}/mirror-registry"
-    mode: '0755'
-    remote_src: yes
+- name: Copy all mirror-registry bundle files to bin_dir (flattening any subdirectories)
+  ansible.builtin.shell: |
+    find {{ mirror_registry_temp_dir.path }} -type f | while read f; do
+      cp "$f" {{ bin_dir }}/
+    done
+    chmod 0755 {{ bin_dir }}/mirror-registry
   when: force_update | bool or not mirror_registry_stat.stat.exists
+  changed_when: true
+
+- name: Show what was installed to bin_dir from mirror-registry bundle
+  ansible.builtin.shell: ls -lh {{ bin_dir }}/ | grep -E 'mirror-registry|\.tar$'
+  changed_when: false
+  register: mirror_registry_files_installed
+
+- name: Display installed mirror-registry files
+  ansible.builtin.debug:
+    msg: "{{ mirror_registry_files_installed.stdout_lines }}"
 
 - name: Clean up temporary download directory
   ansible.builtin.file:
