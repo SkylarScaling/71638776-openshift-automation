@@ -37,7 +37,7 @@
           - "CA Certificate:     {{ mirror_registry_ca_cert_path }}"
           - "IDMS Manifests:     {{ oc_mirror_idms_manifests | length }}"
           - "CatalogSources:     {{ oc_mirror_catalogsource_manifests | length }}"
-          - "GitOps Repos:       {{ gitops_repos | map(attribute='name') | join(', ') }}"
+          - "GitOps Repos:       {{ working_dir }}/gitops-repos"
           - "=================================================================="
 
 # ==============================================================================
