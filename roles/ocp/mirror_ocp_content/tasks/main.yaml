@@ -127,7 +127,7 @@
 - name: Display mirroring summary
   ansible.builtin.debug:
     msg:
-      - "oc-mirror completed successfully"
-      - "Results directory: {{ oc_mirror_results_dir }}"
+      - "oc-mirror complete"
+      - "Cluster resources: {{ oc_mirror_workspace }}/working-dir/cluster-resources"
       - "IDMS manifests found: {{ idms_files.files | length }}"
       - "CatalogSource manifests found: {{ catalogsource_files.files | length }}"
