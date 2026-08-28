@@ -22,16 +22,6 @@
         disableAllDefaultSources: true
   when: disable_default_catalog_sources | bool
 
-- name: Apply mirrored CatalogSource manifests from oc-mirror
-  kubernetes.core.k8s:
-    kubeconfig: "{{ target_kubeconfig }}"
-    state: present
-    definition: "{{ item | from_yaml_all | list }}"
-  loop: "{{ oc_mirror_catalogsource_manifests }}"
-  loop_control:
-    index_var: _cs_idx
-    label: "CatalogSource manifest {{ _cs_idx + 1 }}"
-
 - name: Create redhat-operators CatalogSource alias for compatibility
   kubernetes.core.k8s:
     kubeconfig: "{{ target_kubeconfig }}"
