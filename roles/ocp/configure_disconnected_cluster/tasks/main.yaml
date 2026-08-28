@@ -22,7 +22,17 @@
         disableAllDefaultSources: true
   when: disable_default_catalog_sources | bool
 
-- name: Create redhat-operators CatalogSource alias for compatibility
+- name: Extract mirrored operator index image reference from oc-mirror CatalogSource
+  ansible.builtin.set_fact:
+    _mirrored_index_image: >-
+      {{ (oc_mirror_catalogsource_manifests
+          | map('from_yaml_all')
+          | flatten
+          | selectattr('kind', 'equalto', 'CatalogSource')
+          | map(attribute='spec.image')
+          | first) }}
+
+- name: Create redhat-operators CatalogSource using oc-mirror digest reference
   kubernetes.core.k8s:
     kubeconfig: "{{ target_kubeconfig }}"
     state: present
@@ -34,7 +44,7 @@
         namespace: openshift-marketplace
       spec:
         sourceType: grpc
-        image: "{{ mirror_registry_url }}/{{ mirror_base_path }}/redhat/redhat-operator-index:v{{ openshift_version }}"
+        image: "{{ _mirrored_index_image }}"
         displayName: "Red Hat Operators (Mirrored)"
         publisher: "Red Hat (Mirrored)"
         updateStrategy:
