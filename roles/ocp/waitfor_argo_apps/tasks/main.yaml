@@ -24,6 +24,6 @@
     | select('ne', '')
     | reject('search', '=Healthy/Synced$')
     | list | length == 0
-  retries: 40  # Wait up to 20 minutes total (40 * 30 seconds)
+  retries: 120  # Wait up to 60 minutes total (120 * 30 seconds)
   delay: 30
   changed_when: false
