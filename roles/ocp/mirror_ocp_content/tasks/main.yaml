@@ -78,13 +78,102 @@
     - oc_mirror_result.finished
     - oc_mirror_result.rc not in [0, 4]
 
-- name: Warn if oc-mirror completed with partial failures
+# ==============================================================================
+# WORKAROUND: oc-mirror v2 manifest format bug
+#
+# oc-mirror v2 fails with rc=4 on certain multi-arch manifest list images
+# (notably multicluster-engine/hive-rhel9) because it cannot convert the
+# manifest format while preserving digests. This leaves required operator
+# images out of the mirror and causes downstream operator install failures.
+#
+# Workaround: after rc=4, parse the error log and retry failed images using
+# `oc image mirror --filter-by-os=linux/amd64`, which copies only the
+# linux/amd64 layer and avoids the manifest format constraint.
+#
+# NOTE: This produces a single-arch image with a different digest than the
+# original multi-arch manifest. The IDMS from oc-mirror references the
+# original multi-arch digest, so the cluster will fall through to the mirror
+# via tag rather than digest. This is acceptable for operator images.
+#
+# REMOVE THIS BLOCK when the upstream oc-mirror v2 bug is fixed:
+# https://github.com/openshift/oc-mirror/issues (search: "preserve digests manifest list")
+# ==============================================================================
+- name: Find oc-mirror v2 error log
+  ansible.builtin.find:
+    paths: "{{ oc_mirror_workspace }}/working-dir/logs"
+    patterns: "mirroring_errors_*.txt"
+    file_type: file
+  register: oc_mirror_error_logs
+  when:
+    - oc_mirror_result is defined
+    - oc_mirror_result.rc is defined
+    - oc_mirror_result.rc == 4
+
+- name: Extract failed non-bundle image refs from error log
+  ansible.builtin.shell: >
+    grep -oP 'docker://\S+' {{ (oc_mirror_error_logs.files | sort(attribute='path') | last).path }}
+    | grep -v 'operator-bundle'
+    | sort -u
+  register: failed_images_raw
+  when:
+    - oc_mirror_error_logs is defined
+    - oc_mirror_error_logs.files | default([]) | length > 0
+  changed_when: false
+  failed_when: false
+
+- name: Retry failed images with oc image mirror (linux/amd64 only)
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc image mirror
+    {{ item }}
+    {{ mirror_registry_url }}/{{ mirror_base_path }}/{{ item | regex_replace('^docker://[^/]+/', '') | regex_replace('@sha256:[a-f0-9]+$', '') }}
+    --registry-config={{ oc_mirror_workspace }}/containers/auth.json
+    --insecure=true
+    --filter-by-os=linux/amd64
+    --skip-missing=true
+  loop: "{{ failed_images_raw.stdout_lines | default([]) }}"
+  loop_control:
+    label: "{{ item | regex_replace('^docker://', '') | truncate(80, True, '...') }}"
+  when:
+    - failed_images_raw is defined
+    - failed_images_raw.stdout_lines | default([]) | length > 0
+  changed_when: true
+  failed_when: false
+
+- name: Extract failed operator bundle image refs from error log
+  ansible.builtin.shell: >
+    grep -oP 'docker://\S+' {{ (oc_mirror_error_logs.files | sort(attribute='path') | last).path }}
+    | grep 'operator-bundle'
+    | sort -u
+  register: failed_bundles_raw
+  when:
+    - oc_mirror_error_logs is defined
+    - oc_mirror_error_logs.files | default([]) | length > 0
+  changed_when: false
+  failed_when: false
+
+- name: Retry failed operator bundle images
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc image mirror
+    {{ item }}
+    {{ mirror_registry_url }}/{{ mirror_base_path }}/{{ item | regex_replace('^docker://[^/]+/', '') | regex_replace('@sha256:[a-f0-9]+$', '') }}
+    --registry-config={{ oc_mirror_workspace }}/containers/auth.json
+    --insecure=true
+    --skip-missing=true
+  loop: "{{ failed_bundles_raw.stdout_lines | default([]) }}"
+  loop_control:
+    label: "{{ item | regex_replace('^docker://', '') | truncate(80, True, '...') }}"
+  when:
+    - failed_bundles_raw is defined
+    - failed_bundles_raw.stdout_lines | default([]) | length > 0
+  changed_when: true
+  failed_when: false
+
+- name: Display oc-mirror partial failure summary
   ansible.builtin.debug:
     msg:
-      - "WARNING: oc-mirror completed with some image failures (rc=4)."
-      - "IDMS and CatalogSource manifests were still generated and the playbook will continue."
-      - "Check {{ oc_mirror_workspace }}/working-dir/logs/ for the list of failed images."
-      - "Failed images may need to be manually mirrored before spoke provisioning works."
+      - "WARNING: oc-mirror rc=4 — some images failed and were retried with oc image mirror."
+      - "See {{ oc_mirror_workspace }}/working-dir/logs/ for details."
+      - "Remove the workaround block in mirror_ocp_content/tasks/main.yaml when oc-mirror v2 fixes the manifest preservation bug."
   when:
     - oc_mirror_result is defined
     - oc_mirror_result.rc is defined
