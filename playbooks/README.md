@@ -394,18 +394,57 @@ all:
         init_password: "<registry_password>"  # Mirror registry admin password
       mirror_base_path: "ocp4"               # Base path in mirror registry
       operators:                              # Operators to mirror for the disconnected install
+        # ACM and its required MCE sub-operator (versions must be paired)
         - name: advanced-cluster-management
           channels:
-            - name: "release-2.17"
+            - name: "release-2.17"            # verify current channel: oc-mirror --v2 list operators --catalog ... --package advanced-cluster-management
         - name: multicluster-engine
           channels:
-            - name: "stable-2.17"
+            - name: "stable-2.17"             # must match ACM version (ACM 2.17 ships with MCE 2.17)
+        # ODF meta-operator + all sub-operators it installs automatically.
+        # ODF 4.22 uses a meta-operator pattern: odf-operator reads a ConfigMap and
+        # installs each sub-operator from the catalog. All sub-packages must be mirrored.
         - name: odf-operator
           channels:
             - name: "stable-4.22"
+        - name: ocs-operator
+          channels:
+            - name: "stable-4.22"
+        - name: mcg-operator
+          channels:
+            - name: "stable-4.22"
+        - name: rook-ceph-operator
+          channels:
+            - name: "stable-4.22"
+        - name: odf-csi-addons-operator
+          channels:
+            - name: "stable-4.22"
+        - name: cephcsi-operator
+          channels:
+            - name: "stable-4.22"
+        - name: odf-dependencies
+          channels:
+            - name: "stable-4.22"
+        - name: odf-prometheus-operator
+          channels:
+            - name: "stable-4.22"
+        - name: recipe
+          channels:
+            - name: "stable-4.22"
+        - name: ocs-client-operator
+          channels:
+            - name: "stable-4.22"
+        - name: ocs-tls-profiles
+          channels:
+            - name: "stable-4.22"
+        - name: odf-external-snapshotter-operator
+          channels:
+            - name: "stable-4.22"
+        # GitOps operator — mirror both channels if spokes use different versions
         - name: openshift-gitops-operator
           channels:
-            - name: "gitops-1.21"
+            - name: "gitops-1.19"             # hub and newer spokes
+            - name: "gitops-1.18"             # older spokes (match gitops_version per host)
         - name: quay-operator
           channels:
             - name: "stable-3.17"
@@ -524,9 +563,9 @@ all:
 | `disconnected.mirror_registry.init_user` | No | `init` | Mirror registry admin username |
 | `disconnected.mirror_registry.init_password` | Yes | — | Mirror registry admin password |
 | `disconnected.mirror_base_path` | No | `ocp4` | Base path prefix in the mirror registry |
-| `disconnected.operators` | Yes | — | List of operators to mirror (see example above) |
+| `disconnected.operators` | Yes | — | List of operators to mirror (see example above). ODF requires all 12 sub-operator packages — see example inventory. |
 | `disconnected.operators[].name` | Yes | — | Operator package name from the Red Hat catalog |
-| `disconnected.operators[].channels` | No | — | List of channels to mirror (omit to mirror default channel) |
+| `disconnected.operators[].channels` | No | — | List of channels to mirror (omit to mirror default channel). Always specify channels — omitting causes the catalog default to be mirrored, which may pull far more content than intended. |
 | `disconnected.additional_images` | No | `[]` | Extra images to mirror beyond release and operators |
 | `disconnected.gitea.admin_password` | No | `R3dH4t!gitea` | Admin password for the Gitea Git server deployed on the hub cluster |
 
