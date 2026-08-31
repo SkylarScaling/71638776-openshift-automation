@@ -8,3 +8,6 @@
 
 - name: Download mirror-registry installer
   import_tasks: download-mirror-registry.yaml
+
+- name: Download opm (Operator Package Manager)
+  import_tasks: download-opm.yaml

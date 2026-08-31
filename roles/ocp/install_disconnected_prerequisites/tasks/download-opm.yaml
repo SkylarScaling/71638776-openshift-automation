@@ -1,0 +1,22 @@
+---
+- name: Check if opm is already installed
+  ansible.builtin.stat:
+    path: "{{ bin_dir }}/opm"
+  register: opm_stat
+
+- name: Download and extract opm
+  ansible.builtin.unarchive:
+    src: "{{ openshift_mirror_url }}/opm-linux.tar.gz"
+    dest: "{{ bin_dir }}"
+    remote_src: yes
+    mode: '0755'
+  when: force_update | bool or not opm_stat.stat.exists
+
+- name: Verify opm installation
+  ansible.builtin.command: "{{ bin_dir }}/opm version"
+  register: opm_version_output
+  changed_when: false
+
+- name: Display opm version
+  ansible.builtin.debug:
+    msg: "{{ opm_version_output.stdout_lines }}"

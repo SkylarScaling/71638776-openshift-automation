@@ -1,0 +1,6 @@
+---
+catalog_source: "registry.redhat.io/redhat/redhat-operator-index:v{{ openshift_version }}"
+catalog_fbc_workspace: "{{ oc_mirror_workspace }}/working-dir/operator-catalogs/redhat-operator-index"
+catalog_image_dest: "{{ mirror_registry_url }}/{{ mirror_base_path }}/redhat/redhat-operator-index:v{{ openshift_version }}"
+oc_mirror_workspace: "{{ working_dir }}/oc-mirror-workspace"
+mirror_base_path: "{{ disconnected.mirror_base_path | default('ocp4') }}"

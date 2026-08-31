@@ -23,6 +23,10 @@
       ansible.builtin.include_role:
         name: ocp/mirror_ocp_content
 
+    - name: Patch mirrored catalog with any channels missing from OCI snapshot
+      ansible.builtin.include_role:
+        name: ocp/patch_mirrored_catalog
+
     - name: Clone GitOps repositories for internal hosting
       ansible.builtin.include_role:
         name: ocp/clone_gitops_repos

@@ -1,0 +1,206 @@
+---
+# ==============================================================================
+# CATALOG PATCH ROLE
+#
+# oc-mirror v2 captures the OCI image of the operator catalog index. This OCI
+# image may lag behind the GRPC catalog service that Red Hat updates more
+# frequently. Operators specified in disconnected.operators may be missing from
+# the mirrored catalog if their channels were added to the GRPC service after
+# the OCI image snapshot was taken.
+#
+# This role:
+#   1. Checks the mirrored catalog for each specified operator channel
+#   2. For any missing channels, renders the data from the source GRPC catalog
+#      using opm render (which always queries the live GRPC service)
+#   3. Injects the missing channel data into the mirrored FBC workspace
+#   4. Rebuilds and pushes the updated catalog image to the mirror registry
+#
+# Prerequisites: opm must be installed in bin_dir
+# ==============================================================================
+
+- name: Find the mirrored catalog FBC workspace directory
+  ansible.builtin.find:
+    paths: "{{ catalog_fbc_workspace }}"
+    file_type: directory
+    recurse: false
+  register: catalog_digest_dirs
+
+- name: Fail if no mirrored catalog found
+  ansible.builtin.fail:
+    msg: "No mirrored catalog found in {{ catalog_fbc_workspace }}. Run mirror_ocp_content first."
+  when: catalog_digest_dirs.files | length == 0
+
+- name: Set catalog FBC directory fact
+  ansible.builtin.set_fact:
+    _catalog_fbc_dir: "{{ (catalog_digest_dirs.files | sort(attribute='path') | last).path }}/catalog-config"
+
+- name: Check which specified operator channels are missing from mirrored catalog
+  ansible.builtin.shell: |
+    pkg="{{ item.name }}"
+    channel="{{ item.channels[0].name }}"
+    fbc_dir="{{ _catalog_fbc_dir }}/configs/${pkg}"
+    if [ -f "${fbc_dir}/${channel}.json" ]; then
+      echo "present"
+    else
+      echo "missing"
+    fi
+  loop: "{{ disconnected.operators | selectattr('channels', 'defined') | list }}"
+  loop_control:
+    label: "{{ item.name }}/{{ item.channels[0].name }}"
+  register: channel_check_results
+  changed_when: false
+
+- name: Identify missing channels
+  ansible.builtin.set_fact:
+    _missing_channels: >-
+      {{ _missing_channels | default([]) + [
+        {'package': item.item.name, 'channel': item.item.channels[0].name}
+      ] }}
+  loop: "{{ channel_check_results.results }}"
+  when: item.stdout == 'missing'
+  loop_control:
+    label: "{{ item.item.name }}/{{ item.item.channels[0].name }}"
+
+- name: Display channel check results
+  ansible.builtin.debug:
+    msg: >-
+      {{
+        'All specified channels present in mirrored catalog.'
+        if (_missing_channels | default([]) | length == 0)
+        else ('Missing channels that will be patched: ' + (_missing_channels | default([]) | map(attribute='package') | zip(_missing_channels | default([]) | map(attribute='channel')) | map('join', '/') | join(', ')))
+      }}
+
+- name: Patch missing channels into mirrored catalog
+  when: _missing_channels | default([]) | length > 0
+  block:
+    - name: Render missing channel data from source GRPC catalog
+      ansible.builtin.shell: |
+        export XDG_RUNTIME_DIR="{{ oc_mirror_workspace }}"
+        pkg="{{ item.package }}"
+        channel="{{ item.channel }}"
+        out_file="{{ _catalog_fbc_dir }}/configs/${pkg}/${channel}.json"
+
+        echo "Rendering ${pkg}/${channel} from source..."
+        {{ bin_dir }}/opm render "{{ catalog_source }}" \
+          --authfile {{ oc_mirror_workspace }}/containers/auth.json \
+          --output json 2>/dev/null | \
+          python3 -c "
+        import sys, json
+        pkg = '${pkg}'
+        ch = '${channel}'
+        for line in sys.stdin:
+            try:
+                obj = json.loads(line.strip())
+                schema = obj.get('schema','')
+                # Include package definition, channel, and bundles in this channel
+                if schema == 'olm.package' and obj.get('name') == pkg:
+                    print(json.dumps(obj))
+                elif schema == 'olm.channel' and obj.get('package') == pkg and obj.get('name') == ch:
+                    print(json.dumps(obj))
+                elif schema == 'olm.bundle' and obj.get('package') == pkg:
+                    # Only include bundles referenced by this channel
+                    props = obj.get('properties', [])
+                    channels_prop = [p for p in props if p.get('type') == 'olm.channel']
+                    channel_names = [p.get('value',{}).get('name','') for p in channels_prop]
+                    if ch in channel_names:
+                        print(json.dumps(obj))
+            except:
+                pass
+        " > "${out_file}"
+
+        lines=$(wc -l < "${out_file}")
+        if [ "$lines" -eq 0 ]; then
+          echo "ERROR: No data rendered for ${pkg}/${channel} — channel may not exist in source"
+          exit 1
+        fi
+        echo "Rendered ${lines} objects for ${pkg}/${channel} → ${out_file}"
+      loop: "{{ _missing_channels | default([]) }}"
+      loop_control:
+        label: "{{ item.package }}/{{ item.channel }}"
+      register: render_results
+      changed_when: true
+
+    - name: Mirror operator images for patched channels
+      ansible.builtin.shell: |
+        export XDG_RUNTIME_DIR="{{ oc_mirror_workspace }}"
+        pkg="{{ item.package }}"
+        channel="{{ item.channel }}"
+
+        # Extract bundle image references from the rendered FBC
+        rendered="{{ _catalog_fbc_dir }}/configs/${pkg}/${channel}.json"
+        bundle_images=$(python3 -c "
+        import sys, json
+        with open('${rendered}') as f:
+            for line in f:
+                try:
+                    obj = json.loads(line.strip())
+                    if obj.get('schema') == 'olm.bundle':
+                        img = obj.get('image','')
+                        if img:
+                            print(img)
+                        for ri in obj.get('relatedImages', []):
+                            if ri.get('image'):
+                                print(ri['image'])
+                except:
+                    pass
+        " | sort -u)
+
+        # Mirror each bundle image
+        dest_prefix="{{ mirror_registry_url }}/{{ mirror_base_path }}"
+        failed=0
+        while IFS= read -r img; do
+          [ -z "$img" ] && continue
+          # Derive destination path from source image
+          dest_img="${dest_prefix}/$(echo "$img" | sed 's|^[^/]*/||')"
+          {{ bin_dir }}/oc image mirror \
+            "$img" "$dest_img" \
+            --registry-config={{ oc_mirror_workspace }}/containers/auth.json \
+            --insecure=true \
+            --filter-by-os=linux/amd64 \
+            --skip-missing=true 2>&1 | tail -3 || failed=$((failed+1))
+        done <<< "$bundle_images"
+        echo "Image mirroring complete (${failed} failures)"
+      loop: "{{ _missing_channels | default([]) }}"
+      loop_control:
+        label: "{{ item.package }}/{{ item.channel }}"
+      changed_when: true
+      failed_when: false
+
+    - name: Build updated catalog image from patched FBC
+      ansible.builtin.shell: |
+        fbc_dir="{{ _catalog_fbc_dir }}/configs"
+        tmp_dir="{{ oc_mirror_workspace }}/catalog-build-tmp"
+        mkdir -p "${tmp_dir}"
+
+        # Generate Dockerfile for catalog image
+        {{ bin_dir }}/opm generate dockerfile "${fbc_dir}" \
+          --binary-image "{{ mirror_registry_url }}/{{ mirror_base_path }}/openshift4/ose-operator-registry:v{{ openshift_version }}" \
+          -d "${tmp_dir}/index.Dockerfile" 2>/dev/null
+
+        # Build the catalog image
+        podman build \
+          -f "${tmp_dir}/index.Dockerfile" \
+          -t "{{ catalog_image_dest }}" \
+          "${fbc_dir}" \
+          --authfile {{ oc_mirror_workspace }}/containers/auth.json 2>&1
+
+        echo "Catalog image built: {{ catalog_image_dest }}"
+      register: build_result
+      changed_when: true
+
+    - name: Push updated catalog image to mirror registry
+      ansible.builtin.shell: |
+        podman push "{{ catalog_image_dest }}" \
+          --authfile {{ oc_mirror_workspace }}/containers/auth.json \
+          --tls-verify=false 2>&1
+        echo "Catalog pushed: {{ catalog_image_dest }}"
+      register: push_result
+      changed_when: true
+
+    - name: Display catalog patch summary
+      ansible.builtin.debug:
+        msg:
+          - "Catalog patched with missing channels:"
+          - "{{ _missing_channels | default([]) | map(attribute='package') | zip(_missing_channels | default([]) | map(attribute='channel')) | map('join', '/') | list }}"
+          - "Catalog image pushed to: {{ catalog_image_dest }}"
+          - "Restart the redhat-operators CatalogSource pod in the cluster to pick up the changes."
