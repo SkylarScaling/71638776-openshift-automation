@@ -82,8 +82,8 @@
 
         echo "Rendering ${pkg}/${channel} from source..."
         {{ bin_dir }}/opm render "{{ catalog_source }}" \
-          --authfile {{ oc_mirror_workspace }}/containers/auth.json \
           --output json 2>/dev/null | \
+          jq -c '.' | \
           python3 -c "
         import sys, json
         pkg = '${pkg}'
