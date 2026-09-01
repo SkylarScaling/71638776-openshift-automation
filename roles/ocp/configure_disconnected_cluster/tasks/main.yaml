@@ -1,19 +1,18 @@
 ---
 - name: Apply ImageDigestMirrorSet / ImageContentSourcePolicy manifests
-  kubernetes.core.k8s:
-    kubeconfig: "{{ target_kubeconfig }}"
-    state: present
-    definition: "{{ item | from_yaml_all | list }}"
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: "{{ item }}"
   loop: "{{ oc_mirror_idms_manifests }}"
   loop_control:
     index_var: _idms_idx
     label: "IDMS manifest {{ _idms_idx + 1 }}"
+  changed_when: true
 
 - name: Disable default OperatorHub catalog sources
-  kubernetes.core.k8s:
-    kubeconfig: "{{ target_kubeconfig }}"
-    state: present
-    definition:
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
       apiVersion: config.openshift.io/v1
       kind: OperatorHub
       metadata:
@@ -21,6 +20,7 @@
       spec:
         disableAllDefaultSources: true
   when: disable_default_catalog_sources | bool
+  changed_when: true
 
 - name: Extract mirrored operator index image reference from oc-mirror CatalogSource
   ansible.builtin.set_fact:
@@ -33,10 +33,9 @@
           | first) }}
 
 - name: Create redhat-operators CatalogSource using oc-mirror digest reference
-  kubernetes.core.k8s:
-    kubeconfig: "{{ target_kubeconfig }}"
-    state: present
-    definition:
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
       apiVersion: operators.coreos.com/v1alpha1
       kind: CatalogSource
       metadata:
@@ -50,12 +49,12 @@
         updateStrategy:
           registryPoll:
             interval: 30m
+  changed_when: true
 
 - name: Update global pull secret with mirror registry credentials
-  kubernetes.core.k8s:
-    kubeconfig: "{{ target_kubeconfig }}"
-    state: present
-    definition:
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
       apiVersion: v1
       kind: Secret
       metadata:
@@ -64,6 +63,8 @@
       type: kubernetes.io/dockerconfigjson
       data:
         .dockerconfigjson: "{{ disconnected_pull_secret | to_json | b64encode }}"
+  changed_when: true
+  no_log: true
 
 - name: Wait for MachineConfigPool updates to begin rolling out
   ansible.builtin.debug:
