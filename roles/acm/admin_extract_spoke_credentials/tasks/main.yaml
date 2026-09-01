@@ -18,11 +18,6 @@
   delay: 10
   until: (_kubeconfig_secret_raw.stdout | from_json).items | length > 0
 
-- name: Set kubeconfig_secret fact
-  ansible.builtin.set_fact:
-    kubeconfig_secret:
-      resources: "{{ (_kubeconfig_secret_raw.stdout | from_json).items }}"
-
 - name: Extract Spoke Kubeadmin Password from Parent Hub via Labels
   ansible.builtin.shell: >
     {{ bin_dir }}/oc get secret
@@ -36,19 +31,14 @@
   delay: 10
   until: (_password_secret_raw.stdout | from_json).items | length > 0
 
-- name: Set password_secret fact
-  ansible.builtin.set_fact:
-    password_secret:
-      resources: "{{ (_password_secret_raw.stdout | from_json).items }}"
-
 - name: Write Spoke kubeconfig locally
   ansible.builtin.copy:
-    content: "{{ kubeconfig_secret.resources[0].data.kubeconfig | b64decode }}"
+    content: "{{ (_kubeconfig_secret_raw.stdout | from_json).items[0].data.kubeconfig | b64decode }}"
     dest: "{{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig"
     mode: '0600'
 
 - name: Write Spoke kubeadmin password locally
   ansible.builtin.copy:
-    content: "{{ password_secret.resources[0].data.password | b64decode }}"
+    content: "{{ (_password_secret_raw.stdout | from_json).items[0].data.password | b64decode }}"
     dest: "{{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeadmin-password"
     mode: '0600'

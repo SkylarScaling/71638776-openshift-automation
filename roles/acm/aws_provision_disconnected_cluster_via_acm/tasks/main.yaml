@@ -8,16 +8,11 @@
   register: _image_sets_raw
   changed_when: false
 
-- name: Set available_image_sets fact
-  ansible.builtin.set_fact:
-    available_image_sets:
-      resources: "{{ (_image_sets_raw.stdout | from_json).items }}"
-
 - name: Dynamically set the ClusterImageSet fact based on inventory version
   ansible.builtin.set_fact:
     spoke_clusterimageset_name: >-
       {{
-        available_image_sets.resources |
+        (_image_sets_raw.stdout | from_json).items |
         selectattr('metadata.name', 'search', openshift_version ~ '.' ~ ocp_patch_version) |
         map(attribute='metadata.name') |
         first | default('')

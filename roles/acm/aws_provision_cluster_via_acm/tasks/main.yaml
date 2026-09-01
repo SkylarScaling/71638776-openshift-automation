@@ -8,16 +8,11 @@
   register: _image_sets_raw
   changed_when: false
 
-- name: Set available_image_sets fact
-  ansible.builtin.set_fact:
-    available_image_sets:
-      resources: "{{ (_image_sets_raw.stdout | from_json).items }}"
-
 - name: Dynamically set the ClusterImageSet fact based on inventory version
   ansible.builtin.set_fact:
     spoke_clusterimageset_name: >-
       {{
-        available_image_sets.resources |
+        (_image_sets_raw.stdout | from_json).items |
         selectattr('metadata.name', 'search', openshift_version ~ '.' ~ ocp_patch_version) |
         map(attribute='metadata.name') |
         first | default('')
@@ -158,12 +153,6 @@
   retries: 30
   delay: 10
 
-- name: Set hive_kubeconfig_secret fact
-  ansible.builtin.set_fact:
-    hive_kubeconfig_secret:
-      resources: "{{ (_hive_kubeconfig_raw.stdout | from_json).items }}"
-  when: is_regional_hub | default(false) | bool
-
 - name: Create auto-import-secret for Hosted Mode
   ansible.builtin.shell:
     cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
@@ -175,7 +164,6 @@
         namespace: "{{ ocp_cluster.name }}"
       type: Opaque
       data:
-        # We pass the raw base64 data directly from the Hive secret
-        kubeconfig: "{{ hive_kubeconfig_secret.resources[0].data.kubeconfig }}"
+        kubeconfig: "{{ (_hive_kubeconfig_raw.stdout | from_json).items[0].data.kubeconfig }}"
   changed_when: true
   when: is_regional_hub | default(false) | bool
