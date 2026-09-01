@@ -25,33 +25,33 @@
   ansible.builtin.set_fact:
     cluster_id: "{{ _infra_name.stdout }}"
 
-- name: Get all MachineSets in the machine-api namespace
+- name: Get first worker MachineSet name
   ansible.builtin.shell: >
     {{ bin_dir }}/oc get machineset -n openshift-machine-api
     --kubeconfig {{ target_kubeconfig }}
-    -o json 2>/dev/null || echo '{"items":[]}'
-  register: _machinesets_raw
+    --no-headers -o custom-columns=NAME:.metadata.name
+    | grep '\-worker\-' | head -1
+  register: _worker_ms_name
   changed_when: false
-
-- name: Extract the first worker MachineSet
-  ansible.builtin.set_fact:
-    worker_machineset: >-
-      {{
-        (_machinesets_raw.stdout | from_json)['items']
-        | selectattr('metadata.name', 'search', '-worker-')
-        | first
-        | default(None)
-      }}
 
 - name: Verify a worker MachineSet was found
   ansible.builtin.assert:
     that:
-      - worker_machineset is not none
+      - _worker_ms_name.stdout != ""
     fail_msg: "Could not find any MachineSets with '-worker-' in the name. Please verify the cluster has provisioned worker nodes and your KUBECONFIG is correct."
 
-- name: Set ami_id from the found worker MachineSet
+- name: Get AMI ID from worker MachineSet
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get machineset {{ _worker_ms_name.stdout | trim }}
+    -n openshift-machine-api
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.spec.template.spec.providerSpec.value.ami.id}'
+  register: _ami_id_raw
+  changed_when: false
+
+- name: Set ami_id fact
   ansible.builtin.set_fact:
-    ami_id: "{{ worker_machineset.spec.template.spec.providerSpec.value.ami.id }}"
+    ami_id: "{{ _ami_id_raw.stdout }}"
 
 - name: Display dynamically fetched Cluster ID and AMI
   ansible.builtin.debug:
