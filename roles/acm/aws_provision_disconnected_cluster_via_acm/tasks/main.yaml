@@ -68,12 +68,10 @@
     {{ bin_dir }}/oc get clusterdeployment {{ ocp_cluster.name }}
     -n {{ ocp_cluster.name }}
     --kubeconfig {{ target_kubeconfig }}
-    -o json 2>/dev/null || echo '{}'
-  register: _cd_raw
+    -o jsonpath='{.status.provisionRef.name}' 2>/dev/null || true
+  register: _cd_provision_ref
   changed_when: false
-  until: >
-    (_cd_raw.stdout | from_json).status is defined and
-    (_cd_raw.stdout | from_json).status.provisionRef is defined
+  until: _cd_provision_ref.stdout != ""
   retries: 30
   delay: 10
 
@@ -82,33 +80,30 @@
     {{ bin_dir }}/oc get clusterdeployment {{ ocp_cluster.name }}
     -n {{ ocp_cluster.name }}
     --kubeconfig {{ target_kubeconfig }}
-    -o json 2>/dev/null || echo '{}'
-  register: _cd_raw
+    -o jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}' 2>/dev/null || true
+  register: _cd_conditions
   changed_when: false
   until: >
-    (_cd_raw.stdout | from_json).status is defined and
-    (
-      ((_cd_raw.stdout | from_json).status.conditions | default([]) | selectattr('type', 'equalto', 'Provisioned') | selectattr('status', 'equalto', 'True') | list | length > 0) or
-      ((_cd_raw.stdout | from_json).status.conditions | default([]) | selectattr('type', 'equalto', 'ProvisionFailed') | selectattr('status', 'equalto', 'True') | list | length > 0)
-    )
+    ('Provisioned=True' in _cd_conditions.stdout) or
+    ('ProvisionFailed=True' in _cd_conditions.stdout)
   retries: 90
   delay: 60
 
-- name: Set cd_status fact for downstream tasks
-  ansible.builtin.set_fact:
-    cd_status:
-      resources:
-        - "{{ _cd_raw.stdout | from_json }}"
+- name: Get provisioning failure details
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get clusterdeployment {{ ocp_cluster.name }}
+    -n {{ ocp_cluster.name }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='Reason: {.status.conditions[?(@.type=="ProvisionFailed")].reason}{"\nMessage: "}{.status.conditions[?(@.type=="ProvisionFailed")].message}'
+    2>/dev/null || true
+  register: _cd_fail_details
+  changed_when: false
+  when: "'ProvisionFailed=True' in _cd_conditions.stdout"
 
 - name: Fail immediately if provisioning errored out
   ansible.builtin.fail:
-    msg: >
-      Provisioning for {{ ocp_cluster.name }} failed!
-      Reason: {{ (cd_status.resources[0].status.conditions | selectattr('type', 'equalto', 'ProvisionFailed') | first).reason | default('Unknown') }}
-      Message: {{ (cd_status.resources[0].status.conditions | selectattr('type', 'equalto', 'ProvisionFailed') | first).message | default('No details provided by Hive.') }}
-  when:
-    - cd_status.resources[0].status.conditions is defined
-    - cd_status.resources[0].status.conditions | selectattr('type', 'equalto', 'ProvisionFailed') | selectattr('status', 'equalto', 'True') | list | length > 0
+    msg: "Provisioning for {{ ocp_cluster.name }} failed!\n{{ _cd_fail_details.stdout | default('No details available.') }}"
+  when: "'ProvisionFailed=True' in _cd_conditions.stdout"
 
 - name: Ensure Observability Namespace exists on the Spoke via ManifestWork
   ansible.builtin.shell:
