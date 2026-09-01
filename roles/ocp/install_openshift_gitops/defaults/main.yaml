@@ -1,6 +1,13 @@
 ---
 # The update channel to subscribe to (e.g., gitops-1.10, gitops-1.11, latest)
-gitops_operator_channel: "gitops-1.21"
+gitops_operator_channel: >-
+  {{
+    ((disconnected | default({})).operators | default([])
+     | selectattr('name', 'equalto', 'openshift-gitops-operator')
+     | first
+     | default({'channels': [{'name': 'gitops-1.21'}]})
+    ).channels[0].name
+  }}
 
 # The name of the CatalogSource
 gitops_operator_source: "redhat-operators"
