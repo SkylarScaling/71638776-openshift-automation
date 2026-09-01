@@ -12,7 +12,7 @@
   ansible.builtin.set_fact:
     spoke_clusterimageset_name: >-
       {{
-        (_image_sets_raw.stdout | from_json).items |
+        (_image_sets_raw.stdout | from_json)['items'] |
         selectattr('metadata.name', 'search', openshift_version ~ '.' ~ ocp_patch_version) |
         map(attribute='metadata.name') |
         first | default('')

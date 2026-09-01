@@ -12,7 +12,7 @@
   ansible.builtin.set_fact:
     spoke_clusterimageset_name: >-
       {{
-        (_image_sets_raw.stdout | from_json).items |
+        (_image_sets_raw.stdout | from_json)['items'] |
         selectattr('metadata.name', 'search', openshift_version ~ '.' ~ ocp_patch_version) |
         map(attribute='metadata.name') |
         first | default('')
@@ -146,7 +146,7 @@
   register: _hive_kubeconfig_raw
   changed_when: false
   when: is_regional_hub | default(false) | bool
-  until: (_hive_kubeconfig_raw.stdout | from_json).items | length > 0
+  until: (_hive_kubeconfig_raw.stdout | from_json)['items'] | length > 0
   retries: 30
   delay: 10
 
@@ -161,6 +161,6 @@
         namespace: "{{ ocp_cluster.name }}"
       type: Opaque
       data:
-        kubeconfig: "{{ (_hive_kubeconfig_raw.stdout | from_json).items[0].data.kubeconfig }}"
+        kubeconfig: "{{ (_hive_kubeconfig_raw.stdout | from_json)['items'][0].data.kubeconfig }}"
   changed_when: true
   when: is_regional_hub | default(false) | bool

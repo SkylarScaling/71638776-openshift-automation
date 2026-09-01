@@ -37,7 +37,7 @@
   ansible.builtin.set_fact:
     worker_machineset: >-
       {{
-        (_machinesets_raw.stdout | from_json).items
+        (_machinesets_raw.stdout | from_json)['items']
         | selectattr('metadata.name', 'search', '-worker-')
         | first
         | default(None)

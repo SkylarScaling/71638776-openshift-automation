@@ -8,8 +8,8 @@
   register: _machine_status_raw
   changed_when: false
   until: >
-    (_machine_status_raw.stdout | from_json).items | length >= pool_replicas | int and
-    ((_machine_status_raw.stdout | from_json).items | selectattr('status.phase', 'defined') |
+    (_machine_status_raw.stdout | from_json)['items'] | length >= pool_replicas | int and
+    ((_machine_status_raw.stdout | from_json)['items'] | selectattr('status.phase', 'defined') |
      selectattr('status.phase', 'equalto', 'Running') | list | length) >= pool_replicas | int
   retries: 360 # Check every 10 seconds for 60 minutes
   delay: 10
@@ -23,8 +23,8 @@
   register: _node_status_raw
   changed_when: false
   until: >
-    (_node_status_raw.stdout | from_json).items | length >= pool_replicas | int and
-    ((_node_status_raw.stdout | from_json).items | selectattr('status.conditions', 'defined') |
+    (_node_status_raw.stdout | from_json)['items'] | length >= pool_replicas | int and
+    ((_node_status_raw.stdout | from_json)['items'] | selectattr('status.conditions', 'defined') |
      map(attribute='status.conditions') | flatten |
      selectattr('type', 'equalto', 'Ready') |
      selectattr('status', 'equalto', 'True') | list | length) >= pool_replicas | int
