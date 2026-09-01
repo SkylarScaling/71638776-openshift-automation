@@ -1,11 +1,17 @@
 ---
 # DYNAMICALLY DISCOVER CLUSTER IMAGE SET
 - name: Query Hub for available ClusterImageSets
-  kubernetes.core.k8s_info:
-    api_version: hive.openshift.io/v1
-    kind: ClusterImageSet
-    kubeconfig: "{{ target_kubeconfig }}"
-  register: available_image_sets
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get clusterimageset
+    --kubeconfig {{ target_kubeconfig }}
+    -o json 2>/dev/null || echo '{"items":[]}'
+  register: _image_sets_raw
+  changed_when: false
+
+- name: Set available_image_sets fact
+  ansible.builtin.set_fact:
+    available_image_sets:
+      resources: "{{ (_image_sets_raw.stdout | from_json).items }}"
 
 - name: Dynamically set the ClusterImageSet fact based on inventory version
   ansible.builtin.set_fact:
@@ -26,71 +32,78 @@
       Ensure the configure_disconnected_hub role has been run to create the mirrored ClusterImageSet.
 
 - name: Ensure target ManagedClusterSet exists on the Hub
-  kubernetes.core.k8s:
-    kubeconfig: "{{ target_kubeconfig }}"
-    state: present
-    template: "00-managed-clusterset.yaml.j2"
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: "{{ lookup('template', '00-managed-clusterset.yaml.j2') }}"
+  changed_when: true
 
 - name: Create ManagedCluster object
-  kubernetes.core.k8s:
-    kubeconfig: "{{ target_kubeconfig }}"
-    state: present
-    template: "01-managed-cluster.yaml.j2"
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: "{{ lookup('template', '01-managed-cluster.yaml.j2') }}"
+  changed_when: true
 
 - name: Create Spoke Cluster Namespace
-  kubernetes.core.k8s:
-    kubeconfig: "{{ target_kubeconfig }}"
-    state: present
-    template: "02-namespace.yaml.j2"
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: "{{ lookup('template', '02-namespace.yaml.j2') }}"
+  changed_when: true
 
 - name: Create Required Secrets (AWS Creds, Pull Secret, Install-Config with Disconnected Settings)
-  kubernetes.core.k8s:
-    kubeconfig: "{{ target_kubeconfig }}"
-    state: present
-    template: "03-secrets.yaml.j2"
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: "{{ lookup('template', '03-secrets.yaml.j2') }}"
+  changed_when: true
+  no_log: true
 
 - name: Create ClusterDeployment object
-  kubernetes.core.k8s:
-    kubeconfig: "{{ target_kubeconfig }}"
-    state: present
-    template: "04-cluster-deployment.yaml.j2"
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: "{{ lookup('template', '04-cluster-deployment.yaml.j2') }}"
+  changed_when: true
 
 - name: Create MachinePool object for Worker Nodes
-  kubernetes.core.k8s:
-    kubeconfig: "{{ target_kubeconfig }}"
-    state: present
-    template: "05-machine-pool.yaml.j2"
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: "{{ lookup('template', '05-machine-pool.yaml.j2') }}"
+  changed_when: true
 
 - name: Wait for ClusterDeployment to start provisioning
-  kubernetes.core.k8s_info:
-    kubeconfig: "{{ target_kubeconfig }}"
-    api_version: hive.openshift.io/v1
-    kind: ClusterDeployment
-    name: "{{ ocp_cluster.name }}"
-    namespace: "{{ ocp_cluster.name }}"
-  register: cd_status
-  until:
-    - cd_status.resources | length > 0
-    - cd_status.resources[0].status.provisionRef is defined
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get clusterdeployment {{ ocp_cluster.name }}
+    -n {{ ocp_cluster.name }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o json 2>/dev/null || echo '{}'
+  register: _cd_raw
+  changed_when: false
+  until: >
+    (_cd_raw.stdout | from_json).status is defined and
+    (_cd_raw.stdout | from_json).status.provisionRef is defined
   retries: 30
   delay: 10
 
 - name: Wait for OpenShift cluster installation to complete or fail (Takes 35-45+ minutes)
-  kubernetes.core.k8s_info:
-    kubeconfig: "{{ target_kubeconfig }}"
-    api_version: hive.openshift.io/v1
-    kind: ClusterDeployment
-    name: "{{ ocp_cluster.name }}"
-    namespace: "{{ ocp_cluster.name }}"
-  register: cd_status
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get clusterdeployment {{ ocp_cluster.name }}
+    -n {{ ocp_cluster.name }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o json 2>/dev/null || echo '{}'
+  register: _cd_raw
+  changed_when: false
   until: >
-    (cd_status.resources | length > 0 and cd_status.resources[0].status is defined) and
+    (_cd_raw.stdout | from_json).status is defined and
     (
-      (cd_status.resources[0].status.conditions | default([]) | selectattr('type', 'equalto', 'Provisioned') | selectattr('status', 'equalto', 'True') | list | length > 0) or
-      (cd_status.resources[0].status.conditions | default([]) | selectattr('type', 'equalto', 'ProvisionFailed') | selectattr('status', 'equalto', 'True') | list | length > 0)
+      ((_cd_raw.stdout | from_json).status.conditions | default([]) | selectattr('type', 'equalto', 'Provisioned') | selectattr('status', 'equalto', 'True') | list | length > 0) or
+      ((_cd_raw.stdout | from_json).status.conditions | default([]) | selectattr('type', 'equalto', 'ProvisionFailed') | selectattr('status', 'equalto', 'True') | list | length > 0)
     )
   retries: 90
   delay: 60
+
+- name: Set cd_status fact for downstream tasks
+  ansible.builtin.set_fact:
+    cd_status:
+      resources:
+        - "{{ _cd_raw.stdout | from_json }}"
 
 - name: Fail immediately if provisioning errored out
   ansible.builtin.fail:
@@ -103,10 +116,9 @@
     - cd_status.resources[0].status.conditions | selectattr('type', 'equalto', 'ProvisionFailed') | selectattr('status', 'equalto', 'True') | list | length > 0
 
 - name: Ensure Observability Namespace exists on the Spoke via ManifestWork
-  kubernetes.core.k8s:
-    kubeconfig: "{{ target_kubeconfig }}"
-    state: present
-    definition:
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
       apiVersion: work.open-cluster-management.io/v1
       kind: ManifestWork
       metadata:
@@ -119,12 +131,12 @@
               kind: Namespace
               metadata:
                 name: open-cluster-management-observability
+  changed_when: true
 
 - name: Push disconnected CatalogSource and OperatorHub config to Spoke via ManifestWork
-  kubernetes.core.k8s:
-    kubeconfig: "{{ target_kubeconfig }}"
-    state: present
-    definition:
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
       apiVersion: work.open-cluster-management.io/v1
       kind: ManifestWork
       metadata:
@@ -152,6 +164,7 @@
                 updateStrategy:
                   registryPoll:
                     interval: 30m
+  changed_when: true
 
 - name: Report successful provisioning
   ansible.builtin.debug:

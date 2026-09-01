@@ -17,24 +17,29 @@
   when: pool_replicas | int == 0
 
 - name: Get Cluster Infrastructure Name (Cluster ID)
-  kubernetes.core.k8s_info:
-    kubeconfig: "{{ target_kubeconfig }}"
-    api_version: config.openshift.io/v1
-    kind: Infrastructure
-    name: cluster
-  register: infra_info
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get infrastructure cluster
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.infrastructureName}'
+  register: _infra_name
+  changed_when: false
 
 - name: Set cluster_id fact
   ansible.builtin.set_fact:
-    cluster_id: "{{ infra_info.resources[0].status.infrastructureName }}"
+    cluster_id: "{{ _infra_name.stdout }}"
 
 - name: Get all MachineSets in the machine-api namespace
-  kubernetes.core.k8s_info:
-    kubeconfig: "{{ target_kubeconfig }}"
-    api_version: machine.openshift.io/v1beta1
-    kind: MachineSet
-    namespace: openshift-machine-api
-  register: all_machinesets
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get machineset -n openshift-machine-api
+    --kubeconfig {{ target_kubeconfig }}
+    -o json 2>/dev/null || echo '{"items":[]}'
+  register: _machinesets_raw
+  changed_when: false
+
+- name: Set all_machinesets fact
+  ansible.builtin.set_fact:
+    all_machinesets:
+      resources: "{{ (_machinesets_raw.stdout | from_json).items }}"
 
 - name: Extract the first worker MachineSet
   ansible.builtin.set_fact:
@@ -62,10 +67,10 @@
       - "Building Pool: {{ pool_name }} ({{ pool_replicas }} replicas)"
 
 - name: Apply the generated MachineSet YAML to OpenShift cluster
-  kubernetes.core.k8s:
-    kubeconfig: "{{ target_kubeconfig }}"
-    state: present
-    definition: "{{ lookup('template', 'machineset.yaml.j2') | from_yaml }}"
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: "{{ lookup('template', 'machineset.yaml.j2') }}"
+  changed_when: true
 
 - name: Display MachineSet application status
   ansible.builtin.debug:

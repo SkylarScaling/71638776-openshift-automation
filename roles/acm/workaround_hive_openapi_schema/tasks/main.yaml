@@ -26,16 +26,16 @@
 # STEP 1 — Detect the installed MCE version
 # ==============================================================================
 - name: Query MultiClusterEngine resource to detect installed version
-  kubernetes.core.k8s_info:
-    kubeconfig: "{{ target_kubeconfig }}"
-    api_version: multicluster.openshift.io/v1
-    kind: MultiClusterEngine
-    name: multiclusterengine
-  register: _mce_resource
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get multiclusterengine multiclusterengine
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.currentVersion}'
+  register: _mce_version_raw
+  changed_when: false
 
 - name: Extract MCE version from MultiClusterEngine status
   ansible.builtin.set_fact:
-    _mce_version: "{{ _mce_resource.resources[0].status.currentVersion }}"
+    _mce_version: "{{ _mce_version_raw.stdout }}"
 
 # ==============================================================================
 # STEP 2 — Evaluate whether the workaround is required
@@ -336,20 +336,12 @@
       when: not _workaround_already_applied
 
     - name: Patch hive-controllers deployment to disable affected controllers
-      kubernetes.core.k8s:
-        kubeconfig: "{{ target_kubeconfig }}"
-        state: present
-        api_version: apps/v1
-        kind: Deployment
-        name: hive-controllers
-        namespace: hive
-        definition:
-          spec:
-            template:
-              spec:
-                containers:
-                  - name: "{{ _hive_container_name }}"
-                    args: "{{ _new_args }}"
+      ansible.builtin.shell: >
+        {{ bin_dir }}/oc patch deployment hive-controllers -n hive
+        --kubeconfig {{ target_kubeconfig }}
+        --type=strategic
+        -p='{"spec":{"template":{"spec":{"containers":[{"name":"{{ _hive_container_name }}","args":{{ _new_args | to_json }}}]}}}}'
+      changed_when: true
       when: not _workaround_already_applied
 
     # The patch triggers a rolling restart. The new pod must wait up to 120 s for
