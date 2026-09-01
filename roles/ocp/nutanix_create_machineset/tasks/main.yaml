@@ -30,11 +30,10 @@
 
 - name: Get first worker MachineSet name
   ansible.builtin.shell: >
-    {{ bin_dir }}/oc get machineset -n openshift-machine-api
+    {{ bin_dir }}/oc get machineset.machine.openshift.io -n openshift-machine-api
     --kubeconfig {{ target_kubeconfig }}
-    -l machine.openshift.io/cluster-api-machine-type=worker
     --no-headers -o custom-columns=NAME:.metadata.name
-    | head -1
+    | grep '\-worker\-' | head -1
   register: _worker_ms_name
   changed_when: false
 
@@ -42,11 +41,11 @@
   ansible.builtin.assert:
     that:
       - _worker_ms_name.stdout != ""
-    fail_msg: "Could not find any worker MachineSets (label machine.openshift.io/cluster-api-machine-type=worker). Please verify the cluster has provisioned worker nodes and your KUBECONFIG is correct."
+    fail_msg: "Could not find any MachineSets with '-worker-' in the name. Please verify the cluster has provisioned worker nodes and your KUBECONFIG is correct."
 
 - name: Get Nutanix image name from worker MachineSet
   ansible.builtin.shell: >
-    {{ bin_dir }}/oc get machineset {{ _worker_ms_name.stdout | trim }}
+    {{ bin_dir }}/oc get machineset.machine.openshift.io {{ _worker_ms_name.stdout | trim }}
     -n openshift-machine-api
     --kubeconfig {{ target_kubeconfig }}
     -o jsonpath='{.spec.template.spec.providerSpec.value.image.name}'

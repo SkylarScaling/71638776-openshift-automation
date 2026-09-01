@@ -1,7 +1,7 @@
 ---
 - name: Wait for {{ pool_name }} Machines to be created and Running
   ansible.builtin.shell: >
-    {{ bin_dir }}/oc get machine -n openshift-machine-api
+    {{ bin_dir }}/oc get machine.machine.openshift.io -n openshift-machine-api
     -l "machine.openshift.io/cluster-api-machine-role={{ pool_name }}"
     --kubeconfig {{ target_kubeconfig }}
     -o json 2>/dev/null || echo '{"items":[]}'
