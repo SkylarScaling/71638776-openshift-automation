@@ -3,25 +3,25 @@
 # DEPLOY GITEA
 # ==============================================================================
 - name: Create Gitea namespace
-  kubernetes.core.k8s:
-    kubeconfig: "{{ target_kubeconfig }}"
-    state: present
-    definition:
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
       apiVersion: v1
       kind: Namespace
       metadata:
         name: "{{ gitea_namespace }}"
+  changed_when: true
 
 - name: Create Gitea ServiceAccount
-  kubernetes.core.k8s:
-    kubeconfig: "{{ target_kubeconfig }}"
-    state: present
-    definition:
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
       apiVersion: v1
       kind: ServiceAccount
       metadata:
         name: gitea
         namespace: "{{ gitea_namespace }}"
+  changed_when: true
 
 - name: Grant anyuid SCC to Gitea ServiceAccount
   ansible.builtin.shell: >
@@ -31,10 +31,9 @@
   changed_when: true
 
 - name: Create Gitea PVC
-  kubernetes.core.k8s:
-    kubeconfig: "{{ target_kubeconfig }}"
-    state: present
-    definition:
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
       apiVersion: v1
       kind: PersistentVolumeClaim
       metadata:
@@ -46,12 +45,12 @@
         resources:
           requests:
             storage: "{{ gitea_pvc_size }}"
+  changed_when: true
 
 - name: Create Gitea Service
-  kubernetes.core.k8s:
-    kubeconfig: "{{ target_kubeconfig }}"
-    state: present
-    definition:
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
       apiVersion: v1
       kind: Service
       metadata:
@@ -67,12 +66,12 @@
             port: 3000
             targetPort: http
             protocol: TCP
+  changed_when: true
 
 - name: Create Gitea Route
-  kubernetes.core.k8s:
-    kubeconfig: "{{ target_kubeconfig }}"
-    state: present
-    definition:
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
       apiVersion: route.openshift.io/v1
       kind: Route
       metadata:
@@ -87,26 +86,29 @@
         tls:
           termination: edge
           insecureEdgeTerminationPolicy: Redirect
-  register: gitea_route_result
+  changed_when: true
 
 - name: Get Gitea Route hostname
-  kubernetes.core.k8s_info:
-    kubeconfig: "{{ target_kubeconfig }}"
-    api_version: route.openshift.io/v1
-    kind: Route
-    name: gitea
-    namespace: "{{ gitea_namespace }}"
-  register: gitea_route_info
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get route gitea
+    -n {{ gitea_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.spec.host}'
+  register: _gitea_route_hostname
+  changed_when: false
+  retries: 10
+  delay: 5
+  until: _gitea_route_hostname.stdout != ""
 
 - name: Set Gitea Route hostname fact
   ansible.builtin.set_fact:
-    gitea_route_host: "{{ gitea_route_info.resources[0].spec.host }}"
+    gitea_route_host: "{{ _gitea_route_hostname.stdout }}"
 
 - name: Deploy Gitea
-  kubernetes.core.k8s:
-    kubeconfig: "{{ target_kubeconfig }}"
-    state: present
-    template: "gitea-deployment.yaml.j2"
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: "{{ lookup('template', 'gitea-deployment.yaml.j2') }}"
+  changed_when: true
 
 - name: Wait for Gitea Deployment to be available
   ansible.builtin.shell: >
