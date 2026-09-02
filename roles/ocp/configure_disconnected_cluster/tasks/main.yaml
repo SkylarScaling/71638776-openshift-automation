@@ -119,6 +119,20 @@
   retries: 60
   delay: 30
   changed_when: false
+  # Non-fatal: CatalogSource may be TRANSIENT_FAILURE if the Quay migration
+  # has already run but the ingress CA trust (applied by patch_cluster_idms)
+  # hasn't taken effect yet. The migrate_mirror play will resolve this.
+  failed_when: false
+
+- name: Warn if CatalogSource is not yet ready
+  ansible.builtin.debug:
+    msg: >
+      WARNING: CatalogSource not READY after waiting (current: {{ catalog_status.stdout | default('none') }}).
+      If the Quay mirror migration has run, this will resolve after patch_cluster_idms
+      applies the ingress CA trust and triggers an MCO roll.
+  when: >
+    catalog_status.stdout == "" or
+    (catalog_status.stdout_lines | reject('search', '=READY$') | reject('match', '^$') | list | length > 0)
 
 - name: Display disconnected cluster configuration status
   ansible.builtin.debug:
