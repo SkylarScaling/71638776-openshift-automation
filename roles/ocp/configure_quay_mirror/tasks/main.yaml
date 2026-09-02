@@ -53,20 +53,32 @@
   no_log: true
 
 # initialize fails with 400 if the DB is non-empty (e.g. internal Quay setup rows exist)
-# even when quayadmin hasn't been created yet. Fall back to the signup endpoint,
-# which works when FEATURE_USER_CREATION=true and BROWSER_API_CALLS_XHR_ONLY=false.
-- name: Create quayadmin via Quay signup API (fallback when initialize fails)
-  ansible.builtin.uri:
-    url: "https://{{ quay_registry_url }}/api/v1/user/"
-    method: POST
-    validate_certs: false
-    body_format: json
-    body:
-      username: "{{ quay_mirror_admin_user }}"
-      password: "{{ quay_mirror_admin_password }}"
-      email: "{{ quay_mirror_admin_user }}@local.invalid"
-    status_code: [200, 201, 400, 409]
+# even when quayadmin hasn't been created yet. Fall back to the signup endpoint.
+# Quay enforces CSRF even with BROWSER_API_CALLS_XHR_ONLY=false — get a session
+# cookie first, then reuse it and the csrf_token cookie value as X-CSRF-Token.
+- name: Create quayadmin via Quay signup API with CSRF token (fallback when initialize fails)
+  ansible.builtin.shell: |
+    set -e
+    COOKIE_JAR=$(mktemp)
+    # Seed session and capture csrf_token cookie
+    curl -sk -c "$COOKIE_JAR" \
+      https://{{ quay_registry_url }}/api/v1/discovery \
+      -o /dev/null
+    CSRF=$(awk '/csrf_token/{print $7}' "$COOKIE_JAR")
+    # Create user
+    HTTP=$(curl -sk -b "$COOKIE_JAR" \
+      -X POST https://{{ quay_registry_url }}/api/v1/user/ \
+      -H 'Content-Type: application/json' \
+      -H "X-CSRF-Token: $CSRF" \
+      -d '{"username":"{{ quay_mirror_admin_user }}","password":"{{ quay_mirror_admin_password }}","email":"{{ quay_mirror_admin_user }}@local.invalid"}' \
+      -o /dev/null -w '%{http_code}')
+    rm -f "$COOKIE_JAR"
+    # 200/201 = created, 400/409 = already exists — all acceptable
+    [[ "$HTTP" =~ ^(200|201|400|409)$ ]] || exit 1
+  args:
+    executable: /bin/bash
   register: _quay_signup
+  changed_when: true
   no_log: true
   when: _quay_init.status in [400, 403, 409]
 
