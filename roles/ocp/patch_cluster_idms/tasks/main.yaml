@@ -145,6 +145,6 @@
     msg:
       - "Cluster IDMS patched to use Quay mirror"
       - "Hub IDMS applied:         {{ quay_idms_manifests | length }} manifest(s)"
-      - "Hub CatalogSource image:  {{ _quay_index_image }}"
+      - "Hub CatalogSource image:  {{ quay_catalog_image }}"
       - "Spokes updated:           {{ groups['managed_clusters'] | default([]) | length }}"
       - "The jumphost mirror registry is no longer required."
