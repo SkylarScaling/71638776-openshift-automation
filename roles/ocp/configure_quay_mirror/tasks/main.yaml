@@ -53,32 +53,50 @@
   no_log: true
 
 # initialize fails with 400 if the DB is non-empty (e.g. internal Quay setup rows exist)
-# even when quayadmin hasn't been created yet. Fall back to the signup endpoint.
-# Quay enforces CSRF even with BROWSER_API_CALLS_XHR_ONLY=false — get a session
-# cookie first, then reuse it and the csrf_token cookie value as X-CSRF-Token.
-- name: Create quayadmin via Quay signup API with CSRF token (fallback when initialize fails)
+# even when quayadmin hasn't been created yet. Bypass HTTP entirely — exec into the
+# Quay app pod and call Quay's own Python model layer to create the user, which avoids
+# CSRF entirely and works regardless of Quay's HTTP security settings.
+- name: Get Quay app pod name
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get pod -n {{ quay_mirror_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+    -l quay-component=quay-app
+    --no-headers -o custom-columns=NAME:.metadata.name | head -1
+  register: _quay_app_pod
+  changed_when: false
+  when: _quay_init.status in [400, 403, 409]
+
+- name: Create quayadmin via Quay Python model (bypasses CSRF)
   ansible.builtin.shell: |
-    set -e
-    COOKIE_JAR=$(mktemp)
-    # Seed session and capture csrf_token cookie
-    curl -sk -c "$COOKIE_JAR" \
-      https://{{ quay_registry_url }}/api/v1/discovery \
-      -o /dev/null
-    CSRF=$(awk '/csrf_token/{print $7}' "$COOKIE_JAR")
-    # Create user
-    HTTP=$(curl -sk -b "$COOKIE_JAR" \
-      -X POST https://{{ quay_registry_url }}/api/v1/user/ \
-      -H 'Content-Type: application/json' \
-      -H "X-CSRF-Token: $CSRF" \
-      -d '{"username":"{{ quay_mirror_admin_user }}","password":"{{ quay_mirror_admin_password }}","email":"{{ quay_mirror_admin_user }}@local.invalid"}' \
-      -o /dev/null -w '%{http_code}')
-    rm -f "$COOKIE_JAR"
-    # 200/201 = created, 400/409 = already exists — all acceptable
-    [[ "$HTTP" =~ ^(200|201|400|409)$ ]] || exit 1
+    {{ bin_dir }}/oc exec -n {{ quay_mirror_namespace }} \
+      --kubeconfig {{ target_kubeconfig }} \
+      {{ _quay_app_pod.stdout | trim }} \
+      -- python3 - << 'PYEOF'
+    import sys, os
+    sys.path.insert(0, '/quay-registry')
+    os.chdir('/quay-registry')
+    from app import app
+    from data.model import user as user_model
+    with app.app_context():
+        try:
+            user_model.create_user_noverify(
+                '{{ quay_mirror_admin_user }}',
+                '{{ quay_mirror_admin_password }}',
+                '{{ quay_mirror_admin_user }}@local.invalid'
+            )
+            print('created')
+        except Exception as e:
+            msg = str(e).lower()
+            if 'unique' in msg or 'already' in msg or 'duplicate' in msg:
+                print('exists')
+            else:
+                print('error: ' + str(e), file=sys.stderr)
+                sys.exit(1)
+    PYEOF
   args:
     executable: /bin/bash
-  register: _quay_signup
-  changed_when: true
+  register: _quay_user_create
+  changed_when: "'created' in _quay_user_create.stdout"
   no_log: true
   when: _quay_init.status in [400, 403, 409]
 
