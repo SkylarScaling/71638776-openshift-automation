@@ -1,3 +1,4 @@
 ---
 disable_default_catalog_sources: true
 bin_dir: "{{ bin_dir | default('~/.local/bin') }}"
+quay_mirror_org: "{{ disconnected.quay_mirror.org | default(disconnected.mirror_base_path | default('ocp4')) }}"

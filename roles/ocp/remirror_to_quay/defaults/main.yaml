@@ -1,4 +1,7 @@
 ---
+# Mirror org — matches disconnected.quay_mirror.org; also set as fact by configure_quay_mirror
+quay_mirror_org: "{{ disconnected.quay_mirror.org | default(disconnected.mirror_base_path | default('ocp4')) }}"
+
 # Workspace from the initial jumphost mirror run — must already contain content
 quay_mirror_workspace: "{{ oc_mirror_workspace | default(working_dir ~ '/oc-mirror-workspace') }}"
 
