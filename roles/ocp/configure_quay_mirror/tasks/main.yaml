@@ -68,10 +68,10 @@
 
 - name: Create quayadmin via Quay Python model (bypasses CSRF)
   ansible.builtin.shell: |
-    {{ bin_dir }}/oc exec -n {{ quay_mirror_namespace }} \
+    cat << 'PYEOF' | {{ bin_dir }}/oc exec -i -n {{ quay_mirror_namespace }} \
       --kubeconfig {{ target_kubeconfig }} \
       {{ _quay_app_pod.stdout | trim }} \
-      -- python3 - << 'PYEOF'
+      -- python3 -
     import sys, os
     sys.path.insert(0, '/quay-registry')
     os.chdir('/quay-registry')
@@ -79,14 +79,12 @@
     from data.model import user as user_model
     from data.database import User
     with app.app_context():
-        # Check if already exists with a working password
         existing = None
         try:
             existing = user_model.get_user('{{ quay_mirror_admin_user }}')
         except Exception:
             pass
         if existing:
-            # User exists — ensure password is correct by resetting it
             try:
                 user_model.change_password(existing, '{{ quay_mirror_admin_password }}')
                 User.update(verified=True).where(User.username == '{{ quay_mirror_admin_user }}').execute()
@@ -96,9 +94,7 @@
                 sys.exit(1)
         else:
             try:
-                # create_user(username, password, email) sets the bcrypt hash
                 u = user_model.create_user('{{ quay_mirror_admin_user }}', '{{ quay_mirror_admin_password }}', '{{ quay_mirror_admin_user }}@local.invalid')
-                # Mark verified so no email confirmation is needed
                 User.update(verified=True).where(User.username == '{{ quay_mirror_admin_user }}').execute()
                 print('created')
             except Exception as e:
@@ -122,7 +118,7 @@
     force_basic_auth: true
     status_code: 200
   register: _quay_auth_check
-  no_log: true
+  # TODO UNCOMMENT no_log: true
   failed_when: _quay_auth_check.status != 200
 
 - name: Create mirror organization in Quay
