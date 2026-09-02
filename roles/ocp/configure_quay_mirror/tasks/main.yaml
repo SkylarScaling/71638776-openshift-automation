@@ -37,7 +37,7 @@
     quay_registry_url: "{{ _quay_route_raw.stdout | trim }}"
     quay_mirror_push_url: "{{ _quay_route_raw.stdout | trim }}/{{ quay_mirror_org }}"
 
-- name: Initialize Quay superuser account (FEATURE_USER_INITIALIZE — idempotent, 4xx = already done)
+- name: Attempt Quay superuser account initialization via /user/initialize
   ansible.builtin.uri:
     url: "https://{{ quay_registry_url }}/api/v1/user/initialize"
     method: POST
@@ -51,6 +51,37 @@
     status_code: [200, 201, 400, 403, 409]
   register: _quay_init
   no_log: true
+
+# initialize fails with 400 if the DB is non-empty (e.g. internal Quay setup rows exist)
+# even when quayadmin hasn't been created yet. Fall back to the signup endpoint,
+# which works when FEATURE_USER_CREATION=true and BROWSER_API_CALLS_XHR_ONLY=false.
+- name: Create quayadmin via Quay signup API (fallback when initialize fails)
+  ansible.builtin.uri:
+    url: "https://{{ quay_registry_url }}/api/v1/user/"
+    method: POST
+    validate_certs: false
+    body_format: json
+    body:
+      username: "{{ quay_mirror_admin_user }}"
+      password: "{{ quay_mirror_admin_password }}"
+      email: "{{ quay_mirror_admin_user }}@local.invalid"
+    status_code: [200, 201, 400, 409]
+  register: _quay_signup
+  no_log: true
+  when: _quay_init.status in [400, 403, 409]
+
+- name: Verify quayadmin authentication succeeds
+  ansible.builtin.uri:
+    url: "https://{{ quay_registry_url }}/api/v1/user/"
+    method: GET
+    validate_certs: false
+    user: "{{ quay_mirror_admin_user }}"
+    password: "{{ quay_mirror_admin_password }}"
+    force_basic_auth: true
+    status_code: 200
+  register: _quay_auth_check
+  no_log: true
+  failed_when: _quay_auth_check.status != 200
 
 - name: Create mirror organization in Quay
   ansible.builtin.uri:
