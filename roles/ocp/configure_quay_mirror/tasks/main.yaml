@@ -112,7 +112,8 @@
                 robot_fullname = '{{ quay_mirror_org }}+{{ quay_mirror_robot_account }}'
                 robot = User.get(User.username == robot_fullname)
                 token_record = RobotAccountToken.get(RobotAccountToken.robot_account == robot)
-                robot_token = token_record.token
+                raw = token_record.token
+                robot_token = raw.decrypt() if hasattr(raw, 'decrypt') else str(raw)
             else:
                 print('ERROR creating robot: ' + str(e), file=sys.stderr)
                 sys.exit(1)
@@ -124,7 +125,7 @@
         except Exception:
             pass  # Already a member
 
-        print('ROBOT_TOKEN=' + str(robot_token))
+        print('ROBOT_TOKEN=' + robot_token)
     PYEOF
   args:
     executable: /bin/bash
