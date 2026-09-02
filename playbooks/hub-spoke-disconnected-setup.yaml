@@ -344,6 +344,40 @@
           - "{{ ocp_cluster.name }}"
 
 # ==============================================================================
+# MIGRATE MIRROR: Move Mirror Registry from Jumphost to Quay on Hub
+# ==============================================================================
+# Runs automatically after spoke provisioning. Skip with:
+#   --skip-tags migrate_mirror
+# if you intend to keep the jumphost mirror running long-term.
+# ==============================================================================
+- name: Migrate Mirror - Move content from jumphost to Quay on hub cluster
+  hosts: hub_cluster
+  connection: local
+  gather_facts: false
+  tags: ['migrate_mirror']
+  vars:
+    hub_kubeconfig: "{{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig"
+
+  tasks:
+    - name: Configure Quay as mirror target (org, robot account, pull secret)
+      ansible.builtin.include_role:
+        name: ocp/configure_quay_mirror
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+
+    - name: Re-run oc-mirror to push content to Quay
+      ansible.builtin.include_role:
+        name: ocp/remirror_to_quay
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+
+    - name: Apply new IDMS to hub cluster and propagate to spokes
+      ansible.builtin.include_role:
+        name: ocp/patch_cluster_idms
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+
+# ==============================================================================
 # SUMMARY: Final Environment Handoff
 # ==============================================================================
 - name: Deployment Summary

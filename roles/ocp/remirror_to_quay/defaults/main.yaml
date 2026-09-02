@@ -1,0 +1,9 @@
+---
+# Workspace from the initial jumphost mirror run — must already contain content
+quay_mirror_workspace: "{{ oc_mirror_workspace | default(working_dir ~ '/oc-mirror-workspace') }}"
+
+# Directory where oc-mirror writes the Quay-targeted cluster resources
+quay_mirror_results_dir: "{{ tmp_dir }}/quay-mirror-results"
+
+# Auth file location for oc-mirror
+quay_mirror_auth_file: "{{ quay_mirror_workspace }}/containers/quay-auth.json"

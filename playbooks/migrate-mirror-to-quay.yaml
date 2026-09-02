@@ -1,0 +1,58 @@
+---
+# ==============================================================================
+# STANDALONE: Migrate Mirror Registry from Jumphost to Quay on Hub Cluster
+# ==============================================================================
+#
+# Run this playbook after the hub cluster is installed and Quay is healthy.
+# After a successful run the jumphost mirror-registry is no longer required
+# and the jumphost can be decommissioned.
+#
+# Usage:
+#   cd playbooks
+#   ansible-playbook migrate-mirror-to-quay.yaml -i inventory-disconnected.yaml
+#
+# To re-run only a subset of steps use tags:
+#   --tags configure_quay    Configure Quay org + robot account
+#   --tags remirror          Re-run oc-mirror targeting Quay
+#   --tags patch_idms        Apply new IDMS to hub and spokes
+#
+# ==============================================================================
+# Required inventory additions under disconnected:
+#
+#   quay_mirror:
+#     namespace: "local-quay"           # namespace where QuayRegistry lives
+#     registry_name: "quay-registry"    # QuayRegistry CR name
+#     org: "ocp4"                       # org to create for mirrored content
+#     robot_account: "mirror"           # robot account name (short, no +)
+#     admin_user: "quayadmin"           # Quay superuser for API calls
+#     admin_password: "<password>"      # Quay superuser password
+# ==============================================================================
+
+- name: Migrate mirror registry from jumphost to Quay on hub cluster
+  hosts: hub_cluster
+  connection: local
+  gather_facts: false
+  vars:
+    hub_kubeconfig: "{{ tmp_dir }}/acm-global-hub/install/{{ ocp_cluster.name }}/auth/kubeconfig"
+
+  tasks:
+    - name: Configure Quay as mirror target (org, robot account, pull secret)
+      ansible.builtin.include_role:
+        name: ocp/configure_quay_mirror
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+      tags: ['configure_quay', 'migrate_mirror']
+
+    - name: Re-run oc-mirror to push content to Quay
+      ansible.builtin.include_role:
+        name: ocp/remirror_to_quay
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+      tags: ['remirror', 'migrate_mirror']
+
+    - name: Apply new IDMS to hub cluster and propagate to spokes
+      ansible.builtin.include_role:
+        name: ocp/patch_cluster_idms
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+      tags: ['patch_idms', 'migrate_mirror']

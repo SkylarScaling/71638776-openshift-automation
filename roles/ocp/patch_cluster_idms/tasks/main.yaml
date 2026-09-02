@@ -1,0 +1,162 @@
+---
+# ==============================================================================
+# PATCH CLUSTER IDMS — HUB + SPOKES
+#
+# Applies the new IDMS manifests (pointing at Quay on the hub) to the hub
+# cluster and propagates them to all managed spoke clusters via ManifestWork.
+# After this role completes, the jumphost mirror registry is no longer needed.
+#
+# Prerequisites: remirror_to_quay must have run first (sets quay_idms_manifests,
+# quay_catalogsource_manifests, quay_registry_url, quay_mirror_org).
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# HUB CLUSTER: apply new IDMS + CatalogSource
+# ------------------------------------------------------------------------------
+- name: Apply Quay IDMS manifests to hub cluster
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: "{{ item }}"
+  loop: "{{ quay_idms_manifests }}"
+  loop_control:
+    index_var: _idx
+    label: "Quay IDMS manifest {{ _idx + 1 }}"
+  changed_when: true
+
+- name: Disable default OperatorHub catalog sources on hub
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: config.openshift.io/v1
+      kind: OperatorHub
+      metadata:
+        name: cluster
+      spec:
+        disableAllDefaultSources: true
+  when: disable_default_catalog_sources | bool
+  changed_when: true
+
+- name: Extract Quay-hosted index image reference from oc-mirror CatalogSource
+  ansible.builtin.set_fact:
+    _quay_index_image: >-
+      {{
+        (quay_catalogsource_manifests
+         | map('from_yaml_all')
+         | flatten
+         | selectattr('kind', 'equalto', 'CatalogSource')
+         | map(attribute='spec.image')
+         | first)
+      }}
+
+- name: Update redhat-operators CatalogSource to use Quay index image
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: operators.coreos.com/v1alpha1
+      kind: CatalogSource
+      metadata:
+        name: redhat-operators
+        namespace: openshift-marketplace
+      spec:
+        sourceType: grpc
+        image: "{{ _quay_index_image }}"
+        displayName: "Red Hat Operators (Quay Mirror)"
+        publisher: "Red Hat (Quay Mirror)"
+        updateStrategy:
+          registryPoll:
+            interval: 30m
+  changed_when: true
+
+# ------------------------------------------------------------------------------
+# SPOKE CLUSTERS: propagate via ManifestWork
+# ------------------------------------------------------------------------------
+- name: Build combined IDMS manifest string for ManifestWork
+  ansible.builtin.set_fact:
+    _quay_idms_combined: "{{ quay_idms_manifests | join('\n---\n') }}"
+
+- name: Push updated IDMS to spokes via ManifestWork
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: work.open-cluster-management.io/v1
+      kind: ManifestWork
+      metadata:
+        name: "{{ hostvars[item].ocp_cluster.name }}-quay-idms"
+        namespace: "{{ hostvars[item].ocp_cluster.name }}"
+      spec:
+        workload:
+          manifests: {{ quay_idms_manifests | map('from_yaml_all') | flatten | to_json }}
+  loop: "{{ groups['managed_clusters'] | default([]) }}"
+  loop_control:
+    label: "{{ hostvars[item].ocp_cluster.name }}"
+  changed_when: true
+
+- name: Push updated CatalogSource and OperatorHub config to spokes via ManifestWork
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: work.open-cluster-management.io/v1
+      kind: ManifestWork
+      metadata:
+        name: "{{ hostvars[item].ocp_cluster.name }}-quay-catalog"
+        namespace: "{{ hostvars[item].ocp_cluster.name }}"
+      spec:
+        workload:
+          manifests:
+            - apiVersion: config.openshift.io/v1
+              kind: OperatorHub
+              metadata:
+                name: cluster
+              spec:
+                disableAllDefaultSources: true
+            - apiVersion: operators.coreos.com/v1alpha1
+              kind: CatalogSource
+              metadata:
+                name: redhat-operators
+                namespace: openshift-marketplace
+              spec:
+                sourceType: grpc
+                image: "{{ _quay_index_image }}"
+                displayName: "Red Hat Operators (Quay Mirror)"
+                publisher: "Red Hat (Quay Mirror)"
+                updateStrategy:
+                  registryPoll:
+                    interval: 30m
+  loop: "{{ groups['managed_clusters'] | default([]) }}"
+  loop_control:
+    label: "{{ hostvars[item].ocp_cluster.name }}"
+  changed_when: true
+
+# ------------------------------------------------------------------------------
+# Wait for hub MachineConfigPools to roll out the new IDMS config
+# ------------------------------------------------------------------------------
+- name: Wait for master MachineConfigPool to finish updating
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get mcp master
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.conditions[?(@.type=="Updated")].status}'
+  register: _master_mcp
+  until: _master_mcp.stdout == "True"
+  retries: 60
+  delay: 30
+  changed_when: false
+
+- name: Wait for worker MachineConfigPool to finish updating
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get mcp worker
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.conditions[?(@.type=="Updated")].status}'
+  register: _worker_mcp
+  until: _worker_mcp.stdout == "True"
+  retries: 60
+  delay: 30
+  changed_when: false
+
+- name: Display IDMS patch summary
+  ansible.builtin.debug:
+    msg:
+      - "Cluster IDMS patched to use Quay mirror"
+      - "Hub IDMS applied:         {{ quay_idms_manifests | length }} manifest(s)"
+      - "Hub CatalogSource image:  {{ _quay_index_image }}"
+      - "Spokes updated:           {{ groups['managed_clusters'] | default([]) | length }}"
+      - "The jumphost mirror registry is no longer required."

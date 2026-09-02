@@ -1,0 +1,112 @@
+---
+# ==============================================================================
+# REMIRROR OCP CONTENT TO QUAY
+#
+# Re-runs oc-mirror against the existing workspace to push all previously
+# mirrored content to the Quay instance on the hub cluster. The workspace
+# already contains the imageset and cached layer data from the initial mirror
+# run, so only the destination changes.
+#
+# Prerequisites: configure_quay_mirror must have run first (sets quay_registry_url,
+# quay_mirror_org, quay_robot_username, quay_robot_token).
+# ==============================================================================
+
+- name: Create Quay results directory
+  ansible.builtin.file:
+    path: "{{ quay_mirror_results_dir }}"
+    state: directory
+    mode: '0755'
+
+- name: Write Quay robot credentials to auth file for oc-mirror
+  ansible.builtin.shell: |
+    set -e
+    # Merge Quay robot auth into existing auth.json
+    existing="{{ quay_mirror_workspace }}/containers/auth.json"
+    if [ -f "$existing" ]; then
+      jq -c \
+        --arg host "{{ quay_registry_url }}" \
+        --arg auth "{{ (quay_robot_username ~ ':' ~ quay_robot_token) | b64encode }}" \
+        '.auths[$host] = {"auth": $auth, "email": ""}' \
+        "$existing" > "{{ quay_mirror_auth_file }}"
+    else
+      echo '{"auths":{}}' | jq -c \
+        --arg host "{{ quay_registry_url }}" \
+        --arg auth "{{ (quay_robot_username ~ ':' ~ quay_robot_token) | b64encode }}" \
+        '.auths[$host] = {"auth": $auth, "email": ""}' \
+        > "{{ quay_mirror_auth_file }}"
+    fi
+  args:
+    executable: /bin/bash
+  changed_when: true
+  no_log: true
+
+- name: Run oc-mirror to push content to Quay
+  ansible.builtin.command: >
+    {{ bin_dir }}/oc-mirror
+    --v2
+    --config {{ quay_mirror_workspace }}/imageset-config.yaml
+    --workspace file://{{ quay_mirror_workspace }}
+    --dest-tls-verify=false
+    docker://{{ quay_registry_url }}/{{ quay_mirror_org }}
+  environment:
+    XDG_RUNTIME_DIR: "{{ quay_mirror_workspace }}"
+    REGISTRY_AUTH_FILE: "{{ quay_mirror_auth_file }}"
+  args:
+    chdir: "{{ quay_mirror_workspace }}"
+  async: 7200
+  poll: 0
+  register: _quay_mirror_job
+  changed_when: true
+
+- name: Wait for oc-mirror to Quay to complete (up to 2 hours)
+  ansible.builtin.async_status:
+    jid: "{{ _quay_mirror_job.ansible_job_id }}"
+  register: _quay_mirror_result
+  until: _quay_mirror_result.finished
+  retries: 240
+  delay: 30
+  failed_when:
+    - _quay_mirror_result.finished
+    - _quay_mirror_result.rc not in [0, 4]
+
+- name: Find Quay IDMS manifest files from oc-mirror output
+  ansible.builtin.find:
+    paths: "{{ quay_mirror_workspace }}/working-dir/cluster-resources"
+    patterns:
+      - "idms-*.yaml"
+      - "imageDigestMirrorSet*.yaml"
+      - "imageContentSourcePolicy*.yaml"
+    file_type: file
+  register: _quay_idms_files
+
+- name: Find Quay CatalogSource manifest files from oc-mirror output
+  ansible.builtin.find:
+    paths: "{{ quay_mirror_workspace }}/working-dir/cluster-resources"
+    patterns: "cs-*.yaml"
+    file_type: file
+  register: _quay_cs_files
+
+- name: Read Quay IDMS manifests
+  ansible.builtin.slurp:
+    src: "{{ item.path }}"
+  loop: "{{ _quay_idms_files.files }}"
+  register: _quay_idms_raw
+
+- name: Read Quay CatalogSource manifests
+  ansible.builtin.slurp:
+    src: "{{ item.path }}"
+  loop: "{{ _quay_cs_files.files }}"
+  register: _quay_cs_raw
+
+- name: Set Quay mirror manifest facts
+  ansible.builtin.set_fact:
+    quay_idms_manifests: "{{ _quay_idms_raw.results | map(attribute='content') | map('b64decode') | list }}"
+    quay_catalogsource_manifests: "{{ _quay_cs_raw.results | map(attribute='content') | map('b64decode') | list }}"
+
+- name: Display remirror summary
+  ansible.builtin.debug:
+    msg:
+      - "oc-mirror to Quay complete"
+      - "Target: docker://{{ quay_registry_url }}/{{ quay_mirror_org }}"
+      - "IDMS manifests:        {{ _quay_idms_files.files | length }}"
+      - "CatalogSource manifests: {{ _quay_cs_files.files | length }}"

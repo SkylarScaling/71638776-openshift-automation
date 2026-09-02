@@ -1,0 +1,7 @@
+---
+quay_mirror_namespace: "{{ disconnected.quay_mirror.namespace | default('local-quay') }}"
+quay_mirror_registry_name: "{{ disconnected.quay_mirror.registry_name | default('quay-registry') }}"
+quay_mirror_org: "{{ disconnected.quay_mirror.org | default(disconnected.mirror_base_path | default('ocp4')) }}"
+quay_mirror_robot_account: "{{ disconnected.quay_mirror.robot_account | default('mirror') }}"
+quay_mirror_admin_user: "{{ disconnected.quay_mirror.admin_user | default('quayadmin') }}"
+quay_mirror_admin_password: "{{ disconnected.quay_mirror.admin_password | default('RedHat123!') }}"

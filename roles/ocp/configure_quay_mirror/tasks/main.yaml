@@ -1,0 +1,124 @@
+---
+# ==============================================================================
+# CONFIGURE QUAY AS MIRROR REGISTRY
+#
+# Waits for Quay to be healthy on the hub cluster, then configures it as a
+# mirror target: creates org + robot account, and merges the robot credentials
+# into the cluster global pull secret so nodes can pull from Quay.
+# ==============================================================================
+
+- name: Wait for QuayRegistry to be Available
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get quayregistry {{ quay_mirror_registry_name }}
+    -n {{ quay_mirror_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}' 2>/dev/null || true
+  register: _quay_conditions
+  changed_when: false
+  until: "'Available=True' in _quay_conditions.stdout"
+  retries: 60
+  delay: 30
+
+- name: Get Quay Route hostname
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get route
+    -n {{ quay_mirror_namespace }}
+    -l "quay-operator/quayregistryname={{ quay_mirror_registry_name }}"
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.items[0].spec.host}' 2>/dev/null || true
+  register: _quay_route_raw
+  changed_when: false
+  retries: 10
+  delay: 10
+  until: _quay_route_raw.stdout != ""
+
+- name: Set Quay registry URL facts
+  ansible.builtin.set_fact:
+    quay_registry_url: "{{ _quay_route_raw.stdout | trim }}"
+    quay_mirror_push_url: "{{ _quay_route_raw.stdout | trim }}/{{ quay_mirror_org }}"
+
+- name: Create mirror organization in Quay
+  ansible.builtin.uri:
+    url: "https://{{ quay_registry_url }}/api/v1/organization/"
+    method: POST
+    validate_certs: false
+    user: "{{ quay_mirror_admin_user }}"
+    password: "{{ quay_mirror_admin_password }}"
+    force_basic_auth: true
+    body_format: json
+    body:
+      name: "{{ quay_mirror_org }}"
+      email: "mirror@local.invalid"
+    status_code: [200, 201, 400]
+  register: _quay_org_result
+  no_log: true
+
+- name: Create mirror robot account in Quay
+  ansible.builtin.uri:
+    url: "https://{{ quay_registry_url }}/api/v1/organization/{{ quay_mirror_org }}/robots/{{ quay_mirror_robot_account }}"
+    method: PUT
+    validate_certs: false
+    user: "{{ quay_mirror_admin_user }}"
+    password: "{{ quay_mirror_admin_password }}"
+    force_basic_auth: true
+    body_format: json
+    body:
+      description: "oc-mirror push/pull account"
+    status_code: [200, 201]
+  register: _quay_robot_result
+  no_log: true
+
+- name: Set robot account facts
+  ansible.builtin.set_fact:
+    quay_robot_username: "{{ quay_mirror_org }}+{{ quay_mirror_robot_account }}"
+    quay_robot_token: "{{ _quay_robot_result.json.token }}"
+  no_log: true
+
+- name: Grant robot account admin access to mirror org
+  ansible.builtin.uri:
+    url: "https://{{ quay_registry_url }}/api/v1/organization/{{ quay_mirror_org }}/teams/owners/members/{{ quay_mirror_org }}+{{ quay_mirror_robot_account }}"
+    method: PUT
+    validate_certs: false
+    user: "{{ quay_mirror_admin_user }}"
+    password: "{{ quay_mirror_admin_password }}"
+    force_basic_auth: true
+    body_format: json
+    body: {}
+    status_code: [200, 201]
+  no_log: true
+
+- name: Merge Quay robot credentials into cluster global pull secret
+  ansible.builtin.shell: |
+    set -e
+    MERGED=$({{ bin_dir }}/oc get secret pull-secret \
+      -n openshift-config \
+      --kubeconfig {{ target_kubeconfig }} \
+      -o jsonpath='{.data.\.dockerconfigjson}' \
+      | base64 -d \
+      | jq -c \
+          --arg host "{{ quay_registry_url }}" \
+          --arg auth "{{ (quay_robot_username ~ ':' ~ quay_robot_token) | b64encode }}" \
+          '.auths[$host] = {"auth": $auth, "email": ""}')
+
+    {{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f - <<EOF
+    apiVersion: v1
+    kind: Secret
+    metadata:
+      name: pull-secret
+      namespace: openshift-config
+    type: kubernetes.io/dockerconfigjson
+    data:
+      .dockerconfigjson: "$(echo -n "$MERGED" | base64 -w 0)"
+    EOF
+  args:
+    executable: /bin/bash
+  changed_when: true
+  no_log: true
+
+- name: Display Quay mirror configuration summary
+  ansible.builtin.debug:
+    msg:
+      - "Quay mirror registry configured"
+      - "Registry URL: {{ quay_registry_url }}"
+      - "Push target:  {{ quay_mirror_push_url }}"
+      - "Robot user:   {{ quay_robot_username }}"
