@@ -324,12 +324,13 @@ The disconnected playbook deploys the same Hub+Spoke architecture in an environm
 
 ### Workflow
 
-The playbook has four phases, controlled via tags:
+The playbook has five phases, controlled via tags:
 
 1. **`jumphost`** — Installs tools (`oc-mirror`, `mirror-registry`), stands up a local Quay-based mirror registry, and mirrors OCP release images + operator catalogs. Run once.
 2. **`hub`** — Provisions the ACM Hub cluster via IPI using mirrored images, applies disconnected cluster configuration (IDMS, CatalogSource, pull secret), installs Day 2 operators via ArgoCD, and configures ACM for disconnected spoke provisioning.
 3. **`spokes`** — Provisions managed clusters via ACM/Hive with disconnected settings. Each spoke receives mirror configuration via ManifestWork.
-4. **`summary`** — Prints connection info for all clusters.
+4. **`migrate_mirror`** — After Quay is running on the hub, migrates all mirrored content from the jumphost mirror registry to Quay, updates IDMS on the hub and all spokes, and enables jumphost decommission. Skip with `--skip-tags migrate_mirror` if you intend to keep the jumphost as the permanent mirror registry.
+5. **`summary`** — Prints connection info for all clusters.
 
 ### Prerequisites
 
@@ -364,6 +365,20 @@ ansible-playbook hub-spoke-disconnected-setup.yaml -i inventory-disconnected.yam
 ansible-playbook hub-spoke-disconnected-setup.yaml -i inventory-disconnected.yaml --tags spokes
 # Or a single spoke:
 ansible-playbook hub-spoke-disconnected-setup.yaml -i inventory-disconnected.yaml --tags spokes --limit managed-cluster-3
+```
+
+### Migrate mirror registry from jumphost to Quay (decommission jumphost):
+
+Runs automatically as part of the full playbook. To run standalone after the fact:
+
+```bash
+ansible-playbook migrate-mirror-to-quay.yaml -i inventory-disconnected.yaml
+```
+
+To skip migration and keep the jumphost as the permanent mirror registry:
+
+```bash
+ansible-playbook hub-spoke-disconnected-setup.yaml -i inventory-disconnected.yaml --skip-tags migrate_mirror
 ```
 
 ### Disconnected Hub+Spoke Inventory
@@ -440,19 +455,25 @@ all:
         - name: odf-external-snapshotter-operator
           channels:
             - name: "stable-4.22"
-        # GitOps operator — mirror both channels if spokes use different versions
+        # GitOps operator — channel drives install_openshift_gitops and policy_install_openshift_gitops roles
         - name: openshift-gitops-operator
           channels:
-            - name: "gitops-1.19"             # hub and newer spokes
-            - name: "gitops-1.18"             # older spokes (match gitops_version per host)
+            - name: "gitops-1.21"             # must match what is available in your OCP version's catalog
         - name: quay-operator
           channels:
-            - name: "stable-3.17"
+            - name: "stable-3.18"
       # Optional: additional images to mirror (not part of release or operator catalogs)
       # additional_images:
       #   - registry.redhat.io/ubi9/ubi:latest
       gitea:
         admin_password: "<gitea_admin_password>"  # Admin password for the internal Git server on the hub
+      quay_mirror:
+        namespace: "local-quay"                   # Namespace where Quay is deployed
+        registry_name: "quay-registry"            # QuayRegistry CR name
+        org: "ocp4"                               # Org to create in Quay (matches mirror_base_path)
+        robot_account: "mirror"                   # Robot account name for oc-mirror push/pull
+        admin_user: "quayadmin"                   # Quay admin username
+        admin_password: "<quay_admin_password>"   # Quay admin password
     smtp:
       host: "smtp.gmail.com"
       port: "587"
@@ -568,6 +589,12 @@ all:
 | `disconnected.operators[].channels` | No | — | List of channels to mirror (omit to mirror default channel). Always specify channels — omitting causes the catalog default to be mirrored, which may pull far more content than intended. |
 | `disconnected.additional_images` | No | `[]` | Extra images to mirror beyond release and operators |
 | `disconnected.gitea.admin_password` | No | `R3dH4t!gitea` | Admin password for the Gitea Git server deployed on the hub cluster |
+| `disconnected.quay_mirror.namespace` | No | `local-quay` | Namespace where the Quay operator is deployed |
+| `disconnected.quay_mirror.registry_name` | No | `quay-registry` | Name of the QuayRegistry CR |
+| `disconnected.quay_mirror.org` | No | value of `mirror_base_path` | Quay organization to create for mirrored content |
+| `disconnected.quay_mirror.robot_account` | No | `mirror` | Robot account name used by oc-mirror for push/pull |
+| `disconnected.quay_mirror.admin_user` | No | `quayadmin` | Quay admin username (used to create org and robot account) |
+| `disconnected.quay_mirror.admin_password` | Yes (migrate_mirror phase) | — | Quay admin password |
 
 ---
 
