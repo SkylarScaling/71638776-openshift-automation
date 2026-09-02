@@ -77,26 +77,38 @@
     os.chdir('/quay-registry')
     from app import app
     from data.model import user as user_model
+    from data.database import User
     with app.app_context():
+        # Check if already exists with a working password
+        existing = None
         try:
-            user_model.create_user_noverify(
-                '{{ quay_mirror_admin_user }}',
-                '{{ quay_mirror_admin_password }}',
-                '{{ quay_mirror_admin_user }}@local.invalid'
-            )
-            print('created')
-        except Exception as e:
-            msg = str(e).lower()
-            if 'unique' in msg or 'already' in msg or 'duplicate' in msg:
-                print('exists')
-            else:
+            existing = user_model.get_user('{{ quay_mirror_admin_user }}')
+        except Exception:
+            pass
+        if existing:
+            # User exists — ensure password is correct by resetting it
+            try:
+                user_model.change_password(existing, '{{ quay_mirror_admin_password }}')
+                User.update(verified=True).where(User.username == '{{ quay_mirror_admin_user }}').execute()
+                print('updated')
+            except Exception as e:
+                print('error resetting password: ' + str(e), file=sys.stderr)
+                sys.exit(1)
+        else:
+            try:
+                # create_user(username, password, email) sets the bcrypt hash
+                u = user_model.create_user('{{ quay_mirror_admin_user }}', '{{ quay_mirror_admin_password }}', '{{ quay_mirror_admin_user }}@local.invalid')
+                # Mark verified so no email confirmation is needed
+                User.update(verified=True).where(User.username == '{{ quay_mirror_admin_user }}').execute()
+                print('created')
+            except Exception as e:
                 print('error: ' + str(e), file=sys.stderr)
                 sys.exit(1)
     PYEOF
   args:
     executable: /bin/bash
   register: _quay_user_create
-  changed_when: "'created' in _quay_user_create.stdout"
+  changed_when: "_quay_user_create.stdout | trim in ['created', 'updated']"
   no_log: true
   when: _quay_init.status in [400, 403, 409]
 
