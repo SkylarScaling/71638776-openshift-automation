@@ -36,18 +36,6 @@
   when: disable_default_catalog_sources | bool
   changed_when: true
 
-- name: Extract Quay-hosted index image reference from oc-mirror CatalogSource
-  ansible.builtin.set_fact:
-    _quay_index_image: >-
-      {{
-        (quay_catalogsource_manifests
-         | map('from_yaml_all')
-         | flatten
-         | selectattr('kind', 'equalto', 'CatalogSource')
-         | map(attribute='spec.image')
-         | first)
-      }}
-
 - name: Update redhat-operators CatalogSource to use Quay index image
   ansible.builtin.shell:
     cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
@@ -59,7 +47,7 @@
         namespace: openshift-marketplace
       spec:
         sourceType: grpc
-        image: "{{ _quay_index_image }}"
+        image: "{{ quay_catalog_image }}"
         displayName: "Red Hat Operators (Quay Mirror)"
         publisher: "Red Hat (Quay Mirror)"
         updateStrategy:
@@ -116,7 +104,7 @@
                 namespace: openshift-marketplace
               spec:
                 sourceType: grpc
-                image: "{{ _quay_index_image }}"
+                image: "{{ quay_catalog_image }}"
                 displayName: "Red Hat Operators (Quay Mirror)"
                 publisher: "Red Hat (Quay Mirror)"
                 updateStrategy:

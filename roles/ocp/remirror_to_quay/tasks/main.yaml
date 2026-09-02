@@ -98,10 +98,20 @@
   loop: "{{ _quay_cs_files.files }}"
   register: _quay_cs_raw
 
-- name: Set Quay mirror manifest facts
+- name: Set Quay IDMS manifest facts
   ansible.builtin.set_fact:
     quay_idms_manifests: "{{ _quay_idms_raw.results | map(attribute='content') | map('b64decode') | list }}"
-    quay_catalogsource_manifests: "{{ _quay_cs_raw.results | map(attribute='content') | map('b64decode') | list }}"
+
+- name: Extract Quay catalog index image reference from CatalogSource file
+  ansible.builtin.shell: >
+    grep -h '^\s*image:' {{ quay_mirror_workspace }}/working-dir/cluster-resources/cs-*.yaml
+    | head -1 | awk '{print $2}'
+  register: _quay_catalog_image_raw
+  changed_when: false
+
+- name: Set Quay catalog image fact
+  ansible.builtin.set_fact:
+    quay_catalog_image: "{{ _quay_catalog_image_raw.stdout | trim }}"
 
 - name: Display remirror summary
   ansible.builtin.debug:
