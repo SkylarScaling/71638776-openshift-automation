@@ -37,6 +37,21 @@
     quay_registry_url: "{{ _quay_route_raw.stdout | trim }}"
     quay_mirror_push_url: "{{ _quay_route_raw.stdout | trim }}/{{ quay_mirror_org }}"
 
+- name: Initialize Quay superuser account (FEATURE_USER_INITIALIZE — idempotent, 4xx = already done)
+  ansible.builtin.uri:
+    url: "https://{{ quay_registry_url }}/api/v1/user/initialize"
+    method: POST
+    validate_certs: false
+    body_format: json
+    body:
+      username: "{{ quay_mirror_admin_user }}"
+      password: "{{ quay_mirror_admin_password }}"
+      email: "{{ quay_mirror_admin_user }}@local.invalid"
+      access_token: false
+    status_code: [200, 201, 400, 403, 409]
+  register: _quay_init
+  no_log: true
+
 - name: Create mirror organization in Quay
   ansible.builtin.uri:
     url: "https://{{ quay_registry_url }}/api/v1/organization/"
