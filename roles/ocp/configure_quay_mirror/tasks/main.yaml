@@ -23,7 +23,7 @@
   ansible.builtin.shell: >
     {{ bin_dir }}/oc get route
     -n {{ quay_mirror_namespace }}
-    -l "quay-operator/quayregistryname={{ quay_mirror_registry_name }}"
+    -l "quay-component=quay-app-route,quay-operator/quayregistry={{ quay_mirror_registry_name }}"
     --kubeconfig {{ target_kubeconfig }}
     -o jsonpath='{.items[0].spec.host}' 2>/dev/null || true
   register: _quay_route_raw
