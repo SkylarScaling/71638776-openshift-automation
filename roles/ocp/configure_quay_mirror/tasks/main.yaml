@@ -124,7 +124,7 @@
         except Exception:
             pass  # Already a member
 
-        print('ROBOT_TOKEN=' + robot_token)
+        print('ROBOT_TOKEN=' + str(robot_token))
     PYEOF
   args:
     executable: /bin/bash
