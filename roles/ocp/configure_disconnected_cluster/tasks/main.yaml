@@ -31,6 +31,7 @@
           | selectattr('kind', 'equalto', 'CatalogSource')
           | map(attribute='spec.image')
           | first) }}
+  when: oc_mirror_catalogsource_manifests | length > 0
 
 - name: Create redhat-operators CatalogSource using oc-mirror digest reference
   ansible.builtin.shell:
@@ -50,6 +51,7 @@
           registryPoll:
             interval: 30m
   changed_when: true
+  when: oc_mirror_catalogsource_manifests | length > 0
 
 - name: Update global pull secret with mirror registry credentials
   ansible.builtin.shell:
