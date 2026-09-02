@@ -17,23 +17,23 @@
     state: directory
     mode: '0755'
 
-- name: Write Quay robot credentials to auth file for oc-mirror
+- name: Merge Quay robot credentials into oc-mirror auth.json
   ansible.builtin.shell: |
     set -e
-    # Merge Quay robot auth into existing auth.json
-    existing="{{ quay_mirror_workspace }}/containers/auth.json"
-    if [ -f "$existing" ]; then
+    mkdir -p "{{ quay_mirror_workspace }}/containers"
+    AUTH_FILE="{{ quay_mirror_workspace }}/containers/auth.json"
+    if [ -f "$AUTH_FILE" ]; then
       jq -c \
         --arg host "{{ quay_registry_url }}" \
         --arg auth "{{ (quay_robot_username ~ ':' ~ quay_robot_token) | b64encode }}" \
         '.auths[$host] = {"auth": $auth, "email": ""}' \
-        "$existing" > "{{ quay_mirror_auth_file }}"
+        "$AUTH_FILE" > "${AUTH_FILE}.tmp" && mv "${AUTH_FILE}.tmp" "$AUTH_FILE"
     else
       echo '{"auths":{}}' | jq -c \
         --arg host "{{ quay_registry_url }}" \
         --arg auth "{{ (quay_robot_username ~ ':' ~ quay_robot_token) | b64encode }}" \
         '.auths[$host] = {"auth": $auth, "email": ""}' \
-        > "{{ quay_mirror_auth_file }}"
+        > "$AUTH_FILE"
     fi
   args:
     executable: /bin/bash
@@ -50,7 +50,6 @@
     docker://{{ quay_registry_url }}/{{ quay_mirror_org }}
   environment:
     XDG_RUNTIME_DIR: "{{ quay_mirror_workspace }}"
-    REGISTRY_AUTH_FILE: "{{ quay_mirror_auth_file }}"
   args:
     chdir: "{{ quay_mirror_workspace }}"
   async: 7200
