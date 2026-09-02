@@ -64,9 +64,44 @@
   until: _quay_mirror_result.finished
   retries: 240
   delay: 30
+  # rc=0: success; rc=4: partial (some images failed, IDMS still generated);
+  # rc=14: oc-mirror v2 partial success with more failures — treat same as rc=4
   failed_when:
     - _quay_mirror_result.finished
-    - _quay_mirror_result.rc not in [0, 4]
+    - _quay_mirror_result.rc not in [0, 4, 14]
+
+- name: Find oc-mirror error log for failed images
+  ansible.builtin.find:
+    paths: "{{ quay_mirror_workspace }}/working-dir/logs"
+    patterns: "mirroring_errors_*.txt"
+    file_type: file
+  register: _quay_error_logs
+  when: _quay_mirror_result.rc in [4, 14]
+
+- name: Retry failed non-bundle images via oc image mirror
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc image mirror
+    {{ item }}
+    {{ quay_registry_url }}/{{ quay_mirror_org }}/{{ item | regex_replace('^docker://[^/]+/', '') | regex_replace('@sha256:[a-f0-9]+$', '') }}
+    --registry-config={{ quay_mirror_workspace }}/containers/auth.json
+    --insecure=true
+    --filter-by-os=linux/amd64
+    --skip-missing=true
+  loop: >-
+    {{
+      lookup('file', (_quay_error_logs.files | sort(attribute='path') | last).path)
+      | regex_findall('docker://\\S+')
+      | reject('match', '.*operator-bundle.*')
+      | unique
+      | list
+    }}
+  loop_control:
+    label: "{{ item | regex_replace('^docker://', '') | truncate(80, True, '...') }}"
+  when:
+    - _quay_error_logs is defined
+    - _quay_error_logs.files | default([]) | length > 0
+  changed_when: true
+  failed_when: false
 
 - name: Find Quay IDMS manifest files from oc-mirror output
   ansible.builtin.find:
