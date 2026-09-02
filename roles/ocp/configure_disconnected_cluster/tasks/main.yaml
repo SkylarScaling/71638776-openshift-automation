@@ -54,17 +54,27 @@
   when: oc_mirror_catalogsource_manifests | length > 0
 
 - name: Update global pull secret with mirror registry credentials
-  ansible.builtin.shell:
-    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
-    stdin: |
-      apiVersion: v1
-      kind: Secret
-      metadata:
-        name: pull-secret
-        namespace: openshift-config
-      type: kubernetes.io/dockerconfigjson
-      data:
-        .dockerconfigjson: "{{ disconnected_pull_secret | to_json | b64encode }}"
+  ansible.builtin.shell: |
+    set -e
+    CURRENT=$({{ bin_dir }}/oc get secret pull-secret \
+      -n openshift-config \
+      --kubeconfig {{ target_kubeconfig }} \
+      -o jsonpath='{.data.\.dockerconfigjson}' | base64 -d)
+    MERGED=$(echo "$CURRENT" | jq -c \
+      --argjson new '{{ disconnected_pull_secret | to_json }}' \
+      '.auths += $new.auths')
+    {{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f - <<EOF
+    apiVersion: v1
+    kind: Secret
+    metadata:
+      name: pull-secret
+      namespace: openshift-config
+    type: kubernetes.io/dockerconfigjson
+    data:
+      .dockerconfigjson: "$(echo -n "$MERGED" | base64 -w 0)"
+    EOF
+  args:
+    executable: /bin/bash
   changed_when: true
   no_log: true
 
