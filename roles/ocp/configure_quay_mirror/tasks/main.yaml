@@ -2,9 +2,12 @@
 # ==============================================================================
 # CONFIGURE QUAY AS MIRROR REGISTRY
 #
-# Waits for Quay to be healthy on the hub cluster, then configures it as a
-# mirror target: creates org + robot account, and merges the robot credentials
-# into the cluster global pull secret so nodes can pull from Quay.
+# Waits for Quay to be healthy, then uses oc exec into the Quay app pod to
+# configure everything via Quay's Python model layer: admin user, mirror org,
+# robot account. Outputs the robot token for oc-mirror to use.
+#
+# All configuration bypasses the HTTP API (which requires CSRF/OAuth) by
+# calling Quay's internal model functions directly in the container.
 # ==============================================================================
 
 - name: Wait for QuayRegistry to be Available
@@ -37,25 +40,6 @@
     quay_registry_url: "{{ _quay_route_raw.stdout | trim }}"
     quay_mirror_push_url: "{{ _quay_route_raw.stdout | trim }}/{{ quay_mirror_org }}"
 
-- name: Attempt Quay superuser account initialization via /user/initialize
-  ansible.builtin.uri:
-    url: "https://{{ quay_registry_url }}/api/v1/user/initialize"
-    method: POST
-    validate_certs: false
-    body_format: json
-    body:
-      username: "{{ quay_mirror_admin_user }}"
-      password: "{{ quay_mirror_admin_password }}"
-      email: "{{ quay_mirror_admin_user }}@local.invalid"
-      access_token: false
-    status_code: [200, 201, 400, 403, 409]
-  register: _quay_init
-  no_log: true
-
-# initialize fails with 400 if the DB is non-empty (e.g. internal Quay setup rows exist)
-# even when quayadmin hasn't been created yet. Bypass HTTP entirely — exec into the
-# Quay app pod and call Quay's own Python model layer to create the user, which avoids
-# CSRF entirely and works regardless of Quay's HTTP security settings.
 - name: Get Quay app pod name
   ansible.builtin.shell: >
     {{ bin_dir }}/oc get pod -n {{ quay_mirror_namespace }}
@@ -64,9 +48,8 @@
     --no-headers -o custom-columns=NAME:.metadata.name | head -1
   register: _quay_app_pod
   changed_when: false
-  when: _quay_init.status in [400, 403, 409]
 
-- name: Create quayadmin via Quay Python model (bypasses CSRF)
+- name: Configure Quay admin user, mirror org, and robot account via Python model
   ansible.builtin.shell: |
     cat << 'PYEOF' | {{ bin_dir }}/oc exec -i -n {{ quay_mirror_namespace }} \
       --kubeconfig {{ target_kubeconfig }} \
@@ -76,99 +59,86 @@
     sys.path.insert(0, '/quay-registry')
     os.chdir('/quay-registry')
     from app import app
-    from data.model import user as user_model
+    from data.model import user as user_model, organization as org_model, team as team_model
     from data.database import User
+
     with app.app_context():
-        existing = None
+        # ---- Admin user ----
+        admin = None
         try:
-            existing = user_model.get_user('{{ quay_mirror_admin_user }}')
+            admin = user_model.get_user('{{ quay_mirror_admin_user }}')
         except Exception:
             pass
-        if existing:
-            try:
-                user_model.change_password(existing, '{{ quay_mirror_admin_password }}')
-                User.update(verified=True).where(User.username == '{{ quay_mirror_admin_user }}').execute()
-                print('updated')
-            except Exception as e:
-                print('error resetting password: ' + str(e), file=sys.stderr)
-                sys.exit(1)
+
+        if admin is None:
+            admin = user_model.create_user(
+                '{{ quay_mirror_admin_user }}',
+                '{{ quay_mirror_admin_password }}',
+                '{{ quay_mirror_admin_user }}@local.invalid'
+            )
+            User.update(verified=True).where(
+                User.username == '{{ quay_mirror_admin_user }}'
+            ).execute()
         else:
-            try:
-                u = user_model.create_user('{{ quay_mirror_admin_user }}', '{{ quay_mirror_admin_password }}', '{{ quay_mirror_admin_user }}@local.invalid')
-                User.update(verified=True).where(User.username == '{{ quay_mirror_admin_user }}').execute()
-                print('created')
-            except Exception as e:
-                print('error: ' + str(e), file=sys.stderr)
+            user_model.change_password(admin, '{{ quay_mirror_admin_password }}')
+            User.update(verified=True).where(
+                User.username == '{{ quay_mirror_admin_user }}'
+            ).execute()
+        admin = user_model.get_user('{{ quay_mirror_admin_user }}')
+
+        # ---- Mirror organization ----
+        org = None
+        try:
+            org = org_model.get_organization('{{ quay_mirror_org }}')
+        except Exception:
+            pass
+        if org is None:
+            org = org_model.create_organization(
+                '{{ quay_mirror_org }}',
+                '{{ quay_mirror_org }}@local.invalid',
+                admin
+            )
+
+        # ---- Robot account ----
+        robot_token = None
+        try:
+            robot, robot_token = user_model.create_robot(
+                '{{ quay_mirror_robot_account }}', org
+            )
+        except Exception as e:
+            if 'already' in str(e).lower() or 'unique' in str(e).lower() or 'exist' in str(e).lower():
+                robot, robot_token = user_model.get_robot(
+                    '{{ quay_mirror_robot_account }}', org
+                )
+            else:
+                print('ERROR creating robot: ' + str(e), file=sys.stderr)
                 sys.exit(1)
+
+        # ---- Grant robot owners access ----
+        try:
+            owners = team_model.get_organization_team('{{ quay_mirror_org }}', 'owners')
+            team_model.add_user_to_team(robot, owners)
+        except Exception:
+            pass  # Already a member
+
+        print('ROBOT_TOKEN=' + robot_token)
     PYEOF
   args:
     executable: /bin/bash
-  register: _quay_user_create
-  changed_when: "_quay_user_create.stdout | trim in ['created', 'updated']"
-  no_log: true
-  when: _quay_init.status in [400, 403, 409]
-
-- name: Verify quayadmin authentication succeeds
-  ansible.builtin.uri:
-    url: "https://{{ quay_registry_url }}/api/v1/user/"
-    method: GET
-    validate_certs: false
-    user: "{{ quay_mirror_admin_user }}"
-    password: "{{ quay_mirror_admin_password }}"
-    force_basic_auth: true
-    status_code: 200
-  register: _quay_auth_check
-  # TODO UNCOMMENT no_log: true
-  failed_when: _quay_auth_check.status != 200
-
-- name: Create mirror organization in Quay
-  ansible.builtin.uri:
-    url: "https://{{ quay_registry_url }}/api/v1/organization/"
-    method: POST
-    validate_certs: false
-    user: "{{ quay_mirror_admin_user }}"
-    password: "{{ quay_mirror_admin_password }}"
-    force_basic_auth: true
-    body_format: json
-    body:
-      name: "{{ quay_mirror_org }}"
-      email: "mirror@local.invalid"
-    status_code: [200, 201, 400]
-  register: _quay_org_result
+  register: _quay_setup
+  changed_when: true
   no_log: true
 
-- name: Create mirror robot account in Quay
-  ansible.builtin.uri:
-    url: "https://{{ quay_registry_url }}/api/v1/organization/{{ quay_mirror_org }}/robots/{{ quay_mirror_robot_account }}"
-    method: PUT
-    validate_certs: false
-    user: "{{ quay_mirror_admin_user }}"
-    password: "{{ quay_mirror_admin_password }}"
-    force_basic_auth: true
-    body_format: json
-    body:
-      description: "oc-mirror push/pull account"
-    status_code: [200, 201]
-  register: _quay_robot_result
-  no_log: true
-
-- name: Set robot account facts
+- name: Parse robot account credentials from Quay setup output
   ansible.builtin.set_fact:
     quay_robot_username: "{{ quay_mirror_org }}+{{ quay_mirror_robot_account }}"
-    quay_robot_token: "{{ _quay_robot_result.json.token }}"
-  no_log: true
-
-- name: Grant robot account admin access to mirror org
-  ansible.builtin.uri:
-    url: "https://{{ quay_registry_url }}/api/v1/organization/{{ quay_mirror_org }}/teams/owners/members/{{ quay_mirror_org }}+{{ quay_mirror_robot_account }}"
-    method: PUT
-    validate_certs: false
-    user: "{{ quay_mirror_admin_user }}"
-    password: "{{ quay_mirror_admin_password }}"
-    force_basic_auth: true
-    body_format: json
-    body: {}
-    status_code: [200, 201]
+    quay_robot_token: >-
+      {{
+        _quay_setup.stdout_lines
+        | select('match', '^ROBOT_TOKEN=')
+        | first
+        | replace('ROBOT_TOKEN=', '')
+      }}
   no_log: true
 
 - name: Merge Quay robot credentials into cluster global pull secret
@@ -203,6 +173,6 @@
   ansible.builtin.debug:
     msg:
       - "Quay mirror registry configured"
-      - "Registry URL: {{ quay_registry_url }}"
-      - "Push target:  {{ quay_mirror_push_url }}"
-      - "Robot user:   {{ quay_robot_username }}"
+      - "Registry URL:  {{ quay_registry_url }}"
+      - "Push target:   {{ quay_mirror_push_url }}"
+      - "Robot account: {{ quay_robot_username }}"
