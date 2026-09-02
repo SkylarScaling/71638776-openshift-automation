@@ -106,10 +106,13 @@
                 '{{ quay_mirror_robot_account }}', org
             )
         except Exception as e:
-            if 'already' in str(e).lower() or 'unique' in str(e).lower() or 'exist' in str(e).lower():
-                robot, robot_token = user_model.get_robot(
-                    '{{ quay_mirror_robot_account }}', org
-                )
+            if 'exist' in str(e).lower() or 'unique' in str(e).lower() or 'InvalidRobot' in type(e).__name__:
+                # Robot already exists — retrieve its token directly from the DB
+                from data.database import User, RobotAccountToken
+                robot_fullname = '{{ quay_mirror_org }}+{{ quay_mirror_robot_account }}'
+                robot = User.get(User.username == robot_fullname)
+                token_record = RobotAccountToken.get(RobotAccountToken.robot_account == robot)
+                robot_token = token_record.token
             else:
                 print('ERROR creating robot: ' + str(e), file=sys.stderr)
                 sys.exit(1)
@@ -127,7 +130,7 @@
     executable: /bin/bash
   register: _quay_setup
   changed_when: true
-  # no_log: true  # temporarily disabled for debugging
+  no_log: true
 
 - name: Parse robot account credentials from Quay setup output
   ansible.builtin.set_fact:
