@@ -127,7 +127,7 @@
     executable: /bin/bash
   register: _quay_setup
   changed_when: true
-  no_log: true
+  # no_log: true  # temporarily disabled for debugging
 
 - name: Parse robot account credentials from Quay setup output
   ansible.builtin.set_fact:
