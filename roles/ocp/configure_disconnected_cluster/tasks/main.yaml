@@ -106,8 +106,8 @@
   until: >
     catalog_status.stdout != "" and
     (catalog_status.stdout_lines | reject('search', '=READY$') | reject('match', '^$') | list | length == 0)
-  retries: 30
-  delay: 10
+  retries: 60
+  delay: 30
   changed_when: false
 
 - name: Display disconnected cluster configuration status
