@@ -52,6 +52,11 @@
   delay: 15
   changed_when: false
   when: wait_for_operator_ready
+  # Non-fatal on re-runs: CatalogSource may be TRANSIENT_FAILURE if the Quay
+  # migration ingress CA trust (patch_cluster_idms) hasn't run yet. If GitOps
+  # is already installed, the subscription and CSV already exist and this wait
+  # is not needed. The migrate_mirror play will resolve CatalogSource health.
+  failed_when: false
 
 - name: "Wait for GitOps Operator CSV to be installed"
   ansible.builtin.shell: >
