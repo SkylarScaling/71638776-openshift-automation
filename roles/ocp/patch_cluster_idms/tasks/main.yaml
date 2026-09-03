@@ -11,36 +11,16 @@
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
-# HUB CLUSTER: trust the Quay registry (OpenShift ingress CA)
+# HUB CLUSTER: allow insecure pulls from the Quay route
 #
-# The Quay route uses the cluster's ingress operator CA, which is not in the
-# default image pull trust. Without this, CRI-O rejects pulls from Quay routes.
-# Adding the CA to additionalTrustedCA triggers one MCO roll.
+# The Quay route uses the cluster ingress CA which is not in the CRI-O trust
+# store by default. Rather than distributing the CA (which requires a second
+# MCO roll and relies on the Image Registry Operator to propagate it), mark
+# the Quay hostname as an insecureRegistry. CRI-O skips TLS verification for
+# that hostname, and the MCO roll triggered here distributes that setting
+# reliably to all nodes.
 # ------------------------------------------------------------------------------
-- name: Get OpenShift ingress operator CA cert
-  ansible.builtin.shell: >
-    {{ bin_dir }}/oc get secret router-ca
-    -n openshift-ingress-operator
-    --kubeconfig {{ target_kubeconfig }}
-    -o jsonpath='{.data.tls\.crt}' | base64 -d
-  register: _ingress_ca_raw
-  changed_when: false
-
-- name: Create registry-cas ConfigMap with ingress CA for Quay hostname
-  ansible.builtin.shell:
-    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
-    stdin: |
-      apiVersion: v1
-      kind: ConfigMap
-      metadata:
-        name: registry-cas
-        namespace: openshift-config
-      data:
-        {{ quay_registry_url }}: |
-          {{ _ingress_ca_raw.stdout | indent(10) }}
-  changed_when: true
-
-- name: Configure cluster Image CR to trust ingress CA for Quay registry
+- name: Configure Quay registry as insecure in cluster Image CR
   ansible.builtin.shell:
     cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
     stdin: |
@@ -49,8 +29,9 @@
       metadata:
         name: cluster
       spec:
-        additionalTrustedCA:
-          name: registry-cas
+        registrySources:
+          insecureRegistries:
+            - "{{ quay_registry_url }}"
   changed_when: true
 
 # ------------------------------------------------------------------------------
