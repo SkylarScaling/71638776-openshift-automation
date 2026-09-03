@@ -27,3 +27,20 @@
   retries: 120  # Wait up to 60 minutes total (120 * 30 seconds)
   delay: 30
   changed_when: false
+  # Non-fatal on re-runs: operator apps (ACM, ODF, Quay) show Degraded when
+  # the CatalogSource is in TRANSIENT_FAILURE post-migration. The migrate_mirror
+  # play's patch_cluster_idms will apply the ingress CA trust that fixes the
+  # CatalogSource. Apps will recover after that MCO roll completes.
+  failed_when: false
+
+- name: Warn if Argo CD Applications are not all healthy
+  ansible.builtin.debug:
+    msg: >
+      WARNING: Some Argo CD Applications are not Healthy/Synced:
+      {{ all_app_statuses.stdout_lines | select('ne', '') | reject('search', '=Healthy/Synced$') | list }}
+      If the Quay mirror migration is pending, these will recover after patch_cluster_idms runs.
+  when: >
+    all_app_statuses.stdout_lines
+    | select('ne', '')
+    | reject('search', '=Healthy/Synced$')
+    | list | length > 0
