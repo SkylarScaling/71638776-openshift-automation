@@ -131,7 +131,7 @@
     executable: /bin/bash
   register: _quay_setup
   changed_when: true
-  # no_log: true  # re-enable once working TODO
+  no_log: true TODO
 
 - name: Parse robot account credentials from Quay setup output
   ansible.builtin.set_fact:
