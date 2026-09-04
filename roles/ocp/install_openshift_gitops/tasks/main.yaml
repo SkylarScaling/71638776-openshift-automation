@@ -79,15 +79,20 @@
 - name: "Fail fast if CatalogSource is not READY and no CSV is installed yet"
   ansible.builtin.fail:
     msg: >-
-      {{ gitops_operator_source }} CatalogSource is
-      "{{ _cs_state.stdout | default('unknown') }}" (expected READY).
-      OLM cannot resolve the openshift-gitops-operator Subscription.
-      On a disconnected cluster this usually means the operator catalog image
-      was not successfully mirrored. Check:
+      {{ gitops_operator_source }} CatalogSource state is
+      "{{ _cs_state.stdout | default('(not found)') }}" (expected READY) and no
+      installedCSV exists — OLM cannot resolve the openshift-gitops-operator Subscription.
+      {% if _cs_state.stdout | default('') == '' %}
+      The CatalogSource does not exist. On a disconnected cluster this means
+      configure_disconnected_cluster did not create it, most likely because
+      oc-mirror produced no CatalogSource manifests (operator images not mirrored).
+      Re-run the mirroring step.
+      {% else %}
+      The CatalogSource exists but its pod is not healthy. Check:
         oc get pods -n {{ gitops_operator_source_namespace }}
           --kubeconfig {{ target_kubeconfig }}
-      to see if the catalog pod is in ImagePullBackOff or CrashLoopBackOff,
-      and verify the oc-mirror run mirrored all operator images without errors.
+      for ImagePullBackOff or CrashLoopBackOff.
+      {% endif %}
   when:
     - wait_for_operator_ready
     - _cs_state.stdout | default('') != "READY"

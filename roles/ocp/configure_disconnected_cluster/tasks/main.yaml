@@ -22,6 +22,17 @@
   when: disable_default_catalog_sources | bool
   changed_when: true
 
+- name: Fail if oc-mirror produced no CatalogSource manifests
+  ansible.builtin.fail:
+    msg: >-
+      oc_mirror_catalogsource_manifests is empty — oc-mirror did not generate
+      a CatalogSource for the operator catalog. This usually means the operator
+      images (including the catalog index image) were not successfully mirrored.
+      Without a CatalogSource no operators can install.
+      Re-run the mirroring step and check:
+        {{ oc_mirror_workspace }}/working-dir/logs/mirroring_errors_*.txt
+  when: oc_mirror_catalogsource_manifests | default([]) | length == 0
+
 - name: Extract mirrored operator index image reference from oc-mirror CatalogSource
   ansible.builtin.set_fact:
     _mirrored_index_image: >-
@@ -31,7 +42,6 @@
           | selectattr('kind', 'equalto', 'CatalogSource')
           | map(attribute='spec.image')
           | first) }}
-  when: oc_mirror_catalogsource_manifests | length > 0
 
 - name: Create redhat-operators CatalogSource using oc-mirror digest reference
   ansible.builtin.shell:
@@ -51,7 +61,6 @@
           registryPoll:
             interval: 30m
   changed_when: true
-  when: oc_mirror_catalogsource_manifests | length > 0
 
 - name: Update global pull secret with mirror registry credentials
   ansible.builtin.shell: |
