@@ -104,6 +104,30 @@
   ansible.builtin.set_fact:
     gitea_route_host: "{{ _gitea_route_hostname.stdout }}"
 
+- name: Verify Gitea image is available in mirror registry
+  ansible.builtin.uri:
+    url: "https://{{ mirror_registry_url }}/v2/{{ mirror_base_path | default('ocp4') }}/gitea/gitea/tags/list"
+    validate_certs: false
+    user: "{{ mirror_registry_init_user }}"
+    password: "{{ mirror_registry_init_password }}"
+    force_basic_auth: true
+    status_code: 200
+  register: _gitea_image_check
+  failed_when: false
+  changed_when: false
+
+- name: Fail with actionable message if Gitea image is missing from mirror registry
+  ansible.builtin.fail:
+    msg: >-
+      Gitea image not found in mirror registry at
+      {{ mirror_registry_url }}/{{ mirror_base_path | default('ocp4') }}/gitea/gitea.
+      The oc-mirror run likely failed to mirror docker.io/gitea/gitea:1.22-rootless.
+      Check the oc-mirror error log and re-mirror manually if needed:
+        oc image mirror docker.io/gitea/gitea:1.22-rootless
+          {{ mirror_registry_url }}/{{ mirror_base_path | default('ocp4') }}/gitea/gitea:1.22-rootless
+          --insecure=true
+  when: _gitea_image_check.status | default(0) != 200
+
 - name: Deploy Gitea
   ansible.builtin.shell:
     cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
@@ -115,7 +139,11 @@
     {{ bin_dir }}/oc rollout status deployment/gitea
     -n {{ gitea_namespace }}
     --kubeconfig {{ target_kubeconfig }}
-    --timeout=300s
+    --timeout=60s
+  register: _gitea_rollout
+  until: _gitea_rollout.rc == 0
+  retries: 15
+  delay: 20
   changed_when: false
 
 - name: Wait for Gitea API to respond
