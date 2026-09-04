@@ -42,7 +42,7 @@
 
 - name: "Wait for redhat-operators CatalogSource to be READY"
   ansible.builtin.shell: >
-    {{ bin_dir }}/oc get catalogsource redhat-operators
+    {{ bin_dir }}/oc get catalogsource {{ gitops_operator_source }}
     -n {{ gitops_operator_source_namespace }}
     --kubeconfig {{ target_kubeconfig }}
     -o jsonpath='{.status.connectionState.lastObservedState}' 2>/dev/null || true
@@ -58,6 +58,41 @@
   # is not needed. The migrate_mirror play will resolve CatalogSource health.
   failed_when: false
 
+# If the CatalogSource never became READY, check whether GitOps is already
+# installed before allowing the CSV wait to spin for 15 minutes. On a fresh
+# install a non-READY catalog means the operator image was not mirrored — fail
+# fast with a diagnostic message. On a re-run the CSV already exists so we can
+# skip the wait entirely.
+- name: "Check for pre-existing GitOps CSV (re-run guard)"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get subscription openshift-gitops-operator
+    -n {{ gitops_operator_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.installedCSV}' 2>/dev/null || true
+  register: _preexisting_csv
+  changed_when: false
+  failed_when: false
+  when:
+    - wait_for_operator_ready
+    - _cs_state.stdout | default('') != "READY"
+
+- name: "Fail fast if CatalogSource is not READY and no CSV is installed yet"
+  ansible.builtin.fail:
+    msg: >-
+      {{ gitops_operator_source }} CatalogSource is
+      "{{ _cs_state.stdout | default('unknown') }}" (expected READY).
+      OLM cannot resolve the openshift-gitops-operator Subscription.
+      On a disconnected cluster this usually means the operator catalog image
+      was not successfully mirrored. Check:
+        oc get pods -n {{ gitops_operator_source_namespace }}
+          --kubeconfig {{ target_kubeconfig }}
+      to see if the catalog pod is in ImagePullBackOff or CrashLoopBackOff,
+      and verify the oc-mirror run mirrored all operator images without errors.
+  when:
+    - wait_for_operator_ready
+    - _cs_state.stdout | default('') != "READY"
+    - _preexisting_csv.stdout | default('') == ""
+
 - name: "Wait for GitOps Operator CSV to be installed"
   ansible.builtin.shell: >
     {{ bin_dir }}/oc get subscriptions.operators.coreos.com openshift-gitops-operator
@@ -69,7 +104,9 @@
   retries: 90
   delay: 10
   changed_when: false
-  when: wait_for_operator_ready
+  when:
+    - wait_for_operator_ready
+    - _cs_state.stdout | default('') == "READY" or _preexisting_csv.stdout | default('') != ""
 
 - name: "Wait for the GitOps Operator Deployment to be Ready"
   ansible.builtin.shell: >
