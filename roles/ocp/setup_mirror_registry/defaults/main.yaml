@@ -4,3 +4,7 @@ mirror_registry_hostname: "{{ disconnected.mirror_registry.hostname }}"
 mirror_registry_port: "{{ disconnected.mirror_registry.port | default(8443) }}"
 mirror_registry_init_user: "{{ disconnected.mirror_registry.init_user | default('init') }}"
 mirror_registry_init_password: "{{ disconnected.mirror_registry.init_password }}"
+# How long (seconds) Quay keeps an in-progress blob upload session alive.
+# Default upstream is 300; 3600 accommodates large OCP release blobs in
+# mirrorToMirror mode without being excessively permissive.
+mirror_registry_push_timeout: 3600

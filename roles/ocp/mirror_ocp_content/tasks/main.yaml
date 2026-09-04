@@ -71,12 +71,14 @@
   retries: 240
   delay: 30
   when: oc_mirror_job is defined and oc_mirror_job.ansible_job_id is defined
-  # rc=4 means partial success: some images failed but IDMS/CatalogSource were still generated.
-  # Common cause: oc-mirror v2 manifest format incompatibility with certain multi-arch images.
-  # Check working-dir/logs/mirroring_errors_*.txt for which images need manual attention.
+  # rc=4: partial success — manifest format incompatibility with certain multi-arch images.
+  # rc=14: partial success — transient network failure (e.g. "use of closed network connection"
+  #        writing a blob to the mirror registry). IDMS is still generated; failed images are
+  #        retried below with oc image mirror.
+  # Both are handled by the retry block below. Check working-dir/logs/mirroring_errors_*.txt.
   failed_when:
     - oc_mirror_result.finished
-    - oc_mirror_result.rc not in [0, 4]
+    - oc_mirror_result.rc not in [0, 4, 14]
 
 # ==============================================================================
 # WORKAROUND: oc-mirror v2 manifest format bug
@@ -107,7 +109,7 @@
   when:
     - oc_mirror_result is defined
     - oc_mirror_result.rc is defined
-    - oc_mirror_result.rc == 4
+    - oc_mirror_result.rc in [4, 14]
 
 - name: Extract failed non-bundle image refs from error log
   ansible.builtin.shell: >
@@ -171,13 +173,14 @@
 - name: Display oc-mirror partial failure summary
   ansible.builtin.debug:
     msg:
-      - "WARNING: oc-mirror rc=4 — some images failed and were retried with oc image mirror."
+      - "WARNING: oc-mirror rc={{ oc_mirror_result.rc }} — some images failed and were retried with oc image mirror."
+      - "rc=4: manifest format incompatibility; rc=14: transient network failure."
       - "See {{ oc_mirror_workspace }}/working-dir/logs/ for details."
       - "Remove the workaround block in mirror_ocp_content/tasks/main.yaml when oc-mirror v2 fixes the manifest preservation bug."
   when:
     - oc_mirror_result is defined
     - oc_mirror_result.rc is defined
-    - oc_mirror_result.rc == 4
+    - oc_mirror_result.rc in [4, 14]
 
 - name: Find IDMS files in oc-mirror v2 cluster-resources output
   ansible.builtin.find:

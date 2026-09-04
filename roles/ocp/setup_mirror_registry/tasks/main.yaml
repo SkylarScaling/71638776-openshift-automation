@@ -21,6 +21,12 @@
         path: "{{ mirror_registry_dir }}"
         mode: '0755'
 
+    - name: Write custom Quay configuration for extended upload timeouts
+      ansible.builtin.template:
+        src: "{{ role_path }}/templates/quay-config.yaml.j2"
+        dest: "{{ mirror_registry_dir }}/quay-config.yaml"
+        mode: '0644'
+
     - name: Run mirror-registry installer
       ansible.builtin.command: >
         {{ bin_dir }}/mirror-registry install
@@ -28,6 +34,7 @@
         --quayRoot {{ mirror_registry_dir }}
         --initUser {{ mirror_registry_init_user }}
         --initPassword {{ mirror_registry_init_password }}
+        --quayConfig {{ mirror_registry_dir }}/quay-config.yaml
       register: mirror_registry_install
       changed_when: "'has been installed' in mirror_registry_install.stdout"
 
