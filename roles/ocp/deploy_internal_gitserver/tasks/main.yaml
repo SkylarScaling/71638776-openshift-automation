@@ -116,17 +116,15 @@
   failed_when: false
   changed_when: false
 
-- name: Fail with actionable message if Gitea image is missing from mirror registry
-  ansible.builtin.fail:
-    msg: >-
-      Gitea image not found in mirror registry at
-      {{ mirror_registry_url }}/{{ mirror_base_path | default('ocp4') }}/gitea/gitea.
-      The oc-mirror run likely failed to mirror docker.io/gitea/gitea:1.22-rootless.
-      Check the oc-mirror error log and re-mirror manually if needed:
-        oc image mirror docker.io/gitea/gitea:1.22-rootless
-          {{ mirror_registry_url }}/{{ mirror_base_path | default('ocp4') }}/gitea/gitea:1.22-rootless
-          --insecure=true
+- name: Mirror Gitea image to local registry if not already present
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc image mirror
+    {{ gitea_source_image }}
+    {{ gitea_image }}
+    --registry-config={{ mirror_registry_dir }}/pull-secret-merged.json
+    --insecure=true
   when: _gitea_image_check.status | default(0) != 200
+  changed_when: true
 
 - name: Deploy Gitea
   ansible.builtin.shell:
