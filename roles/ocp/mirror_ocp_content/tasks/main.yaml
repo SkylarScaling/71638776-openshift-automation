@@ -15,15 +15,33 @@
   ansible.builtin.debug:
     msg: "ImageSetConfiguration written to {{ oc_mirror_workspace }}/imageset-config.yaml"
 
-- name: Check for existing oc-mirror v2 results
+# Consider mirroring complete only when BOTH the IDMS and a CatalogSource file
+# exist. A partial rc=14 failure writes the IDMS but not the CatalogSource, so
+# checking only for the IDMS causes re-runs to skip mirroring while leaving
+# oc_mirror_catalogsource_manifests empty.
+- name: Check for existing oc-mirror v2 IDMS results
   ansible.builtin.find:
     paths: "{{ oc_mirror_workspace }}/working-dir/cluster-resources"
     patterns:
       - "idms-*.yaml"
       - "imageDigestMirrorSet*.yaml"
     file_type: file
-  register: existing_results
+  register: existing_idms
   failed_when: false
+
+- name: Check for existing oc-mirror v2 CatalogSource results
+  ansible.builtin.find:
+    paths: "{{ oc_mirror_workspace }}/working-dir/cluster-resources"
+    patterns: "cs-*.yaml"
+    file_type: file
+  register: existing_cs
+  failed_when: false
+
+- name: Set oc-mirror completion flag
+  ansible.builtin.set_fact:
+    _oc_mirror_complete: >-
+      {{ existing_idms.files | default([]) | length > 0
+         and existing_cs.files | default([]) | length > 0 }}
 
 - name: Print log path for live monitoring
   ansible.builtin.debug:
@@ -31,21 +49,21 @@
       Starting oc-mirror. This may take 60-120+ minutes depending on bandwidth.
       Monitor progress: tail -f {{ oc_mirror_workspace }}/.oc-mirror.log
       or: watch -n 5 'du -sh {{ oc_mirror_workspace }}'
-  when: existing_results.files | default([]) | length == 0
+  when: not _oc_mirror_complete
 
 - name: Create auth directory for oc-mirror credentials
   ansible.builtin.file:
     state: directory
     path: "{{ oc_mirror_workspace }}/containers"
     mode: '0700'
-  when: existing_results.files | default([]) | length == 0
+  when: not _oc_mirror_complete
 
 - name: Write merged pull secret for oc-mirror authentication
   ansible.builtin.copy:
     src: "{{ mirror_registry_dir }}/pull-secret-merged.json"
     dest: "{{ oc_mirror_workspace }}/containers/auth.json"
     mode: '0600'
-  when: existing_results.files | default([]) | length == 0
+  when: not _oc_mirror_complete
 
 - name: Run oc-mirror to mirror content to registry
   ansible.builtin.command: >
@@ -61,7 +79,7 @@
   async: 7200
   poll: 0
   register: oc_mirror_job
-  when: existing_results.files | default([]) | length == 0
+  when: not _oc_mirror_complete
 
 - name: Wait for oc-mirror to complete (up to 2 hours)
   ansible.builtin.async_status:
