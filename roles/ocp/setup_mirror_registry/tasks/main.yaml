@@ -47,8 +47,24 @@
         insertafter: EOF
       become: true
 
+    - name: Find Quay app container name
+      ansible.builtin.shell: |
+        podman ps --format json | python3 -c "
+        import sys, json
+        for c in json.load(sys.stdin):
+            name = (c.get('Names') or [''])[0]
+            nl = name.lower()
+            if 'quay' in nl and 'postgres' not in nl and 'redis' not in nl:
+                print(name)
+                break
+        "
+      register: _quay_container_name
+      become: true
+      changed_when: false
+      failed_when: _quay_container_name.stdout | trim == ""
+
     - name: Restart Quay container to apply config change
-      ansible.builtin.command: podman restart quay-app
+      ansible.builtin.command: "podman restart {{ _quay_container_name.stdout | trim }}"
       become: true
       changed_when: true
 
