@@ -182,6 +182,44 @@
     - oc_mirror_result.rc is defined
     - oc_mirror_result.rc in [4, 14]
 
+# When rc=14 oc-mirror exits before generating the CatalogSource (cs-*.yaml)
+# because 0 operator images were mirrored. The oc image mirror retry above
+# restores the images, but cluster-resources are not regenerated. Re-run
+# oc-mirror so it produces the cs-*.yaml; all images are now in the destination
+# so this second run only verifies and writes cluster-resources (fast).
+- name: Re-run oc-mirror to regenerate cluster-resources after rc=14 image recovery
+  ansible.builtin.command: >
+    {{ bin_dir }}/oc-mirror
+    --v2
+    --config {{ oc_mirror_workspace }}/imageset-config.yaml
+    --workspace file://{{ oc_mirror_workspace }}
+    docker://{{ mirror_registry_url }}/{{ mirror_base_path }}
+  environment:
+    XDG_RUNTIME_DIR: "{{ oc_mirror_workspace }}"
+  args:
+    chdir: "{{ oc_mirror_workspace }}"
+  async: 7200
+  poll: 0
+  register: oc_mirror_regen_job
+  when:
+    - oc_mirror_result is defined
+    - oc_mirror_result.rc is defined
+    - oc_mirror_result.rc == 14
+
+- name: Wait for oc-mirror cluster-resource regeneration to complete
+  ansible.builtin.async_status:
+    jid: "{{ oc_mirror_regen_job.ansible_job_id }}"
+  register: oc_mirror_regen_result
+  until: oc_mirror_regen_result.finished
+  retries: 240
+  delay: 30
+  when:
+    - oc_mirror_regen_job is defined
+    - oc_mirror_regen_job.ansible_job_id is defined
+  failed_when:
+    - oc_mirror_regen_result.finished
+    - oc_mirror_regen_result.rc not in [0, 4]
+
 - name: Find IDMS files in oc-mirror v2 cluster-resources output
   ansible.builtin.find:
     paths: "{{ oc_mirror_workspace }}/working-dir/cluster-resources"
