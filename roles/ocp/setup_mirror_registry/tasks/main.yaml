@@ -21,12 +21,6 @@
         path: "{{ mirror_registry_dir }}"
         mode: '0755'
 
-    - name: Write custom Quay configuration for extended upload timeouts
-      ansible.builtin.template:
-        src: "{{ role_path }}/templates/quay-config.yaml.j2"
-        dest: "{{ mirror_registry_dir }}/quay-config.yaml"
-        mode: '0644'
-
     - name: Run mirror-registry installer
       ansible.builtin.command: >
         {{ bin_dir }}/mirror-registry install
@@ -34,13 +28,40 @@
         --quayRoot {{ mirror_registry_dir }}
         --initUser {{ mirror_registry_init_user }}
         --initPassword {{ mirror_registry_init_password }}
-        --quayConfig {{ mirror_registry_dir }}/quay-config.yaml
       register: mirror_registry_install
       changed_when: "'has been installed' in mirror_registry_install.stdout"
 
     - name: Display mirror registry install output
       ansible.builtin.debug:
         msg: "{{ mirror_registry_install.stdout_lines[-5:] }}"
+
+    # mirror-registry has no --quayConfig install flag; patch config.yaml directly.
+    # PUSH_TEMP_TAG_EXPIRATION_SEC (default 300s) controls how long an in-progress
+    # blob upload session is kept alive — raise it so large OCP release blobs in
+    # mirrorToMirror mode don't time out mid-transfer.
+    - name: Extend Quay upload session timeout in generated config
+      ansible.builtin.lineinfile:
+        path: "{{ mirror_registry_dir }}/quay-config/config.yaml"
+        regexp: "^PUSH_TEMP_TAG_EXPIRATION_SEC:"
+        line: "PUSH_TEMP_TAG_EXPIRATION_SEC: {{ mirror_registry_push_timeout }}"
+        insertafter: EOF
+      become: true
+
+    - name: Restart Quay container to apply config change
+      ansible.builtin.command: podman restart quay-app
+      become: true
+      changed_when: true
+
+    - name: Wait for registry to be healthy after restart
+      ansible.builtin.uri:
+        url: "https://{{ mirror_registry_hostname }}:{{ mirror_registry_port }}/health/instance"
+        validate_certs: false
+        status_code: [200, 301]
+      register: _registry_restart_health
+      until: _registry_restart_health.status in [200, 301]
+      retries: 20
+      delay: 10
+      failed_when: false
   when: registry_health.status is not defined or registry_health.status not in [200, 301]
 
 - name: Set mirror registry CA cert path

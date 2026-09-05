@@ -1,7 +1,0 @@
----
-# Extended timeouts for large image mirroring operations via oc-mirror.
-# PUSH_TEMP_TAG_EXPIRATION_SEC controls how long an in-progress blob upload
-# session is kept alive before Quay garbage-collects the temporary tag.
-# The default (300s / 5 min) is too short for large OCP release blobs when
-# oc-mirror is streaming directly from the internet (mirrorToMirror mode).
-PUSH_TEMP_TAG_EXPIRATION_SEC: {{ mirror_registry_push_timeout }}
