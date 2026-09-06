@@ -59,13 +59,11 @@
                 break
         "
       register: _quay_container_name
-      become: true
       changed_when: false
       failed_when: _quay_container_name.stdout | trim == ""
 
     - name: Restart Quay container to apply config change
       ansible.builtin.command: "podman restart {{ _quay_container_name.stdout | trim }}"
-      become: true
       changed_when: true
 
     - name: Wait for registry to be healthy after restart
