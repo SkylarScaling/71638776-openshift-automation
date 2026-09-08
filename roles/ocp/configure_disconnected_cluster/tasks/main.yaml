@@ -94,6 +94,22 @@
       will begin rolling out with the updated mirror configuration.
       This may take 10-30 minutes as nodes are rebooted.
 
+# Wait for MCO to detect and begin the rolling update before checking
+# completion. Without this pre-wait, the existing Updated=True condition
+# (from a prior roll) can pass the completion check immediately, before
+# the controller has even noticed the new IDMS config.
+- name: Wait for master MachineConfigPool to begin updating (MCO detection window)
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get mcp master
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.conditions[?(@.type=="Updating")].status}'
+  register: _master_mcp_updating
+  until: _master_mcp_updating.stdout == "True"
+  retries: 12
+  delay: 15
+  changed_when: false
+  failed_when: false
+
 - name: Wait for master MachineConfigPool to finish updating
   ansible.builtin.shell: >
     {{ bin_dir }}/oc get mcp master
@@ -104,6 +120,18 @@
   retries: 60
   delay: 30
   changed_when: false
+
+- name: Wait for worker MachineConfigPool to begin updating (MCO detection window)
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get mcp worker
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.conditions[?(@.type=="Updating")].status}'
+  register: _worker_mcp_updating
+  until: _worker_mcp_updating.stdout == "True"
+  retries: 12
+  delay: 15
+  changed_when: false
+  failed_when: false
 
 - name: Wait for worker MachineConfigPool to finish updating
   ansible.builtin.shell: >
