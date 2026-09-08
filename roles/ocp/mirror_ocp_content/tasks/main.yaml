@@ -37,11 +37,24 @@
   register: existing_cs
   failed_when: false
 
+- name: Read mirror version sentinel if present
+  ansible.builtin.slurp:
+    src: "{{ oc_mirror_workspace }}/.mirror-version"
+  register: _existing_mirror_version
+  failed_when: false
+
+# Require that IDMS files, CatalogSource files, AND a version sentinel
+# matching the current openshift_version.ocp_patch_version all exist.
+# Without the version check, leftover files from a prior run targeting
+# a different OCP version would cause mirroring to be skipped while
+# leaving stale cluster-resources in the workspace.
 - name: Set oc-mirror completion flag
   ansible.builtin.set_fact:
     _oc_mirror_complete: >-
       {{ existing_idms.files | default([]) | length > 0
-         and existing_cs.files | default([]) | length > 0 }}
+         and existing_cs.files | default([]) | length > 0
+         and (_existing_mirror_version.content | default('') | b64decode | trim)
+             == (openshift_version ~ '.' ~ ocp_patch_version) }}
 
 - name: Print log path for live monitoring
   ansible.builtin.debug:
@@ -271,6 +284,12 @@
   ansible.builtin.set_fact:
     oc_mirror_idms_manifests: "{{ idms_contents.results | map(attribute='content') | map('b64decode') | list }}"
     oc_mirror_catalogsource_manifests: "{{ catalogsource_contents.results | map(attribute='content') | map('b64decode') | list }}"
+
+- name: Write mirror version sentinel
+  ansible.builtin.copy:
+    content: "{{ openshift_version }}.{{ ocp_patch_version }}"
+    dest: "{{ oc_mirror_workspace }}/.mirror-version"
+    mode: '0644'
 
 - name: Display mirroring summary
   ansible.builtin.debug:
