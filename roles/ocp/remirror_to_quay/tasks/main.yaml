@@ -2,10 +2,11 @@
 # ==============================================================================
 # REMIRROR OCP CONTENT TO QUAY
 #
-# Re-runs oc-mirror against the existing workspace to push all previously
-# mirrored content to the Quay instance on the hub cluster. The workspace
-# already contains the imageset and cached layer data from the initial mirror
-# run, so only the destination changes.
+# Runs oc-mirror from a fresh workspace to push all OCP release and operator
+# content to the Quay instance on the hub cluster. Uses a dedicated workspace
+# (quay_mirror_workspace) rather than the initial mirror workspace so that
+# oc-mirror has no prior sync state and actually pushes all images to Quay
+# instead of treating them as already synced.
 #
 # Prerequisites: configure_quay_mirror must have run first (sets quay_registry_url,
 # quay_mirror_org, quay_robot_username, quay_robot_token).
@@ -17,24 +18,37 @@
     state: directory
     mode: '0755'
 
-- name: Merge Quay robot credentials into oc-mirror auth.json
+# Use a fresh workspace so oc-mirror has no prior sync state for the Quay
+# destination. Reusing the initial mirror workspace causes oc-mirror v2 to
+# treat all content as already synced and generate IDMS pointing at Quay
+# without actually pushing the images there.
+- name: Create fresh Quay mirror workspace
+  ansible.builtin.file:
+    path: "{{ quay_mirror_workspace }}"
+    state: directory
+    mode: '0755'
+
+- name: Copy imageset-config from initial workspace to Quay workspace
+  ansible.builtin.copy:
+    src: "{{ initial_mirror_workspace }}/imageset-config.yaml"
+    dest: "{{ quay_mirror_workspace }}/imageset-config.yaml"
+    remote_src: true
+    mode: '0644'
+
+- name: Build auth.json with pull-secret credentials plus Quay robot credentials
   ansible.builtin.shell: |
     set -e
     mkdir -p "{{ quay_mirror_workspace }}/containers"
     AUTH_FILE="{{ quay_mirror_workspace }}/containers/auth.json"
-    if [ -f "$AUTH_FILE" ]; then
-      jq -c \
-        --arg host "{{ quay_registry_url }}" \
-        --arg auth "{{ (quay_robot_username ~ ':' ~ quay_robot_token) | b64encode }}" \
-        '.auths[$host] = {"auth": $auth, "email": ""}' \
-        "$AUTH_FILE" > "${AUTH_FILE}.tmp" && mv "${AUTH_FILE}.tmp" "$AUTH_FILE"
-    else
-      echo '{"auths":{}}' | jq -c \
-        --arg host "{{ quay_registry_url }}" \
-        --arg auth "{{ (quay_robot_username ~ ':' ~ quay_robot_token) | b64encode }}" \
-        '.auths[$host] = {"auth": $auth, "email": ""}' \
-        > "$AUTH_FILE"
-    fi
+    # Seed with the full merged pull secret so oc-mirror can pull from all
+    # source registries (registry.redhat.io, quay.io, etc.)
+    cp "{{ initial_mirror_workspace }}/containers/auth.json" "$AUTH_FILE"
+    # Add Quay push credentials so oc-mirror can push to the destination
+    jq -c \
+      --arg host "{{ quay_registry_url }}" \
+      --arg auth "{{ (quay_robot_username ~ ':' ~ quay_robot_token) | b64encode }}" \
+      '.auths[$host] = {"auth": $auth, "email": ""}' \
+      "$AUTH_FILE" > "${AUTH_FILE}.tmp" && mv "${AUTH_FILE}.tmp" "$AUTH_FILE"
   args:
     executable: /bin/bash
   changed_when: true
