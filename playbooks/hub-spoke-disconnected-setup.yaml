@@ -299,18 +299,90 @@
   tags: ['spokes']
   vars:
     mirror_base_path: "{{ disconnected.mirror_base_path | default('ocp4') }}"
+    mirror_registry_dir: "{{ working_dir }}/mirror-registry"
+    oc_mirror_workspace: "{{ working_dir }}/oc-mirror-workspace"
   tasks:
     - name: Set Hub Kubeconfig
       ansible.builtin.set_fact:
         hub_kubeconfig: "{{ install_dir }}/{{ hostvars[groups['hub_cluster'][0]]['ocp_cluster']['name'] }}/auth/kubeconfig"
 
-    - name: Load disconnected facts from Hub host
+    # ------------------------------------------------------------------
+    # Load disconnected facts — prefer in-memory hostvars from the Hub
+    # play; fall back to disk so --tags spokes works standalone.
+    # ------------------------------------------------------------------
+    - name: Load mirror_registry_url from Hub hostvars or inventory
       ansible.builtin.set_fact:
         mirror_registry_url: "{{ hostvars[groups['hub_cluster'][0]]['mirror_registry_url'] | default(disconnected.mirror_registry.hostname ~ ':' ~ (disconnected.mirror_registry.port | default(8443))) }}"
-        mirror_registry_ca_bundle: "{{ hostvars[groups['hub_cluster'][0]]['mirror_registry_ca_bundle'] }}"
-        disconnected_pull_secret: "{{ hostvars[groups['hub_cluster'][0]]['disconnected_pull_secret'] }}"
+
+    - name: Read mirror registry CA certificate from disk
+      ansible.builtin.slurp:
+        src: "{{ mirror_registry_dir }}/quay-rootCA/rootCA.pem"
+      register: _spokes_ca_raw
+      when: hostvars[groups['hub_cluster'][0]]['mirror_registry_ca_bundle'] is not defined
+
+    - name: Load mirror_registry_ca_bundle from Hub hostvars or disk
+      ansible.builtin.set_fact:
+        mirror_registry_ca_bundle: >-
+          {{ hostvars[groups['hub_cluster'][0]]['mirror_registry_ca_bundle']
+             if hostvars[groups['hub_cluster'][0]]['mirror_registry_ca_bundle'] is defined
+             else (_spokes_ca_raw.content | b64decode) }}
+
+    - name: Read merged pull secret from disk
+      ansible.builtin.slurp:
+        src: "{{ mirror_registry_dir }}/pull-secret-merged.json"
+      register: _spokes_ps_raw
+      when: hostvars[groups['hub_cluster'][0]]['disconnected_pull_secret'] is not defined
+
+    - name: Load disconnected_pull_secret from Hub hostvars or disk
+      ansible.builtin.set_fact:
+        disconnected_pull_secret: >-
+          {{ hostvars[groups['hub_cluster'][0]]['disconnected_pull_secret']
+             if hostvars[groups['hub_cluster'][0]]['disconnected_pull_secret'] is defined
+             else (_spokes_ps_raw.content | b64decode | from_json) }}
+
+    - name: Find IDMS and CatalogSource files from disk
+      block:
+        - name: Find IDMS files
+          ansible.builtin.find:
+            paths: "{{ oc_mirror_workspace }}/working-dir/cluster-resources"
+            patterns:
+              - "idms-*.yaml"
+              - "imageDigestMirrorSet*.yaml"
+              - "imageContentSourcePolicy*.yaml"
+          register: _spokes_idms_files
+
+        - name: Read IDMS files from disk
+          ansible.builtin.slurp:
+            src: "{{ item.path }}"
+          loop: "{{ _spokes_idms_files.files }}"
+          register: _spokes_idms_raw
+
+        - name: Set IDMS manifests fact from disk
+          ansible.builtin.set_fact:
+            oc_mirror_idms_manifests: "{{ _spokes_idms_raw.results | map(attribute='content') | map('b64decode') | list }}"
+
+        - name: Find CatalogSource files from disk
+          ansible.builtin.find:
+            paths: "{{ oc_mirror_workspace }}/working-dir/cluster-resources"
+            patterns: "cs-*.yaml"
+          register: _spokes_cs_files
+
+        - name: Read CatalogSource files from disk
+          ansible.builtin.slurp:
+            src: "{{ item.path }}"
+          loop: "{{ _spokes_cs_files.files }}"
+          register: _spokes_cs_raw
+
+        - name: Set CatalogSource manifests fact from disk
+          ansible.builtin.set_fact:
+            oc_mirror_catalogsource_manifests: "{{ _spokes_cs_raw.results | map(attribute='content') | map('b64decode') | list }}"
+      when: hostvars[groups['hub_cluster'][0]]['oc_mirror_idms_manifests'] is not defined
+
+    - name: Load IDMS and CatalogSource manifests from Hub hostvars
+      ansible.builtin.set_fact:
         oc_mirror_idms_manifests: "{{ hostvars[groups['hub_cluster'][0]]['oc_mirror_idms_manifests'] }}"
         oc_mirror_catalogsource_manifests: "{{ hostvars[groups['hub_cluster'][0]]['oc_mirror_catalogsource_manifests'] }}"
+      when: hostvars[groups['hub_cluster'][0]]['oc_mirror_idms_manifests'] is defined
 
     - name: Apply Hive Provisioning Manifests to Hub (Disconnected)
       ansible.builtin.include_role:
