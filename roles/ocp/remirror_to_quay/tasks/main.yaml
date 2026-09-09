@@ -2,11 +2,16 @@
 # ==============================================================================
 # REMIRROR OCP CONTENT TO QUAY
 #
-# Runs oc-mirror from a fresh workspace to push all OCP release and operator
-# content to the Quay instance on the hub cluster. Uses a dedicated workspace
-# (quay_mirror_workspace) rather than the initial mirror workspace so that
-# oc-mirror has no prior sync state and actually pushes all images to Quay
-# instead of treating them as already synced.
+# Copies all content from the jumphost mirror registry to the Quay instance
+# on the hub cluster using skopeo sync (direct registry-to-registry copy).
+# oc-mirror is not used here: it generates cluster-resources based on the
+# imageset-config regardless of whether it actually pushes images, making it
+# unreliable for the remirror step when the initial mirror workspace state
+# treats content as already-synced.
+#
+# After the sync, Quay IDMS manifests are derived by substituting the Quay
+# hostname into the existing jumphost IDMS facts (paths are identical).
+# The CatalogSource image is constructed from the known path pattern.
 #
 # Prerequisites: configure_quay_mirror must have run first (sets quay_registry_url,
 # quay_mirror_org, quay_robot_username, quay_robot_token).
@@ -18,32 +23,14 @@
     state: directory
     mode: '0755'
 
-# Use a fresh workspace so oc-mirror has no prior sync state for the Quay
-# destination. Reusing the initial mirror workspace causes oc-mirror v2 to
-# treat all content as already synced and generate IDMS pointing at Quay
-# without actually pushing the images there.
-- name: Create fresh Quay mirror workspace
-  ansible.builtin.file:
-    path: "{{ quay_mirror_workspace }}"
-    state: directory
-    mode: '0755'
-
-- name: Copy imageset-config from initial workspace to Quay workspace
-  ansible.builtin.copy:
-    src: "{{ initial_mirror_workspace }}/imageset-config.yaml"
-    dest: "{{ quay_mirror_workspace }}/imageset-config.yaml"
-    remote_src: true
-    mode: '0644'
-
-- name: Build auth.json with pull-secret credentials plus Quay robot credentials
+# Build a combined auth file that covers both the jumphost source registry
+# and the Quay destination registry.
+- name: Build auth.json with jumphost and Quay credentials for skopeo
   ansible.builtin.shell: |
     set -e
-    mkdir -p "{{ quay_mirror_workspace }}/containers"
-    AUTH_FILE="{{ quay_mirror_workspace }}/containers/auth.json"
-    # Seed with the full merged pull secret so oc-mirror can pull from all
-    # source registries (registry.redhat.io, quay.io, etc.)
+    mkdir -p "{{ quay_mirror_results_dir }}/containers"
+    AUTH_FILE="{{ quay_mirror_results_dir }}/containers/auth.json"
     cp "{{ initial_mirror_workspace }}/containers/auth.json" "$AUTH_FILE"
-    # Add Quay push credentials so oc-mirror can push to the destination
     jq -c \
       --arg host "{{ quay_registry_url }}" \
       --arg auth "{{ (quay_robot_username ~ ':' ~ quay_robot_token) | b64encode }}" \
@@ -54,117 +41,96 @@
   changed_when: true
   no_log: true
 
-- name: Run oc-mirror to push content to Quay
-  ansible.builtin.command: >
-    {{ bin_dir }}/oc-mirror
-    --v2
-    --config {{ quay_mirror_workspace }}/imageset-config.yaml
-    --workspace file://{{ quay_mirror_workspace }}
-    --dest-tls-verify=false
-    docker://{{ quay_registry_url }}/{{ quay_mirror_org }}
-  environment:
-    XDG_RUNTIME_DIR: "{{ quay_mirror_workspace }}"
-  args:
-    chdir: "{{ quay_mirror_workspace }}"
+# skopeo sync copies every image under the jumphost ocp4/ namespace to the
+# Quay ocp4/ org in one pass. It handles multi-arch manifests, digest
+# references, and partial failures more reliably than oc-mirror for a
+# registry-to-registry copy.
+- name: Sync all content from jumphost registry to Quay with skopeo
+  ansible.builtin.shell: |
+    skopeo sync \
+      --authfile "{{ quay_mirror_results_dir }}/containers/auth.json" \
+      --src docker \
+      --dest docker \
+      --src-tls-verify=false \
+      --dest-tls-verify=false \
+      --preserve-digests \
+      --all \
+      "{{ mirror_registry_url }}/{{ mirror_base_path }}" \
+      "{{ quay_registry_url }}" \
+      2>&1
   async: 7200
   poll: 0
-  register: _quay_mirror_job
+  register: _skopeo_sync_job
   changed_when: true
 
-- name: Wait for oc-mirror to Quay to complete (up to 2 hours)
+- name: Wait for skopeo sync to complete (up to 2 hours)
   ansible.builtin.async_status:
-    jid: "{{ _quay_mirror_job.ansible_job_id }}"
-  register: _quay_mirror_result
-  until: _quay_mirror_result.finished
+    jid: "{{ _skopeo_sync_job.ansible_job_id }}"
+  register: _skopeo_sync_result
+  until: _skopeo_sync_result.finished
   retries: 240
   delay: 30
-  # rc=0: success; rc=4: partial (some images failed, IDMS still generated);
-  # rc=14: oc-mirror v2 partial success with more failures — treat same as rc=4
   failed_when:
-    - _quay_mirror_result.finished
-    - _quay_mirror_result.rc not in [0, 4, 14]
+    - _skopeo_sync_result.finished
+    - _skopeo_sync_result.rc != 0
 
-- name: Find oc-mirror error log for failed images
-  ansible.builtin.find:
-    paths: "{{ quay_mirror_workspace }}/working-dir/logs"
-    patterns: "mirroring_errors_*.txt"
-    file_type: file
-  register: _quay_error_logs
-  when: _quay_mirror_result.rc in [4, 14]
-
-- name: Retry failed non-bundle images via oc image mirror
-  ansible.builtin.shell: >
-    {{ bin_dir }}/oc image mirror
-    {{ item }}
-    {{ quay_registry_url }}/{{ quay_mirror_org }}/{{ item | regex_replace('^docker://[^/]+/', '') | regex_replace('@sha256:[a-f0-9]+$', '') }}
-    --registry-config={{ quay_mirror_workspace }}/containers/auth.json
-    --insecure=true
-    --filter-by-os=linux/amd64
-    --skip-missing=true
-  loop: >-
-    {{
-      lookup('file', (_quay_error_logs.files | sort(attribute='path') | last).path)
-      | regex_findall('docker://\\S+')
-      | reject('match', '.*operator-bundle.*')
-      | unique
-      | list
-    }}
-  loop_control:
-    label: "{{ item | regex_replace('^docker://', '') | truncate(80, True, '...') }}"
-  when:
-    - _quay_error_logs is defined
-    - _quay_error_logs.files | default([]) | length > 0
-  changed_when: true
+- name: Display skopeo sync output summary
+  ansible.builtin.debug:
+    msg: "{{ (_skopeo_sync_result.stdout_lines | default([])) | list | last(10) }}"
   failed_when: false
 
-- name: Find Quay IDMS manifest files from oc-mirror output
-  ansible.builtin.find:
-    paths: "{{ quay_mirror_workspace }}/working-dir/cluster-resources"
-    patterns:
-      - "idms-*.yaml"
-      - "imageDigestMirrorSet*.yaml"
-      - "imageContentSourcePolicy*.yaml"
-    file_type: file
-  register: _quay_idms_files
-
-- name: Find Quay CatalogSource manifest files from oc-mirror output
-  ansible.builtin.find:
-    paths: "{{ quay_mirror_workspace }}/working-dir/cluster-resources"
-    patterns: "cs-*.yaml"
-    file_type: file
-  register: _quay_cs_files
-
-- name: Read Quay IDMS manifests
-  ansible.builtin.slurp:
-    src: "{{ item.path }}"
-  loop: "{{ _quay_idms_files.files }}"
-  register: _quay_idms_raw
-
-- name: Read Quay CatalogSource manifests
-  ansible.builtin.slurp:
-    src: "{{ item.path }}"
-  loop: "{{ _quay_cs_files.files }}"
-  register: _quay_cs_raw
-
-- name: Set Quay IDMS manifest facts
+# Derive Quay IDMS by replacing the jumphost hostname with the Quay hostname
+# in every jumphost IDMS manifest. The repository path structure is identical
+# on both registries since skopeo preserves it.
+- name: Build Quay IDMS manifests by substituting Quay hostname into jumphost IDMS
   ansible.builtin.set_fact:
-    quay_idms_manifests: "{{ _quay_idms_raw.results | map(attribute='content') | map('b64decode') | list }}"
+    quay_idms_manifests: >-
+      {{
+        oc_mirror_idms_manifests
+        | map('regex_replace', mirror_registry_url | regex_escape, quay_registry_url ~ '/' ~ quay_mirror_org)
+        | list
+      }}
 
-- name: Extract Quay catalog index image reference from CatalogSource file
-  ansible.builtin.shell: >
-    grep -h '^\s*image:' {{ quay_mirror_workspace }}/working-dir/cluster-resources/cs-*.yaml
-    | head -1 | awk '{print $2}'
-  register: _quay_catalog_image_raw
+# Verify that the catalog index image is present in Quay before referencing it.
+- name: Get Bearer token to query Quay catalog image tags
+  ansible.builtin.shell: |
+    curl -sk \
+      -u "{{ quay_robot_username }}:{{ quay_robot_token }}" \
+      "https://{{ quay_registry_url }}/v2/auth?service={{ quay_registry_url }}&scope=repository:{{ quay_mirror_org }}/redhat/redhat-operator-index:pull" \
+      | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))"
+  register: _quay_bearer_token
   changed_when: false
+  no_log: true
+
+- name: Verify catalog index image exists in Quay
+  ansible.builtin.uri:
+    url: "https://{{ quay_registry_url }}/v2/{{ quay_mirror_org }}/redhat/redhat-operator-index/tags/list"
+    headers:
+      Authorization: "Bearer {{ _quay_bearer_token.stdout | trim }}"
+    validate_certs: false
+    status_code: 200
+  register: _quay_catalog_tags
+  failed_when: false
+
+- name: Fail if catalog index image is missing from Quay after sync
+  ansible.builtin.fail:
+    msg: >-
+      The redhat-operator-index image was not found in Quay after skopeo sync.
+      Check skopeo output above and verify that
+      {{ mirror_registry_url }}/{{ mirror_base_path }}/redhat/redhat-operator-index
+      exists on the jumphost registry.
+  when: _quay_catalog_tags.status | default(0) != 200
 
 - name: Set Quay catalog image fact
   ansible.builtin.set_fact:
-    quay_catalog_image: "{{ _quay_catalog_image_raw.stdout | trim }}"
+    quay_catalog_image: >-
+      {{ quay_registry_url }}/{{ quay_mirror_org }}/redhat/redhat-operator-index:v{{ openshift_version }}
 
 - name: Display remirror summary
   ansible.builtin.debug:
     msg:
-      - "oc-mirror to Quay complete"
-      - "Target: docker://{{ quay_registry_url }}/{{ quay_mirror_org }}"
-      - "IDMS manifests:        {{ _quay_idms_files.files | length }}"
-      - "CatalogSource manifests: {{ _quay_cs_files.files | length }}"
+      - "skopeo sync to Quay complete"
+      - "Source:        {{ mirror_registry_url }}/{{ mirror_base_path }}"
+      - "Destination:   {{ quay_registry_url }}/{{ quay_mirror_org }}"
+      - "Catalog image: {{ quay_catalog_image }}"
+      - "IDMS manifests derived: {{ quay_idms_manifests | length }}"
