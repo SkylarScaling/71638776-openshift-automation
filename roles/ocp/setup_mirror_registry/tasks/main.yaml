@@ -1,7 +1,7 @@
 ---
 - name: Check if mirror registry is already running
   ansible.builtin.uri:
-    url: "https://{{ mirror_registry_hostname }}:{{ mirror_registry_port }}/health/instance"
+    url: "https://127.0.0.1:{{ mirror_registry_port }}/health/instance"
     validate_certs: false
     status_code: [200, 301]
     timeout: 30
@@ -40,7 +40,7 @@
 # on slow public-hostname TCP connections. 40 retries × 15s = 10 minutes max.
 - name: Wait for started mirror registry to be healthy
   ansible.builtin.uri:
-    url: "https://{{ mirror_registry_hostname }}:{{ mirror_registry_port }}/health/instance"
+    url: "https://127.0.0.1:{{ mirror_registry_port }}/health/instance"
     validate_certs: false
     status_code: [200, 301]
     timeout: 30
@@ -127,7 +127,7 @@
 
     - name: Wait for registry to be healthy after restart
       ansible.builtin.uri:
-        url: "https://{{ mirror_registry_hostname }}:{{ mirror_registry_port }}/health/instance"
+        url: "https://127.0.0.1:{{ mirror_registry_port }}/health/instance"
         validate_certs: false
         status_code: [200, 301]
       register: _registry_restart_health
