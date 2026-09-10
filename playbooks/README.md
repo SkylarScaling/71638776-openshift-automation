@@ -340,6 +340,22 @@ In addition to the [standard prerequisites](../README.md):
 - The jumphost FQDN/IP must be reachable from all cluster nodes (hub and spokes) on the mirror registry port (default: 8443)
 - Sufficient disk space on the jumphost for mirrored content (~50-100 GB depending on operators selected)
 
+### Software Installed to the Jumphost
+
+The `jumphost` phase installs the following software onto the jumphost. All binaries are placed in `~/.local/bin` (standard user bin, no root access required except for `skopeo`).
+
+| Software | Installed By | Function |
+|---|---|---|
+| **OpenShift CLI (`oc`)** | `install_ocp_prerequisites` | Primary CLI for interacting with OpenShift clusters. Used throughout the playbooks to apply manifests, query cluster state, extract credentials, and run administrative commands against the hub and spoke clusters. |
+| **`kubectl`** | `install_ocp_prerequisites` | Kubernetes CLI bundled with the `oc` download. Used as a fallback and by any tooling that calls the standard Kubernetes client. |
+| **OpenShift Installer (`openshift-install`)** | `install_ocp_prerequisites` | IPI (Installer-Provisioned Infrastructure) CLI that creates OpenShift clusters end-to-end on AWS or Nutanix. Handles DNS, load balancers, EC2/AHV instances, and bootstrapping. |
+| **`oc-mirror`** | `install_disconnected_prerequisites` | OpenShift mirror plugin (v2). Downloads OCP release images and operator catalogs from Red Hat's public registries and pushes them to the local mirror registry. Also generates the `ImageDigestMirrorSet` and `CatalogSource` manifests the clusters need to locate mirrored content. Run once during jumphost preparation. |
+| **`mirror-registry`** | `install_disconnected_prerequisites` | Red Hat's single-node Quay installer. Stands up a self-contained Quay container registry (backed by Podman) on the jumphost to serve as the initial local mirror. Runs on port 8443 with a self-signed certificate. Quay is later replaced by the production Quay instance on the hub cluster via the `migrate_mirror` phase. |
+| **`opm`** (Operator Package Manager) | `install_disconnected_prerequisites` | Red Hat CLI for working with Operator Lifecycle Manager (OLM) catalog bundles. Used to inspect, render, and patch the mirrored operator catalog (File-Based Catalog format). Specifically needed by the `patch_mirrored_catalog` role to add operator channels that are present in the live Red Hat catalog GRPC service but missing from the OCI snapshot captured by `oc-mirror`. |
+| **`skopeo`** | `install_disconnected_prerequisites` (dnf) | Container image copy and inspection tool. Used by the `migrate_mirror` phase to copy all mirrored content from the jumphost registry directly to the production Quay instance on the hub cluster (registry-to-registry copy without re-downloading from the internet). Installed via `dnf` as a system package (`sudo` required). |
+
+> **Note:** `skopeo` is the only tool that requires `sudo` (installed via `dnf`). All other tools are downloaded and installed into `~/.local/bin` as the current user.
+
 ### Deploy the complete disconnected environment:
 
 ```bash
