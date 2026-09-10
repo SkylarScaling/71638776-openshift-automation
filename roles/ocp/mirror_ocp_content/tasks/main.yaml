@@ -180,15 +180,16 @@
   changed_when: false
   failed_when: false
 
-- name: Retry failed images with oc image mirror (linux/amd64 only)
+- name: Retry failed images with skopeo (linux/amd64 only)
   ansible.builtin.shell: >
-    {{ bin_dir }}/oc image mirror
+    skopeo copy
+    --authfile {{ oc_mirror_workspace }}/containers/auth.json
+    --dest-tls-verify=false
+    --override-os=linux
+    --override-arch=amd64
+    --src-no-creds
     {{ item }}
-    {{ mirror_registry_url }}/{{ mirror_base_path }}/{{ item | regex_replace('^docker://[^/]+/', '') | regex_replace('@sha256:[a-f0-9]+$', '') }}
-    --registry-config={{ oc_mirror_workspace }}/containers/auth.json
-    --insecure=true
-    --filter-by-os=linux/amd64
-    --skip-missing=true
+    docker://127.0.0.1:{{ mirror_registry_port }}/{{ mirror_base_path }}/{{ item | regex_replace('^docker://[^/]+/', '') | regex_replace('@sha256:[a-f0-9]+$', '') }}
   loop: "{{ failed_images_raw.stdout_lines | default([]) }}"
   loop_control:
     label: "{{ item | regex_replace('^docker://', '') | truncate(80, True, '...') }}"
@@ -210,14 +211,13 @@
   changed_when: false
   failed_when: false
 
-- name: Retry failed operator bundle images
+- name: Retry failed operator bundle images with skopeo
   ansible.builtin.shell: >
-    {{ bin_dir }}/oc image mirror
+    skopeo copy
+    --authfile {{ oc_mirror_workspace }}/containers/auth.json
+    --dest-tls-verify=false
     {{ item }}
-    {{ mirror_registry_url }}/{{ mirror_base_path }}/{{ item | regex_replace('^docker://[^/]+/', '') | regex_replace('@sha256:[a-f0-9]+$', '') }}
-    --registry-config={{ oc_mirror_workspace }}/containers/auth.json
-    --insecure=true
-    --skip-missing=true
+    docker://127.0.0.1:{{ mirror_registry_port }}/{{ mirror_base_path }}/{{ item | regex_replace('^docker://[^/]+/', '') | regex_replace('@sha256:[a-f0-9]+$', '') }}
   loop: "{{ failed_bundles_raw.stdout_lines | default([]) }}"
   loop_control:
     label: "{{ item | regex_replace('^docker://', '') | truncate(80, True, '...') }}"

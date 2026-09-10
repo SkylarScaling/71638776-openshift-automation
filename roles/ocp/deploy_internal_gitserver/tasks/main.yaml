@@ -104,25 +104,29 @@
   ansible.builtin.set_fact:
     gitea_route_host: "{{ _gitea_route_hostname.stdout }}"
 
+# Use 127.0.0.1 for all operations that push TO the local mirror registry.
+# EC2 instances cannot route to their own public IP (hair-pinning is blocked),
+# so using the public hostname for local registry operations always times out.
 - name: Verify Gitea image is available in mirror registry
   ansible.builtin.uri:
-    url: "https://{{ mirror_registry_url }}/v2/{{ mirror_base_path | default('ocp4') }}/gitea/gitea/tags/list"
+    url: "https://127.0.0.1:{{ mirror_registry_port }}/v2/{{ mirror_base_path | default('ocp4') }}/gitea/gitea/tags/list"
     validate_certs: false
     user: "{{ mirror_registry_init_user }}"
     password: "{{ mirror_registry_init_password }}"
     force_basic_auth: true
     status_code: 200
+    timeout: 15
   register: _gitea_image_check
   failed_when: false
   changed_when: false
 
 - name: Mirror Gitea image to local registry if not already present
   ansible.builtin.shell: >
-    {{ bin_dir }}/oc image mirror
-    {{ gitea_source_image }}
-    {{ gitea_image }}
-    --registry-config={{ mirror_registry_dir }}/pull-secret-merged.json
-    --insecure=true
+    skopeo copy --all
+    --authfile {{ mirror_registry_dir }}/pull-secret-merged.json
+    --dest-tls-verify=false
+    docker://{{ gitea_source_image }}
+    docker://127.0.0.1:{{ mirror_registry_port }}/{{ mirror_base_path | default('ocp4') }}/gitea/gitea:{{ gitea_source_image | regex_replace('^.*:', '') }}
   when: _gitea_image_check.status | default(0) != 200
   changed_when: true
 
