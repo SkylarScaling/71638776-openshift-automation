@@ -4,6 +4,7 @@
     url: "https://{{ mirror_registry_hostname }}:{{ mirror_registry_port }}/health/instance"
     validate_certs: false
     status_code: [200, 301]
+    timeout: 30
   register: registry_health
   failed_when: false
   changed_when: false
@@ -11,17 +12,17 @@
 - name: Skip mirror registry setup if already running
   ansible.builtin.debug:
     msg: "Mirror registry is already running at {{ mirror_registry_hostname }}:{{ mirror_registry_port }}, skipping setup."
-  when: registry_health.status is defined and registry_health.status in [200, 301]
+  when: registry_health.status | default(0) in [200, 301]
 
 # If the registry is not responding but a previous installation exists on disk,
 # the EC2 instance was likely stopped and restarted (Podman containers don't
 # auto-start). Attempt mirror-registry start before falling through to a fresh
-# install, which would hang waiting to overwrite the existing installation.
+# install — mirror-registry install hangs when it finds an existing installation.
 - name: Check if mirror registry was previously installed (quay-config directory present)
   ansible.builtin.stat:
     path: "{{ mirror_registry_dir }}/quay-config/config.yaml"
   register: _quay_config_stat
-  when: registry_health.status is not defined or registry_health.status not in [200, 301]
+  when: registry_health.status | default(0) not in [200, 301]
 
 - name: Start existing mirror registry installation (stopped after host restart)
   ansible.builtin.command: >
@@ -31,28 +32,45 @@
   register: _registry_start
   changed_when: true
   when:
-    - registry_health.status is not defined or registry_health.status not in [200, 301]
+    - registry_health.status | default(0) not in [200, 301]
     - _quay_config_stat.stat is defined and _quay_config_stat.stat.exists
 
-- name: Wait for restarted mirror registry to be healthy
+# After mirror-registry start the Quay containers can take several minutes to
+# become ready. Poll with a per-attempt timeout so we don't block indefinitely
+# on slow public-hostname TCP connections. 40 retries × 15s = 10 minutes max.
+- name: Wait for started mirror registry to be healthy
   ansible.builtin.uri:
     url: "https://{{ mirror_registry_hostname }}:{{ mirror_registry_port }}/health/instance"
     validate_certs: false
     status_code: [200, 301]
-  register: _registry_restart_check
-  until: _registry_restart_check.status in [200, 301]
-  retries: 20
-  delay: 10
-  failed_when: false
+    timeout: 30
+  register: _registry_post_start_health
+  until: _registry_post_start_health.status | default(0) in [200, 301]
+  retries: 40
+  delay: 15
   when:
     - _quay_config_stat.stat is defined and _quay_config_stat.stat.exists
 
-- name: Re-check registry health after start attempt
+# Use the post-start result to gate the install block. Setting registry_health
+# here prevents the install block from running when the registry was started
+# rather than freshly installed.
+- name: Mark registry as running after successful start
   ansible.builtin.set_fact:
-    registry_health: "{{ _registry_restart_check }}"
+    registry_health: "{{ _registry_post_start_health }}"
   when:
     - _quay_config_stat.stat is defined and _quay_config_stat.stat.exists
-    - _registry_restart_check.status is defined and _registry_restart_check.status in [200, 301]
+    - _registry_post_start_health.status | default(0) in [200, 301]
+
+- name: Fail if existing mirror registry could not be started
+  ansible.builtin.fail:
+    msg: >-
+      mirror-registry start was attempted but the registry did not become healthy
+      within 10 minutes. Check Podman container logs:
+        podman logs quay-app
+        podman logs quay-redis
+  when:
+    - _quay_config_stat.stat is defined and _quay_config_stat.stat.exists
+    - _registry_post_start_health.status | default(0) not in [200, 301]
 
 - name: Install and configure mirror registry
   block:
