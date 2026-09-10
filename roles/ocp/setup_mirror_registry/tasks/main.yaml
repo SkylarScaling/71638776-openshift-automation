@@ -13,6 +13,47 @@
     msg: "Mirror registry is already running at {{ mirror_registry_hostname }}:{{ mirror_registry_port }}, skipping setup."
   when: registry_health.status is defined and registry_health.status in [200, 301]
 
+# If the registry is not responding but a previous installation exists on disk,
+# the EC2 instance was likely stopped and restarted (Podman containers don't
+# auto-start). Attempt mirror-registry start before falling through to a fresh
+# install, which would hang waiting to overwrite the existing installation.
+- name: Check if mirror registry was previously installed (quay-config directory present)
+  ansible.builtin.stat:
+    path: "{{ mirror_registry_dir }}/quay-config/config.yaml"
+  register: _quay_config_stat
+  when: registry_health.status is not defined or registry_health.status not in [200, 301]
+
+- name: Start existing mirror registry installation (stopped after host restart)
+  ansible.builtin.command: >
+    {{ bin_dir }}/mirror-registry start
+    --quayHostname {{ mirror_registry_hostname }}
+    --quayRoot {{ mirror_registry_dir }}
+  register: _registry_start
+  changed_when: true
+  when:
+    - registry_health.status is not defined or registry_health.status not in [200, 301]
+    - _quay_config_stat.stat is defined and _quay_config_stat.stat.exists
+
+- name: Wait for restarted mirror registry to be healthy
+  ansible.builtin.uri:
+    url: "https://{{ mirror_registry_hostname }}:{{ mirror_registry_port }}/health/instance"
+    validate_certs: false
+    status_code: [200, 301]
+  register: _registry_restart_check
+  until: _registry_restart_check.status in [200, 301]
+  retries: 20
+  delay: 10
+  failed_when: false
+  when:
+    - _quay_config_stat.stat is defined and _quay_config_stat.stat.exists
+
+- name: Re-check registry health after start attempt
+  ansible.builtin.set_fact:
+    registry_health: "{{ _registry_restart_check }}"
+  when:
+    - _quay_config_stat.stat is defined and _quay_config_stat.stat.exists
+    - _registry_restart_check.status is defined and _registry_restart_check.status in [200, 301]
+
 - name: Install and configure mirror registry
   block:
     - name: Create mirror registry data directory
