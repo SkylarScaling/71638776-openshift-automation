@@ -17,6 +17,20 @@
 # quay_mirror_org, quay_robot_username, quay_robot_token).
 # ==============================================================================
 
+- name: Verify skopeo is installed
+  ansible.builtin.command: skopeo --version
+  changed_when: false
+  register: _skopeo_check
+  failed_when: _skopeo_check.rc != 0
+
+- name: Verify Quay registry is reachable from this host
+  ansible.builtin.uri:
+    url: "https://{{ quay_registry_url }}/health/instance"
+    validate_certs: false
+    status_code: [200, 301]
+  register: _quay_health
+  failed_when: _quay_health.status | default(0) not in [200, 301]
+
 - name: Create Quay results directory
   ansible.builtin.file:
     path: "{{ quay_mirror_results_dir }}"

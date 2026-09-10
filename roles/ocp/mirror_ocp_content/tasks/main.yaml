@@ -43,18 +43,44 @@
   register: _existing_mirror_version
   failed_when: false
 
-# Require that IDMS files, CatalogSource files, AND a version sentinel
-# matching the current openshift_version.ocp_patch_version all exist.
-# Without the version check, leftover files from a prior run targeting
-# a different OCP version would cause mirroring to be skipped while
-# leaving stale cluster-resources in the workspace.
+- name: Check existing CatalogSource files for a valid image pointing to the local mirror registry
+  ansible.builtin.shell: |
+    python3 -c "
+    import glob, sys
+    try:
+        import yaml
+    except ImportError:
+        import subprocess, sys
+        subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'pyyaml', '-q'])
+        import yaml
+    cs_dir = '{{ oc_mirror_workspace }}/working-dir/cluster-resources'
+    mirror = '{{ mirror_registry_url }}'
+    valid = False
+    for f in glob.glob(cs_dir + '/cs-*.yaml'):
+        for doc in yaml.safe_load_all(open(f)):
+            if doc and doc.get('kind') == 'CatalogSource':
+                img = doc.get('spec', {}).get('image', '')
+                if img and mirror in img:
+                    valid = True
+    print('valid' if valid else 'invalid')
+    "
+  register: _cs_image_valid
+  changed_when: false
+  failed_when: false
+
+# Require that IDMS files, CatalogSource files, a version sentinel matching
+# the current version, AND a cs-*.yaml whose spec.image references the local
+# mirror registry all exist before skipping. The image check prevents stale
+# workspace files (e.g. from a failed Quay remirror that overwrote cs-*.yaml
+# with image:"") from suppressing a fresh mirror run.
 - name: Set oc-mirror completion flag
   ansible.builtin.set_fact:
     _oc_mirror_complete: >-
       {{ existing_idms.files | default([]) | length > 0
          and existing_cs.files | default([]) | length > 0
          and (_existing_mirror_version.content | default('') | b64decode | trim)
-             == (openshift_version ~ '.' ~ ocp_patch_version) }}
+             == (openshift_version ~ '.' ~ ocp_patch_version)
+         and _cs_image_valid.stdout | default('invalid') == 'valid' }}
 
 - name: Print log path for live monitoring
   ansible.builtin.debug:
