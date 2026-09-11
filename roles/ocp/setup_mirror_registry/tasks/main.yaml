@@ -182,18 +182,25 @@
 # Without this rule, the AWS security group allows external traffic in but
 # firewalld drops it before Podman sees it — cluster nodes get i/o timeout
 # when pulling images even though the registry is running and the EC2 SG is open.
+- name: Check if firewalld is installed
+  ansible.builtin.command: which firewall-cmd
+  register: _fw_available
+  changed_when: false
+  failed_when: false
+
 - name: Open mirror registry port in firewalld
   ansible.builtin.command: >
     firewall-cmd --add-port={{ mirror_registry_port }}/tcp --permanent
   become: true
   register: _fw_rule
-  changed_when: _fw_rule.rc == 0 and 'already' not in _fw_rule.stdout
+  changed_when: "'already' not in _fw_rule.stdout"
   failed_when: _fw_rule.rc != 0 and 'NOT_RUNNING' not in _fw_rule.stderr
+  when: _fw_available.rc == 0
 
 - name: Reload firewalld to apply rule
   ansible.builtin.command: firewall-cmd --reload
   become: true
-  when: _fw_rule is changed
+  when: _fw_available.rc == 0 and _fw_rule is changed
   changed_when: true
   failed_when: false
 
