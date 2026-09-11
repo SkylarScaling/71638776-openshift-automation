@@ -177,6 +177,20 @@
     state: present
   become: true
 
+# RHEL 9 runs firewalld by default. mirror-registry configures Podman to
+# listen on the registry port, but does not open the OS-level firewall.
+# Without this rule, the AWS security group allows external traffic in but
+# firewalld drops it before Podman sees it — cluster nodes get i/o timeout
+# when pulling images even though the registry is running and the EC2 SG is open.
+- name: Open mirror registry port in firewalld (permanent)
+  ansible.posix.firewalld:
+    port: "{{ mirror_registry_port }}/tcp"
+    permanent: true
+    state: enabled
+    immediate: true
+  become: true
+  failed_when: false
+
 - name: Build base64 auth token for mirror registry
   ansible.builtin.set_fact:
     mirror_registry_auth: "{{ (mirror_registry_init_user ~ ':' ~ mirror_registry_init_password) | b64encode }}"
