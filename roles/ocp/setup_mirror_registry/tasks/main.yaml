@@ -228,6 +228,67 @@
     dest: "{{ mirror_registry_dir }}/pull-secret-merged.json"
     mode: '0600'
 
+# Rootless Podman only binds the registry port on the loopback interface;
+# external hosts (OCP cluster nodes) cannot reach it even when the AWS
+# security group is open. Use an iptables PREROUTING DNAT rule to redirect
+# traffic arriving on any external interface to 127.0.0.1 where Podman
+# is listening. route_localnet must be enabled for DNAT to loopback to work.
+- name: Enable route_localnet sysctl for DNAT to loopback (persistent)
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/99-mirror-registry.conf
+    content: "net.ipv4.conf.all.route_localnet = 1\n"
+    mode: '0644'
+  become: true
+  register: _sysctl_conf
+
+- name: Apply route_localnet sysctl setting
+  ansible.builtin.command: sysctl -w net.ipv4.conf.all.route_localnet=1
+  become: true
+  changed_when: true
+
+- name: Write mirror registry NAT forwarding script
+  ansible.builtin.copy:
+    dest: /usr/local/bin/mirror-registry-nat.sh
+    mode: '0755'
+    content: |
+      #!/bin/bash
+      # Redirect external connections on the mirror registry port to loopback.
+      # Rootless Podman binds only on 127.0.0.1; this rule makes the port
+      # reachable from external hosts (OCP cluster nodes, spokes).
+      iptables -t nat -C PREROUTING -p tcp --dport {{ mirror_registry_port }} \
+        -j DNAT --to-destination 127.0.0.1:{{ mirror_registry_port }} 2>/dev/null \
+        || iptables -t nat -A PREROUTING -p tcp --dport {{ mirror_registry_port }} \
+             -j DNAT --to-destination 127.0.0.1:{{ mirror_registry_port }}
+      iptables -C INPUT -p tcp --dport {{ mirror_registry_port }} -j ACCEPT 2>/dev/null \
+        || iptables -A INPUT -p tcp --dport {{ mirror_registry_port }} -j ACCEPT
+  become: true
+
+- name: Create systemd service to apply mirror registry NAT rule at boot
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/mirror-registry-nat.service
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=Mirror registry external port forwarding (DNAT loopback)
+      After=network.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/bin/mirror-registry-nat.sh
+      RemainAfterExit=yes
+
+      [Install]
+      WantedBy=multi-user.target
+  become: true
+
+- name: Enable and start mirror registry NAT service
+  ansible.builtin.systemd:
+    name: mirror-registry-nat
+    state: started
+    enabled: true
+    daemon_reload: true
+  become: true
+
 - name: Display mirror registry connection info
   ansible.builtin.debug:
     msg:
