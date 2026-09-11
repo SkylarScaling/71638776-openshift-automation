@@ -163,6 +163,20 @@
   become: true
   changed_when: true
 
+# Quay embeds the public hostname in its WWW-Authenticate Bearer realm URL.
+# EC2 instances cannot route to their own public IP (hair-pinning is blocked),
+# so any local tool that follows the auth challenge (skopeo, oc image mirror,
+# curl with auth) times out. Adding the public hostname to /etc/hosts pointing
+# to 127.0.0.1 makes the auth realm reachable locally, TLS cert validation
+# passes (the cert CN/SAN matches), and all registry operations work normally.
+- name: Add mirror registry hostname to /etc/hosts for local loopback access
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: "{{ mirror_registry_hostname | regex_escape }}"
+    line: "127.0.0.1 {{ mirror_registry_hostname }}"
+    state: present
+  become: true
+
 - name: Build base64 auth token for mirror registry
   ansible.builtin.set_fact:
     mirror_registry_auth: "{{ (mirror_registry_init_user ~ ':' ~ mirror_registry_init_password) | b64encode }}"

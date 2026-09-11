@@ -124,9 +124,8 @@
   ansible.builtin.shell: >
     skopeo copy --all
     --authfile {{ mirror_registry_dir }}/pull-secret-merged.json
-    --dest-tls-verify=false
     docker://{{ gitea_source_image }}
-    docker://127.0.0.1:{{ mirror_registry_port }}/{{ mirror_base_path | default('ocp4') }}/gitea/gitea:{{ gitea_source_image | regex_replace('^.*:', '') }}
+    docker://{{ gitea_image }}
   when: _gitea_image_check.status | default(0) != 200
   changed_when: true
 
