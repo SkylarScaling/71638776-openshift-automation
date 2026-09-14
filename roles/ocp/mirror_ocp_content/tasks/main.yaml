@@ -180,16 +180,14 @@
   changed_when: false
   failed_when: false
 
-- name: Retry failed images with skopeo (linux/amd64 only)
+- name: Retry failed images with oc image mirror (linux/amd64 only)
   ansible.builtin.shell: >
-    skopeo copy
-    --authfile {{ oc_mirror_workspace }}/containers/auth.json
-    --dest-tls-verify=false
-    --override-os=linux
-    --override-arch=amd64
-    --src-no-creds
-    {{ item }}
-    docker://127.0.0.1:{{ mirror_registry_port }}/{{ mirror_base_path }}/{{ item | regex_replace('^docker://[^/]+/', '') | regex_replace('@sha256:[a-f0-9]+$', '') }}
+    {{ bin_dir }}/oc image mirror
+    --filter-by-os=linux/amd64
+    --insecure=true
+    -a {{ oc_mirror_workspace }}/containers/auth.json
+    {{ item | regex_replace('^docker://', '') }}
+    {{ mirror_registry_url }}/{{ mirror_base_path }}/{{ item | regex_replace('^docker://[^/]+/', '') | regex_replace('@sha256:[a-f0-9]+$', '') }}
   loop: "{{ failed_images_raw.stdout_lines | default([]) }}"
   loop_control:
     label: "{{ item | regex_replace('^docker://', '') | truncate(80, True, '...') }}"
@@ -211,13 +209,13 @@
   changed_when: false
   failed_when: false
 
-- name: Retry failed operator bundle images with skopeo
+- name: Retry failed operator bundle images with oc image mirror
   ansible.builtin.shell: >
-    skopeo copy
-    --authfile {{ oc_mirror_workspace }}/containers/auth.json
-    --dest-tls-verify=false
-    {{ item }}
-    docker://127.0.0.1:{{ mirror_registry_port }}/{{ mirror_base_path }}/{{ item | regex_replace('^docker://[^/]+/', '') | regex_replace('@sha256:[a-f0-9]+$', '') }}
+    {{ bin_dir }}/oc image mirror
+    --insecure=true
+    -a {{ oc_mirror_workspace }}/containers/auth.json
+    {{ item | regex_replace('^docker://', '') }}
+    {{ mirror_registry_url }}/{{ mirror_base_path }}/{{ item | regex_replace('^docker://[^/]+/', '') | regex_replace('@sha256:[a-f0-9]+$', '') }}
   loop: "{{ failed_bundles_raw.stdout_lines | default([]) }}"
   loop_control:
     label: "{{ item | regex_replace('^docker://', '') | truncate(80, True, '...') }}"
@@ -230,7 +228,7 @@
 - name: Display oc-mirror partial failure summary
   ansible.builtin.debug:
     msg:
-      - "WARNING: oc-mirror rc={{ oc_mirror_result.rc }} — some images failed and were retried with oc image mirror."
+      - "WARNING: oc-mirror rc={{ oc_mirror_result.rc }} — some images failed and were retried with 'oc image mirror'."
       - "rc=4: manifest format incompatibility; rc=14: transient network failure."
       - "See {{ oc_mirror_workspace }}/working-dir/logs/ for details."
       - "Remove the workaround block in mirror_ocp_content/tasks/main.yaml when oc-mirror v2 fixes the manifest preservation bug."
