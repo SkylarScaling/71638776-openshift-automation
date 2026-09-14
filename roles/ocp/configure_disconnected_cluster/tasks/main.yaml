@@ -70,8 +70,9 @@
       -n openshift-config \
       --kubeconfig {{ target_kubeconfig }} \
       -o jsonpath='{.data.\.dockerconfigjson}' | base64 -d)
+    EXPECTED='{{ disconnected_pull_secret.auths[mirror_registry_url].auth }}'
     EXISTING_AUTH=$(echo "$CURRENT" | jq -r '.auths["{{ mirror_registry_url }}"].auth // ""')
-    if [ "$EXISTING_AUTH" = "{{ mirror_registry_auth }}" ]; then
+    if [ "$EXISTING_AUTH" = "$EXPECTED" ]; then
       echo "present"
     else
       echo "missing"
