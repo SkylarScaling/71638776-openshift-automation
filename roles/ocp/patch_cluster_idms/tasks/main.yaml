@@ -20,18 +20,31 @@
 # that hostname, and the MCO roll triggered here distributes that setting
 # reliably to all nodes.
 # ------------------------------------------------------------------------------
-- name: Configure Quay registry as insecure in cluster Image CR
-  ansible.builtin.shell:
-    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
-    stdin: |
-      apiVersion: config.openshift.io/v1
-      kind: Image
-      metadata:
-        name: cluster
-      spec:
-        registrySources:
-          insecureRegistries:
-            - "{{ quay_registry_url }}"
+- name: Get current insecureRegistries from cluster Image CR
+  ansible.builtin.shell: |
+    {{ bin_dir }}/oc get image.config.openshift.io cluster \
+      --kubeconfig {{ target_kubeconfig }} \
+      -o jsonpath='{.spec.registrySources.insecureRegistries[*]}' 2>/dev/null || true
+  register: _current_insecure
+  changed_when: false
+
+- name: Add Quay registry to insecureRegistries in cluster Image CR
+  ansible.builtin.shell: |
+    set -e
+    CURRENT=$({{ bin_dir }}/oc get image.config.openshift.io cluster \
+      --kubeconfig {{ target_kubeconfig }} \
+      -o json 2>/dev/null)
+    UPDATED=$(echo "$CURRENT" | jq -c \
+      --arg quay "{{ quay_registry_url }}" \
+      '.spec.registrySources.insecureRegistries = (
+        (.spec.registrySources.insecureRegistries // [])
+        + [$quay] | unique
+      )')
+    echo "$UPDATED" | {{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -
+  args:
+    executable: /bin/bash
+  when: quay_registry_url not in (_current_insecure.stdout | default(''))
+  register: _image_cr_patch
   changed_when: true
 
 # ------------------------------------------------------------------------------
@@ -157,6 +170,7 @@
   delay: 15
   changed_when: false
   failed_when: false
+  when: _image_cr_patch is changed
 
 - name: Wait for master MachineConfigPool to finish updating
   ansible.builtin.shell: >
@@ -180,6 +194,7 @@
   delay: 15
   changed_when: false
   failed_when: false
+  when: _image_cr_patch is changed
 
 - name: Wait for worker MachineConfigPool to finish updating
   ansible.builtin.shell: >

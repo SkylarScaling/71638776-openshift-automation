@@ -63,6 +63,25 @@
             interval: 30m
   changed_when: true
 
+- name: Check if mirror registry credentials already exist in global pull secret
+  ansible.builtin.shell: |
+    set -e
+    CURRENT=$({{ bin_dir }}/oc get secret pull-secret \
+      -n openshift-config \
+      --kubeconfig {{ target_kubeconfig }} \
+      -o jsonpath='{.data.\.dockerconfigjson}' | base64 -d)
+    EXISTING_AUTH=$(echo "$CURRENT" | jq -r '.auths["{{ mirror_registry_url }}"].auth // ""')
+    if [ "$EXISTING_AUTH" = "{{ mirror_registry_auth }}" ]; then
+      echo "present"
+    else
+      echo "missing"
+    fi
+  args:
+    executable: /bin/bash
+  register: _pull_secret_check
+  changed_when: false
+  no_log: true
+
 - name: Update global pull secret with mirror registry credentials
   ansible.builtin.shell: |
     set -e
@@ -85,8 +104,10 @@
     EOF
   args:
     executable: /bin/bash
+  register: _pull_secret_apply
   changed_when: true
   no_log: true
+  when: _pull_secret_check.stdout | trim == "missing"
 
 - name: Wait for MachineConfigPool updates to begin rolling out
   ansible.builtin.debug:
@@ -94,6 +115,7 @@
       Disconnected cluster configuration applied. Node MachineConfigPools
       will begin rolling out with the updated mirror configuration.
       This may take 10-30 minutes as nodes are rebooted.
+  when: _pull_secret_check.stdout | trim == "missing"
 
 # Wait for MCO to detect and begin the rolling update before checking
 # completion. Without this pre-wait, the existing Updated=True condition
@@ -110,6 +132,7 @@
   delay: 15
   changed_when: false
   failed_when: false
+  when: _pull_secret_check.stdout | trim == "missing"
 
 - name: Wait for master MachineConfigPool to finish updating
   ansible.builtin.shell: >
@@ -133,6 +156,7 @@
   delay: 15
   changed_when: false
   failed_when: false
+  when: _pull_secret_check.stdout | trim == "missing"
 
 - name: Wait for worker MachineConfigPool to finish updating
   ansible.builtin.shell: >

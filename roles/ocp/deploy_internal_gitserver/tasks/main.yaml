@@ -104,6 +104,15 @@
   ansible.builtin.set_fact:
     gitea_route_host: "{{ _gitea_route_hostname.stdout }}"
 
+- name: Check if Gitea deployment already exists
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get deployment gitea
+    -n {{ gitea_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.metadata.name}' 2>/dev/null || true
+  register: _gitea_deployment_check
+  changed_when: false
+
 - name: Verify Gitea image is available in mirror registry
   ansible.builtin.uri:
     url: "https://{{ mirror_registry_url }}/v2/{{ mirror_base_path | default('ocp4') }}/gitea/gitea/tags/list"
@@ -116,6 +125,7 @@
   register: _gitea_image_check
   failed_when: false
   changed_when: false
+  when: _gitea_deployment_check.stdout | default('') == ""
 
 - name: Fail if Gitea image is missing from mirror registry
   ansible.builtin.fail:
@@ -125,7 +135,9 @@
       Ensure 'docker.io/gitea/gitea:1.22-rootless' is listed in the
       ImageSetConfiguration additionalImages section and re-run the
       mirroring step (ocp/mirror_ocp_content).
-  when: _gitea_image_check.status | default(0) != 200
+  when:
+    - _gitea_deployment_check.stdout | default('') == ""
+    - _gitea_image_check.status | default(0) != 200
 
 - name: Deploy Gitea
   ansible.builtin.shell:

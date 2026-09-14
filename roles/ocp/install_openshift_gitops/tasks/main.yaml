@@ -40,6 +40,16 @@
         sourceNamespace: "{{ gitops_operator_source_namespace }}"
   changed_when: true
 
+- name: "Check if GitOps Operator CSV is already installed"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get subscription openshift-gitops-operator
+    -n {{ gitops_operator_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.installedCSV}' 2>/dev/null || true
+  register: _existing_csv
+  changed_when: false
+  when: wait_for_operator_ready
+
 - name: "Wait for redhat-operators CatalogSource to be READY"
   ansible.builtin.shell: >
     {{ bin_dir }}/oc get catalogsource {{ gitops_operator_source }}
@@ -51,7 +61,9 @@
   retries: 60
   delay: 15
   changed_when: false
-  when: wait_for_operator_ready
+  when:
+    - wait_for_operator_ready
+    - _existing_csv.stdout | default('') == ""
 
 - name: "Wait for GitOps Operator CSV to be installed"
   ansible.builtin.shell: >
@@ -64,7 +76,9 @@
   retries: 90
   delay: 10
   changed_when: false
-  when: wait_for_operator_ready
+  when:
+    - wait_for_operator_ready
+    - _existing_csv.stdout | default('') == ""
 
 - name: "Wait for the GitOps Operator Deployment to be Ready"
   ansible.builtin.shell: >

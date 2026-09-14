@@ -145,6 +145,25 @@
       }}
   no_log: true
 
+- name: Check if Quay robot credentials already exist in global pull secret
+  ansible.builtin.shell: |
+    set -e
+    CURRENT=$({{ bin_dir }}/oc get secret pull-secret \
+      -n openshift-config \
+      --kubeconfig {{ target_kubeconfig }} \
+      -o jsonpath='{.data.\.dockerconfigjson}' | base64 -d)
+    EXISTING_AUTH=$(echo "$CURRENT" | jq -r '.auths["{{ quay_registry_url }}"].auth // ""')
+    if [ "$EXISTING_AUTH" = "{{ (quay_robot_username ~ ':' ~ quay_robot_token) | b64encode }}" ]; then
+      echo "present"
+    else
+      echo "missing"
+    fi
+  args:
+    executable: /bin/bash
+  register: _quay_pull_secret_check
+  changed_when: false
+  no_log: true
+
 - name: Merge Quay robot credentials into cluster global pull secret
   ansible.builtin.shell: |
     set -e
@@ -172,6 +191,7 @@
     executable: /bin/bash
   changed_when: true
   no_log: true
+  when: _quay_pull_secret_check.stdout | trim == "missing"
 
 - name: Display Quay mirror configuration summary
   ansible.builtin.debug:

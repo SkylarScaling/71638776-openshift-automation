@@ -49,13 +49,39 @@
       register: _quay_mirror_version
       failed_when: false
 
+    - name: Check existing Quay CatalogSource files reference the Quay registry
+      ansible.builtin.shell: |
+        python3 -c "
+        import glob, sys
+        try:
+            import yaml
+        except ImportError:
+            import subprocess, sys
+            subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'pyyaml', '-q'])
+            import yaml
+        cs_dir = '{{ quay_mirror_workspace }}/working-dir/cluster-resources'
+        quay = '{{ quay_registry_url }}'
+        valid = False
+        for f in glob.glob(cs_dir + '/cs-*.yaml'):
+            for doc in yaml.safe_load_all(open(f)):
+                if doc and doc.get('kind') == 'CatalogSource':
+                    img = doc.get('spec', {}).get('image', '')
+                    if img and quay in img:
+                        valid = True
+        print('valid' if valid else 'invalid')
+        "
+      register: _quay_cs_image_valid
+      changed_when: false
+      failed_when: false
+
 - name: Set Quay oc-mirror completion flag
   ansible.builtin.set_fact:
     _quay_mirror_complete: >-
       {{ _quay_existing_idms.files | default([]) | length > 0
          and _quay_existing_cs.files | default([]) | length > 0
          and (_quay_mirror_version.content | default('') | b64decode | trim)
-             == (openshift_version ~ '.' ~ ocp_patch_version) }}
+             == (openshift_version ~ '.' ~ ocp_patch_version)
+         and _quay_cs_image_valid.stdout | default('invalid') == 'valid' }}
 
 - name: Prepare Quay oc-mirror workspace
   block:
