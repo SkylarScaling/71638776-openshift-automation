@@ -115,7 +115,7 @@
 
 - name: Verify Gitea image is available in mirror registry
   ansible.builtin.uri:
-    url: "https://{{ mirror_registry_url }}/v2/{{ mirror_base_path | default('ocp4') }}/gitea/gitea/tags/list"
+    url: "https://{{ mirror_registry_url }}/v2/{{ mirror_base_path | default('ocp4') }}/{{ gitea_source_image | regex_replace(':[^:]+$', '') }}/tags/list"
     validate_certs: false
     user: "{{ mirror_registry_init_user }}"
     password: "{{ mirror_registry_init_password }}"
