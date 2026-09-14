@@ -15,6 +15,29 @@
 # quay_mirror_org, quay_robot_username, quay_robot_token).
 # ==============================================================================
 
+- name: Extract cluster ingress CA certificate
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get configmap default-ingress-cert
+    -n openshift-config-managed
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.data.ca-bundle\.crt}'
+  register: _ingress_ca_raw
+  changed_when: false
+
+- name: Trust cluster ingress CA on jumphost
+  ansible.builtin.copy:
+    content: "{{ _ingress_ca_raw.stdout }}"
+    dest: "/etc/pki/ca-trust/source/anchors/ocp-ingress-ca.pem"
+    mode: '0644'
+  become: true
+  register: _ingress_ca_installed
+
+- name: Update CA trust store for ingress CA
+  ansible.builtin.command: update-ca-trust
+  become: true
+  changed_when: true
+  when: _ingress_ca_installed is changed
+
 - name: Verify Quay registry is reachable from this host
   ansible.builtin.uri:
     url: "https://{{ quay_registry_url }}/health/instance"
