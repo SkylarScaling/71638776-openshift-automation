@@ -106,7 +106,7 @@
 
 - name: Verify Gitea image is available in mirror registry
   ansible.builtin.uri:
-    url: "https://{{ mirror_registry_hostname }}:{{ mirror_registry_port }}/v2/{{ mirror_base_path | default('ocp4') }}/gitea/gitea/tags/list"
+    url: "https://{{ mirror_registry_url }}/v2/{{ mirror_base_path | default('ocp4') }}/gitea/gitea/tags/list"
     validate_certs: false
     user: "{{ mirror_registry_init_user }}"
     password: "{{ mirror_registry_init_password }}"
@@ -121,7 +121,7 @@
   ansible.builtin.fail:
     msg: >-
       The Gitea image was not found in the mirror registry at
-      {{ mirror_registry_hostname }}:{{ mirror_registry_port }}.
+      {{ mirror_registry_url }}.
       Ensure 'docker.io/gitea/gitea:1.22-rootless' is listed in the
       ImageSetConfiguration additionalImages section and re-run the
       mirroring step (ocp/mirror_ocp_content).
