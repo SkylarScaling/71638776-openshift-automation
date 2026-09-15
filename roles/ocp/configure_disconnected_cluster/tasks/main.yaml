@@ -39,7 +39,9 @@
       {{ (oc_mirror_catalogsource_manifests
           | map('from_yaml_all')
           | flatten
+          | select('mapping')
           | selectattr('kind', 'equalto', 'CatalogSource')
+          | selectattr('spec.image', 'defined')
           | selectattr('spec.image', 'search', 'redhat-operator-index')
           | map(attribute='spec.image')
           | first) }}

@@ -106,6 +106,12 @@
              == (openshift_version ~ '.' ~ ocp_patch_version)
          and _quay_cs_image_valid.stdout | default('invalid') == 'valid' }}
 
+- name: Clean stale Quay oc-mirror workspace for fresh re-run
+  ansible.builtin.file:
+    state: absent
+    path: "{{ quay_mirror_workspace }}/working-dir"
+  when: not _quay_mirror_complete
+
 - name: Prepare Quay oc-mirror workspace
   block:
     - name: Create Quay oc-mirror workspace directory
@@ -317,6 +323,16 @@
     file_type: file
   register: _quay_cs_files
 
+- name: Fail if oc-mirror did not generate CatalogSource manifests
+  ansible.builtin.fail:
+    msg: >-
+      oc-mirror did not generate any CatalogSource manifests in
+      {{ quay_mirror_workspace }}/working-dir/cluster-resources/.
+      The operator catalog index image was not successfully pushed to Quay.
+      Verify CREATE_PRIVATE_REPO_ON_PUSH is enabled, then delete the stale
+      workspace and re-run: rm -rf {{ quay_mirror_workspace }}/working-dir
+  when: _quay_cs_files.files | length == 0
+
 - name: Read Quay IDMS manifests
   ansible.builtin.slurp:
     src: "{{ item.path }}"
@@ -333,18 +349,33 @@
   ansible.builtin.set_fact:
     quay_idms_manifests: "{{ _quay_idms_contents.results | map(attribute='content') | map('b64decode') | list }}"
 
-- name: Extract Quay catalog image from CatalogSource manifest
+- name: Validate CatalogSource manifests contain operator catalog index
   ansible.builtin.set_fact:
-    quay_catalog_image: >-
-      {{ (_quay_cs_contents.results
+    _quay_cs_catalog_entries: >-
+      {{ _quay_cs_contents.results
           | map(attribute='content')
           | map('b64decode')
           | map('from_yaml_all')
           | flatten
+          | select('mapping')
           | selectattr('kind', 'equalto', 'CatalogSource')
+          | selectattr('spec.image', 'defined')
           | selectattr('spec.image', 'search', 'redhat-operator-index')
-          | map(attribute='spec.image')
-          | first) }}
+          | list }}
+
+- name: Fail if no CatalogSource references operator catalog index
+  ansible.builtin.fail:
+    msg: >-
+      oc-mirror generated CatalogSource manifests but none reference
+      'redhat-operator-index'. The operator catalog index image was not
+      successfully pushed to Quay. Check the oc-mirror error log at
+      {{ quay_mirror_workspace }}/working-dir/logs/ and verify
+      CREATE_PRIVATE_REPO_ON_PUSH is enabled on the Quay instance.
+  when: _quay_cs_catalog_entries | length == 0
+
+- name: Extract Quay catalog image from CatalogSource manifest
+  ansible.builtin.set_fact:
+    quay_catalog_image: "{{ _quay_cs_catalog_entries | map(attribute='spec.image') | first }}"
 
 - name: Write Quay mirror version sentinel
   ansible.builtin.copy:
