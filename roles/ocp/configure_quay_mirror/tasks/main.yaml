@@ -49,7 +49,7 @@
   register: _quay_config_secret_name
   changed_when: false
 
-- name: Enable CREATE_PRIVATE_REPO_ON_PUSH in Quay config
+- name: Enable mirror-required Quay config settings
   ansible.builtin.shell: |
     set -e
     SECRET="{{ _quay_config_secret_name.stdout | trim }}"
@@ -61,17 +61,24 @@
       -n {{ quay_mirror_namespace }} \
       --kubeconfig {{ target_kubeconfig }} \
       -o jsonpath='{.data.config\.yaml}' | base64 -d)
-    if echo "$CURRENT" | grep -q 'CREATE_PRIVATE_REPO_ON_PUSH: true'; then
-      echo "skip: already enabled"
+    UPDATED="$CURRENT"
+    NEEDS_PATCH=false
+    for SETTING in CREATE_PRIVATE_REPO_ON_PUSH FEATURE_EXTENDED_REPOSITORY_NAMES; do
+      if ! echo "$UPDATED" | grep -q "${SETTING}: true"; then
+        UPDATED=$(echo "$UPDATED"; echo "${SETTING}: true")
+        NEEDS_PATCH=true
+      fi
+    done
+    if [ "$NEEDS_PATCH" = "false" ]; then
+      echo "skip: all settings already enabled"
       exit 0
     fi
-    UPDATED=$(echo "$CURRENT"; echo "CREATE_PRIVATE_REPO_ON_PUSH: true")
     {{ bin_dir }}/oc patch secret "$SECRET" \
       -n {{ quay_mirror_namespace }} \
       --kubeconfig {{ target_kubeconfig }} \
       --type=merge \
       -p "{\"data\":{\"config.yaml\":\"$(echo -n "$UPDATED" | base64 -w 0)\"}}"
-    echo "changed: enabled CREATE_PRIVATE_REPO_ON_PUSH"
+    echo "changed: enabled mirror config settings"
   args:
     executable: /bin/bash
   register: _quay_config_patch

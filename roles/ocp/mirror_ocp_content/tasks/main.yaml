@@ -129,13 +129,12 @@
   delay: 30
   when: oc_mirror_job is defined and oc_mirror_job.ansible_job_id is defined
   # rc=4: partial success — manifest format incompatibility with certain multi-arch images.
-  # rc=14: partial success — transient network failure (e.g. "use of closed network connection"
-  #        writing a blob to the mirror registry). IDMS is still generated; failed images are
-  #        retried below with oc image mirror.
-  # Both are handled by the retry block below. Check working-dir/logs/mirroring_errors_*.txt.
+  # rc=12/14: partial failure — transient network errors or auth issues for a subset of images.
+  #           IDMS is still generated; failed images are retried below with oc image mirror.
+  # All are handled by the retry block below. Check working-dir/logs/mirroring_errors_*.txt.
   failed_when:
     - oc_mirror_result.finished
-    - oc_mirror_result.rc not in [0, 4, 14]
+    - oc_mirror_result.rc not in [0, 4, 12, 14]
 
 # ==============================================================================
 # WORKAROUND: oc-mirror v2 manifest format bug
@@ -166,7 +165,7 @@
   when:
     - oc_mirror_result is defined
     - oc_mirror_result.rc is defined
-    - oc_mirror_result.rc in [4, 14]
+    - oc_mirror_result.rc in [4, 12, 14]
 
 - name: Extract failed non-bundle image refs from error log
   ansible.builtin.shell: >
@@ -235,7 +234,7 @@
   when:
     - oc_mirror_result is defined
     - oc_mirror_result.rc is defined
-    - oc_mirror_result.rc in [4, 14]
+    - oc_mirror_result.rc in [4, 12, 14]
 
 # When rc=14 oc-mirror exits before generating the CatalogSource (cs-*.yaml)
 # because 0 operator images were mirrored. The oc image mirror retry above

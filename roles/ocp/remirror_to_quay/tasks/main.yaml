@@ -186,9 +186,9 @@
     - _quay_mirror_job.ansible_job_id is defined
   failed_when:
     - _quay_mirror_result.finished
-    - _quay_mirror_result.rc not in [0, 4, 14]
+    - _quay_mirror_result.rc not in [0, 4, 12, 14]
 
-# Handle rc=4/rc=14 partial failures with oc image mirror retries
+# Handle partial failures with oc image mirror retries
 - name: Find oc-mirror error log (Quay run)
   ansible.builtin.find:
     paths: "{{ quay_mirror_workspace }}/working-dir/logs"
@@ -198,7 +198,7 @@
   when:
     - _quay_mirror_result is defined
     - _quay_mirror_result.rc is defined
-    - _quay_mirror_result.rc in [4, 14]
+    - _quay_mirror_result.rc in [4, 12, 14]
 
 - name: Extract failed non-bundle image refs from Quay error log
   ansible.builtin.shell: >
@@ -269,9 +269,9 @@
   when:
     - _quay_mirror_result is defined
     - _quay_mirror_result.rc is defined
-    - _quay_mirror_result.rc == 14
+    - _quay_mirror_result.rc in [12, 14]
 
-- name: Re-run oc-mirror to regenerate Quay cluster-resources after rc=14
+- name: Re-run oc-mirror to regenerate Quay cluster-resources after partial failure
   ansible.builtin.command: >
     {{ bin_dir }}/oc-mirror
     --v2
@@ -288,7 +288,7 @@
   when:
     - _quay_mirror_result is defined
     - _quay_mirror_result.rc is defined
-    - _quay_mirror_result.rc == 14
+    - _quay_mirror_result.rc in [12, 14]
     - _quay_post_mirror_idms.files | default([]) | length == 0
 
 - name: Wait for Quay cluster-resource regeneration to complete
