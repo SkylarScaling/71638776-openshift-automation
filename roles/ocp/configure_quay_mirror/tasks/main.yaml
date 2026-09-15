@@ -40,6 +40,56 @@
     quay_registry_url: "{{ _quay_route_raw.stdout | trim }}"
     quay_mirror_push_url: "{{ _quay_route_raw.stdout | trim }}/{{ quay_mirror_org }}"
 
+- name: Get Quay config bundle secret name
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get quayregistry {{ quay_mirror_registry_name }}
+    -n {{ quay_mirror_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.spec.configBundleSecret}' 2>/dev/null || true
+  register: _quay_config_secret_name
+  changed_when: false
+
+- name: Enable CREATE_PRIVATE_REPO_ON_PUSH in Quay config
+  ansible.builtin.shell: |
+    set -e
+    SECRET="{{ _quay_config_secret_name.stdout | trim }}"
+    if [ -z "$SECRET" ]; then
+      echo "skip: no configBundleSecret found"
+      exit 0
+    fi
+    CURRENT=$({{ bin_dir }}/oc get secret "$SECRET" \
+      -n {{ quay_mirror_namespace }} \
+      --kubeconfig {{ target_kubeconfig }} \
+      -o jsonpath='{.data.config\.yaml}' | base64 -d)
+    if echo "$CURRENT" | grep -q 'CREATE_PRIVATE_REPO_ON_PUSH: true'; then
+      echo "skip: already enabled"
+      exit 0
+    fi
+    UPDATED=$(echo "$CURRENT"; echo "CREATE_PRIVATE_REPO_ON_PUSH: true")
+    {{ bin_dir }}/oc patch secret "$SECRET" \
+      -n {{ quay_mirror_namespace }} \
+      --kubeconfig {{ target_kubeconfig }} \
+      --type=merge \
+      -p "{\"data\":{\"config.yaml\":\"$(echo -n "$UPDATED" | base64 -w 0)\"}}"
+    echo "changed: enabled CREATE_PRIVATE_REPO_ON_PUSH"
+  args:
+    executable: /bin/bash
+  register: _quay_config_patch
+  changed_when: "'changed:' in _quay_config_patch.stdout"
+
+- name: Wait for Quay to reconcile config change
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get quayregistry {{ quay_mirror_registry_name }}
+    -n {{ quay_mirror_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}' 2>/dev/null || true
+  register: _quay_reconcile
+  changed_when: false
+  until: "'Available=True' in _quay_reconcile.stdout"
+  retries: 30
+  delay: 10
+  when: _quay_config_patch is changed
+
 - name: Get Quay app pod name
   ansible.builtin.shell: >
     {{ bin_dir }}/oc get pod -n {{ quay_mirror_namespace }}
