@@ -474,10 +474,11 @@ all:
         - name: quay-operator
           channels:
             - name: "stable-3.18"
-        # Cluster Observability Operator — required if deploying COO via apps_install_coo
+        # Cluster Observability Operator — required by MCO addon (deploys it as a dependency
+        # on spoke clusters) and optionally via apps_install_coo on the hub
         - name: cluster-observability-operator
           channels:
-            - name: "development"
+            - name: "stable"
       # Optional: additional images to mirror (not part of release or operator catalogs)
       # additional_images:
       #   - registry.redhat.io/ubi9/ubi:latest
