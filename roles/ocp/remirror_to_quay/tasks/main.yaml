@@ -44,6 +44,9 @@
     validate_certs: false
     status_code: [200, 301]
   register: _quay_health
+  until: _quay_health.status | default(0) in [200, 301]
+  retries: 20
+  delay: 15
   failed_when: _quay_health.status | default(0) not in [200, 301]
 
 - name: Check for existing Quay oc-mirror results
