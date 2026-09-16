@@ -84,27 +84,37 @@
   register: _quay_config_patch
   changed_when: "'changed:' in _quay_config_patch.stdout"
 
-- name: Delete Quay app pods to apply new config
-  ansible.builtin.shell: >
-    {{ bin_dir }}/oc delete pods
-    -n {{ quay_mirror_namespace }}
-    --kubeconfig {{ target_kubeconfig }}
-    -l quay-component=quay-app
+- name: Wait for Quay Operator to apply new config to running pods
+  ansible.builtin.shell: |
+    POD=$({{ bin_dir }}/oc get pod -n {{ quay_mirror_namespace }} \
+      --kubeconfig {{ target_kubeconfig }} \
+      -l quay-component=quay-app \
+      --field-selector=status.phase=Running \
+      --no-headers -o custom-columns=NAME:.metadata.name | head -1)
+    if [ -z "$POD" ]; then
+      echo "no-running-pod"
+      exit 0
+    fi
+    cat << 'PYEOF' | {{ bin_dir }}/oc exec -i -n {{ quay_mirror_namespace }} \
+      --kubeconfig {{ target_kubeconfig }} "$POD" -- python3 -
+    import sys, os
+    sys.path.insert(0, '/quay-registry')
+    os.chdir('/quay-registry')
+    from app import app
+    with app.app_context():
+        if app.config.get('FEATURE_EXTENDED_REPOSITORY_NAMES', False):
+            print('confirmed')
+        else:
+            print('missing')
+    PYEOF
+  args:
+    executable: /bin/bash
+  register: _quay_feature_verify
+  until: "'confirmed' in _quay_feature_verify.stdout"
+  retries: 24
+  delay: 15
   when: _quay_config_patch is changed
-  changed_when: true
-
-- name: Wait for Quay to become available after pod restart
-  ansible.builtin.shell: >
-    {{ bin_dir }}/oc get quayregistry {{ quay_mirror_registry_name }}
-    -n {{ quay_mirror_namespace }}
-    --kubeconfig {{ target_kubeconfig }}
-    -o jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}' 2>/dev/null || true
-  register: _quay_available
   changed_when: false
-  until: "'Available=True' in _quay_available.stdout"
-  retries: 30
-  delay: 10
-  when: _quay_config_patch is changed
 
 - name: Get Quay app pod name
   ansible.builtin.shell: >
