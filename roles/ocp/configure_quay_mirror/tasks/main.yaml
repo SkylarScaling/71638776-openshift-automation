@@ -84,25 +84,27 @@
   register: _quay_config_patch
   changed_when: "'changed:' in _quay_config_patch.stdout"
 
-- name: Restart Quay app pods to apply config changes
-  ansible.builtin.shell: |
-    set -e
-    DEPLOY=$({{ bin_dir }}/oc get deployment \
-      -n {{ quay_mirror_namespace }} \
-      --kubeconfig {{ target_kubeconfig }} \
-      -l quay-component=quay-app \
-      -o jsonpath='{.items[0].metadata.name}')
-    {{ bin_dir }}/oc rollout restart deployment/"$DEPLOY" \
-      -n {{ quay_mirror_namespace }} \
-      --kubeconfig {{ target_kubeconfig }}
-    {{ bin_dir }}/oc rollout status deployment/"$DEPLOY" \
-      -n {{ quay_mirror_namespace }} \
-      --kubeconfig {{ target_kubeconfig }} \
-      --timeout=300s
-  args:
-    executable: /bin/bash
+- name: Delete Quay app pods to apply new config
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc delete pods
+    -n {{ quay_mirror_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+    -l quay-component=quay-app
   when: _quay_config_patch is changed
   changed_when: true
+
+- name: Wait for Quay to become available after pod restart
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get quayregistry {{ quay_mirror_registry_name }}
+    -n {{ quay_mirror_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}' 2>/dev/null || true
+  register: _quay_available
+  changed_when: false
+  until: "'Available=True' in _quay_available.stdout"
+  retries: 30
+  delay: 10
+  when: _quay_config_patch is changed
 
 - name: Get Quay app pod name
   ansible.builtin.shell: >
