@@ -234,6 +234,51 @@
         target_kubeconfig: "{{ hub_kubeconfig }}"
 
     # ------------------------------------------------------------------
+    # Day 2: Cluster Configuration (NTP, Auth, RBAC, GroupSync, MetalLB, SSL)
+    # ------------------------------------------------------------------
+    - name: Configure NTP on Hub
+      ansible.builtin.include_role:
+        name: ocp/configure_ntp
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+      when: ntp_servers | default([]) | length > 0
+
+    - name: Configure Authentication on Hub
+      ansible.builtin.include_role:
+        name: ocp/configure_authentication
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+      when: ldap is defined
+
+    - name: Configure RBAC on Hub
+      ansible.builtin.include_role:
+        name: ocp/configure_rbac
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+      when: rbac_bindings | default([]) | length > 0
+
+    - name: Install Group Sync Operator on Hub
+      ansible.builtin.include_role:
+        name: ocp/install_groupsync
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+      when: groupsync is defined
+
+    - name: Install MetalLB on Hub
+      ansible.builtin.include_role:
+        name: ocp/install_metallb
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+      when: metallb is defined
+
+    - name: Configure Custom SSL on Hub
+      ansible.builtin.include_role:
+        name: ocp/configure_ssl
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+      when: ssl is defined
+
+    # ------------------------------------------------------------------
     # ACM Policies for Spoke Configuration
     # ------------------------------------------------------------------
     - name: Install ACM Policies
@@ -410,6 +455,48 @@
         target_kubeconfig: "{{ hub_kubeconfig }}"
         search_target_namespaces:
           - "{{ ocp_cluster.name }}"
+
+    - name: Configure NTP on Managed Cluster
+      ansible.builtin.include_role:
+        name: ocp/configure_ntp
+      vars:
+        target_kubeconfig: "{{ spoke_kubeconfig }}"
+      when: ntp_servers | default([]) | length > 0
+
+    - name: Configure Authentication on Managed Cluster
+      ansible.builtin.include_role:
+        name: ocp/configure_authentication
+      vars:
+        target_kubeconfig: "{{ spoke_kubeconfig }}"
+      when: ldap is defined
+
+    - name: Configure RBAC on Managed Cluster
+      ansible.builtin.include_role:
+        name: ocp/configure_rbac
+      vars:
+        target_kubeconfig: "{{ spoke_kubeconfig }}"
+      when: rbac_bindings | default([]) | length > 0
+
+    - name: Install Group Sync Operator on Managed Cluster
+      ansible.builtin.include_role:
+        name: ocp/install_groupsync
+      vars:
+        target_kubeconfig: "{{ spoke_kubeconfig }}"
+      when: groupsync is defined
+
+    - name: Install MetalLB on Managed Cluster
+      ansible.builtin.include_role:
+        name: ocp/install_metallb
+      vars:
+        target_kubeconfig: "{{ spoke_kubeconfig }}"
+      when: metallb is defined
+
+    - name: Configure Custom SSL on Managed Cluster
+      ansible.builtin.include_role:
+        name: ocp/configure_ssl
+      vars:
+        target_kubeconfig: "{{ spoke_kubeconfig }}"
+      when: ssl is defined
 
 # ==============================================================================
 # MIGRATE MIRROR: Move Mirror Registry from Jumphost to Quay on Hub
