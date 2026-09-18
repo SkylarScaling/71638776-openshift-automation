@@ -1,0 +1,161 @@
+---
+# DYNAMICALLY DISCOVER CLUSTER IMAGE SET
+- name: Query Hub for available ClusterImageSets
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get clusterimageset
+    --kubeconfig {{ target_kubeconfig }}
+    -o json 2>/dev/null || echo '{"items":[]}'
+  register: _image_sets_raw
+  changed_when: false
+
+- name: Dynamically set the ClusterImageSet fact based on inventory version
+  ansible.builtin.set_fact:
+    spoke_clusterimageset_name: >-
+      {{
+        (_image_sets_raw.stdout | from_json)['items'] |
+        selectattr('metadata.name', 'search', openshift_version ~ '.' ~ ocp_patch_version) |
+        map(attribute='metadata.name') |
+        first | default('')
+      }}
+
+- name: Verify that a matching ClusterImageSet was found
+  ansible.builtin.assert:
+    that:
+      - spoke_clusterimageset_name != ""
+    fail_msg: >
+      Could not find a ClusterImageSet on the Hub matching version {{ openshift_version }}.{{ ocp_patch_version }}.
+      Ensure the configure_disconnected_hub role has been run to create the mirrored ClusterImageSet.
+
+- name: Ensure target ManagedClusterSet exists on the Hub
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: "{{ lookup('template', '00-managed-clusterset.yaml.j2') }}"
+  changed_when: true
+
+- name: Create ManagedCluster object
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: "{{ lookup('template', '01-managed-cluster.yaml.j2') }}"
+  changed_when: true
+
+- name: Create Spoke Cluster Namespace
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: "{{ lookup('template', '02-namespace.yaml.j2') }}"
+  changed_when: true
+
+- name: Create Required Secrets (AWS Creds, Pull Secret, Install-Config with Disconnected Settings)
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: "{{ lookup('template', '03-secrets.yaml.j2') }}"
+  changed_when: true
+  no_log: true
+
+- name: Create ClusterDeployment object
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: "{{ lookup('template', '04-cluster-deployment.yaml.j2') }}"
+  changed_when: true
+
+- name: Create MachinePool object for Worker Nodes
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: "{{ lookup('template', '05-machine-pool.yaml.j2') }}"
+  changed_when: true
+
+- name: Wait for ClusterDeployment to start provisioning
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get clusterdeployment {{ ocp_cluster.name }}
+    -n {{ ocp_cluster.name }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.provisionRef.name}' 2>/dev/null || true
+  register: _cd_provision_ref
+  changed_when: false
+  until: _cd_provision_ref.stdout != ""
+  retries: 30
+  delay: 10
+
+- name: Wait for OpenShift cluster installation to complete or fail (Takes 35-45+ minutes)
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get clusterdeployment {{ ocp_cluster.name }}
+    -n {{ ocp_cluster.name }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}' 2>/dev/null || true
+  register: _cd_conditions
+  changed_when: false
+  until: >
+    ('Provisioned=True' in _cd_conditions.stdout) or
+    ('ProvisionFailed=True' in _cd_conditions.stdout)
+  retries: 90
+  delay: 60
+
+- name: Get provisioning failure details
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get clusterdeployment {{ ocp_cluster.name }}
+    -n {{ ocp_cluster.name }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='Reason: {.status.conditions[?(@.type=="ProvisionFailed")].reason}{"\nMessage: "}{.status.conditions[?(@.type=="ProvisionFailed")].message}'
+    2>/dev/null || true
+  register: _cd_fail_details
+  changed_when: false
+  when: "'ProvisionFailed=True' in _cd_conditions.stdout"
+
+- name: Fail immediately if provisioning errored out
+  ansible.builtin.fail:
+    msg: "Provisioning for {{ ocp_cluster.name }} failed!\n{{ _cd_fail_details.stdout | default('No details available.') }}"
+  when: "'ProvisionFailed=True' in _cd_conditions.stdout"
+
+- name: Ensure Observability Namespace exists on the Spoke via ManifestWork
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: work.open-cluster-management.io/v1
+      kind: ManifestWork
+      metadata:
+        name: "{{ ocp_cluster.name }}-observability-namespace"
+        namespace: "{{ ocp_cluster.name }}"
+      spec:
+        workload:
+          manifests:
+            - apiVersion: v1
+              kind: Namespace
+              metadata:
+                name: open-cluster-management-observability
+  changed_when: true
+
+- name: Push disconnected CatalogSource and OperatorHub config to Spoke via ManifestWork
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: work.open-cluster-management.io/v1
+      kind: ManifestWork
+      metadata:
+        name: "{{ ocp_cluster.name }}-disconnected-config"
+        namespace: "{{ ocp_cluster.name }}"
+      spec:
+        workload:
+          manifests:
+            - apiVersion: config.openshift.io/v1
+              kind: OperatorHub
+              metadata:
+                name: cluster
+              spec:
+                disableAllDefaultSources: true
+            - apiVersion: operators.coreos.com/v1alpha1
+              kind: CatalogSource
+              metadata:
+                name: redhat-operators
+                namespace: openshift-marketplace
+              spec:
+                sourceType: grpc
+                image: "{{ mirror_registry_url }}/{{ mirror_base_path }}/redhat/redhat-operator-index:v{{ openshift_version }}"
+                displayName: "Red Hat Operators (Mirrored)"
+                publisher: "Red Hat (Mirrored)"
+                updateStrategy:
+                  registryPoll:
+                    interval: 30m
+  changed_when: true
+
+- name: Report successful provisioning
+  ansible.builtin.debug:
+    msg: "Cluster {{ ocp_cluster.name }} has been successfully provisioned by ACM (disconnected)!"

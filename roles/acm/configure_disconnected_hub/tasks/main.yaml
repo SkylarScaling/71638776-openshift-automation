@@ -1,0 +1,38 @@
+---
+- name: Create ClusterImageSet pointing to mirrored release
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: "{{ lookup('template', 'cluster-image-set.yaml.j2') }}"
+  changed_when: true
+
+- name: Verify ClusterImageSet was created
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get clusterimageset img{{ openshift_version }}.{{ ocp_patch_version }}-x86-64-appsub
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.metadata.name}' 2>/dev/null || true
+  register: _cis_check
+  changed_when: false
+  until: _cis_check.stdout != ""
+  retries: 5
+  delay: 5
+
+- name: Create ConfigMap with mirror registry CA for spoke provisioning
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: mirror-registry-ca-bundle
+        namespace: open-cluster-management
+      data:
+        ca-bundle.crt: |
+          {{ mirror_registry_ca_bundle | indent(10) }}
+  changed_when: true
+
+- name: Display disconnected hub configuration summary
+  ansible.builtin.debug:
+    msg:
+      - "Disconnected hub configuration complete"
+      - "ClusterImageSet: img{{ openshift_version }}.{{ ocp_patch_version }}-x86-64-appsub"
+      - "Release image: {{ mirror_registry_url }}/{{ mirror_base_path }}/openshift-release-dev/ocp-release:{{ openshift_version }}.{{ ocp_patch_version }}-x86_64"

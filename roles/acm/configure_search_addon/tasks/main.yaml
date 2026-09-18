@@ -32,14 +32,14 @@
   loop: "{{ search_target_namespaces }}"
 
 - name: Enable Search Collector in target cluster namespaces
-  kubernetes.core.k8s:
-    kubeconfig: "{{ target_kubeconfig }}"
-    state: present
-    definition:
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
       apiVersion: addon.open-cluster-management.io/v1alpha1
       kind: ManagedClusterAddOn
       metadata:
         name: search-collector
         namespace: "{{ item }}"
       spec: {}
+  changed_when: true
   loop: "{{ search_target_namespaces }}"

@@ -1,0 +1,12 @@
+---
+spokes_clusterset: default
+sigstore_policy_namespace: default
+
+# enforce = automatically enables TechPreviewNoUpgrade on non-compliant clusters
+# inform  = report only; use this first to audit which clusters need the change
+#
+# WARNING: TechPreviewNoUpgrade is irreversible without reinstalling the cluster.
+# Run with inform first to confirm target clusters, then switch to enforce.
+# If managed clusters use mirror registries, mirror cosign signatures for OCP
+# release images BEFORE switching to enforce — see README.md for details.
+policy_remediation_action: inform

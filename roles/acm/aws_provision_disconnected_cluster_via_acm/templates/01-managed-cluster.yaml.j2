@@ -1,0 +1,13 @@
+apiVersion: cluster.open-cluster-management.io/v1
+kind: ManagedCluster
+metadata:
+  name: {{ ocp_cluster.name }}
+  labels:
+    cloud: Amazon
+    vendor: OpenShift
+    cluster.open-cluster-management.io/clusterset: {{ parent_clusterset }}
+{% if gitops_version is defined %}
+    argocd.version: "{{ gitops_version }}"
+{% endif %}
+spec:
+  hubAcceptsClient: true

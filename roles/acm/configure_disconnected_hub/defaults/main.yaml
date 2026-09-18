@@ -1,0 +1,2 @@
+---
+mirror_base_path: "{{ disconnected.mirror_base_path | default('ocp4') }}"

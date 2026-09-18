@@ -1,0 +1,6 @@
+---
+automation_repo_url: "git@github.com:SkylarScaling/71638776-openshift-automation.git"
+automation_repo_dest: "~/71638776-openshift-automation"
+automation_repo_branch: "disconnected"
+jumphost_pull_secret_dest: "~/pull-secret.json"
+jumphost_ssh_user: "ec2-user"

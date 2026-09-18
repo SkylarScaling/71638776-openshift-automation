@@ -12,10 +12,10 @@
   changed_when: false
 
 - name: Configure Managed Cluster Add-on Strategies (On Regional Hub)
-  kubernetes.core.k8s:
-    kubeconfig: "{{ target_kubeconfig }}"
-    state: present
-    template: "managed-clusters-strategy.yaml.j2"
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: "{{ lookup('template', 'managed-clusters-strategy.yaml.j2') }}"
+  changed_when: true
   loop:
     - governance-policy-framework
     - config-policy-controller

@@ -1,0 +1,25 @@
+---
+- name: Check installed oc-mirror version
+  ansible.builtin.command: "{{ bin_dir }}/oc-mirror version"
+  register: oc_mirror_version_check
+  changed_when: false
+  failed_when: false
+
+- name: Download and extract oc-mirror plugin
+  ansible.builtin.unarchive:
+    src: "{{ openshift_mirror_url }}/oc-mirror.tar.gz"
+    dest: "{{ bin_dir }}"
+    remote_src: yes
+    mode: '0755'
+  when: >
+    force_update | bool or
+    oc_mirror_version_check.rc != 0
+
+- name: Verify oc-mirror installation
+  ansible.builtin.command: "{{ bin_dir }}/oc-mirror version"
+  register: oc_mirror_version_output
+  changed_when: false
+
+- name: Display oc-mirror version
+  ansible.builtin.debug:
+    msg: "{{ oc_mirror_version_output.stdout_lines }}"

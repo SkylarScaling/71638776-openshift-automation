@@ -1,0 +1,195 @@
+---
+- name: Apply ImageDigestMirrorSet / ImageContentSourcePolicy manifests
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: "{{ item }}"
+  loop: "{{ oc_mirror_idms_manifests }}"
+  loop_control:
+    index_var: _idms_idx
+    label: "IDMS manifest {{ _idms_idx + 1 }}"
+  changed_when: true
+
+- name: Disable default OperatorHub catalog sources
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: config.openshift.io/v1
+      kind: OperatorHub
+      metadata:
+        name: cluster
+      spec:
+        disableAllDefaultSources: true
+  when: disable_default_catalog_sources | bool
+  changed_when: true
+
+- name: Fail if oc-mirror produced no CatalogSource manifests
+  ansible.builtin.fail:
+    msg: >-
+      oc_mirror_catalogsource_manifests is empty — oc-mirror did not generate
+      a CatalogSource for the operator catalog. This usually means the operator
+      images (including the catalog index image) were not successfully mirrored.
+      Without a CatalogSource no operators can install.
+      Re-run the mirroring step and check:
+        {{ oc_mirror_workspace }}/working-dir/logs/mirroring_errors_*.txt
+  when: oc_mirror_catalogsource_manifests | default([]) | length == 0
+
+- name: Extract mirrored operator index image reference from oc-mirror CatalogSource
+  ansible.builtin.set_fact:
+    _mirrored_index_image: >-
+      {{ (oc_mirror_catalogsource_manifests
+          | map('from_yaml_all')
+          | flatten
+          | select('mapping')
+          | selectattr('kind', 'equalto', 'CatalogSource')
+          | selectattr('spec.image', 'defined')
+          | selectattr('spec.image', 'search', 'redhat-operator-index')
+          | map(attribute='spec.image')
+          | first) }}
+
+- name: Create redhat-operators CatalogSource using oc-mirror digest reference
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: operators.coreos.com/v1alpha1
+      kind: CatalogSource
+      metadata:
+        name: redhat-operators
+        namespace: openshift-marketplace
+      spec:
+        sourceType: grpc
+        image: "{{ _mirrored_index_image }}"
+        displayName: "Red Hat Operators (Mirrored)"
+        publisher: "Red Hat (Mirrored)"
+        updateStrategy:
+          registryPoll:
+            interval: 30m
+  changed_when: true
+
+- name: Check if mirror registry credentials already exist in global pull secret
+  ansible.builtin.shell: |
+    set -e
+    CURRENT=$({{ bin_dir }}/oc get secret pull-secret \
+      -n openshift-config \
+      --kubeconfig {{ target_kubeconfig }} \
+      -o jsonpath='{.data.\.dockerconfigjson}' | base64 -d)
+    EXPECTED='{{ disconnected_pull_secret.auths[mirror_registry_url].auth }}'
+    EXISTING_AUTH=$(echo "$CURRENT" | jq -r '.auths["{{ mirror_registry_url }}"].auth // ""')
+    if [ "$EXISTING_AUTH" = "$EXPECTED" ]; then
+      echo "present"
+    else
+      echo "missing"
+    fi
+  args:
+    executable: /bin/bash
+  register: _pull_secret_check
+  changed_when: false
+  no_log: true
+
+- name: Update global pull secret with mirror registry credentials
+  ansible.builtin.shell: |
+    set -e
+    CURRENT=$({{ bin_dir }}/oc get secret pull-secret \
+      -n openshift-config \
+      --kubeconfig {{ target_kubeconfig }} \
+      -o jsonpath='{.data.\.dockerconfigjson}' | base64 -d)
+    MERGED=$(echo "$CURRENT" | jq -c \
+      --argjson new '{{ disconnected_pull_secret | to_json }}' \
+      '.auths += $new.auths')
+    {{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f - <<EOF
+    apiVersion: v1
+    kind: Secret
+    metadata:
+      name: pull-secret
+      namespace: openshift-config
+    type: kubernetes.io/dockerconfigjson
+    data:
+      .dockerconfigjson: "$(echo -n "$MERGED" | base64 -w 0)"
+    EOF
+  args:
+    executable: /bin/bash
+  register: _pull_secret_apply
+  changed_when: true
+  no_log: true
+  when: _pull_secret_check.stdout | trim == "missing"
+
+- name: Wait for MachineConfigPool updates to begin rolling out
+  ansible.builtin.debug:
+    msg: >
+      Disconnected cluster configuration applied. Node MachineConfigPools
+      will begin rolling out with the updated mirror configuration.
+      This may take 10-30 minutes as nodes are rebooted.
+  when: _pull_secret_check.stdout | trim == "missing"
+
+# Wait for MCO to detect and begin the rolling update before checking
+# completion. Without this pre-wait, the existing Updated=True condition
+# (from a prior roll) can pass the completion check immediately, before
+# the controller has even noticed the new IDMS config.
+- name: Wait for master MachineConfigPool to begin updating (MCO detection window)
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get mcp master
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.conditions[?(@.type=="Updating")].status}'
+  register: _master_mcp_updating
+  until: _master_mcp_updating.stdout == "True"
+  retries: 12
+  delay: 15
+  changed_when: false
+  failed_when: false
+  when: _pull_secret_check.stdout | trim == "missing"
+
+- name: Wait for master MachineConfigPool to finish updating
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get mcp master
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.conditions[?(@.type=="Updated")].status}'
+  register: master_mcp
+  until: master_mcp.stdout == "True"
+  retries: 60
+  delay: 30
+  changed_when: false
+
+- name: Wait for worker MachineConfigPool to begin updating (MCO detection window)
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get mcp worker
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.conditions[?(@.type=="Updating")].status}'
+  register: _worker_mcp_updating
+  until: _worker_mcp_updating.stdout == "True"
+  retries: 12
+  delay: 15
+  changed_when: false
+  failed_when: false
+  when: _pull_secret_check.stdout | trim == "missing"
+
+- name: Wait for worker MachineConfigPool to finish updating
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get mcp worker
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.conditions[?(@.type=="Updated")].status}'
+  register: worker_mcp
+  until: worker_mcp.stdout == "True"
+  retries: 60
+  delay: 30
+  changed_when: false
+
+- name: Verify CatalogSource pods are ready
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get catalogsource -n openshift-marketplace
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{range .items[*]}{.metadata.name}={.status.connectionState.lastObservedState}{"\n"}{end}'
+  register: catalog_status
+  until: >
+    catalog_status.stdout != "" and
+    (catalog_status.stdout_lines | reject('search', '=READY$') | reject('match', '^$') | list | length == 0)
+  retries: 60
+  delay: 30
+  changed_when: false
+
+- name: Display disconnected cluster configuration status
+  ansible.builtin.debug:
+    msg:
+      - "Disconnected cluster configuration complete"
+      - "Mirror registry: {{ mirror_registry_url }}"
+      - "Default catalog sources: {{ 'disabled' if disable_default_catalog_sources else 'enabled' }}"
+      - "MachineConfigPools: updated"
+      - "CatalogSource status: {{ catalog_status.stdout_lines }}"

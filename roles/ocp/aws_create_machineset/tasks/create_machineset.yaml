@@ -12,10 +12,10 @@
     machineset_name: "{{ cluster_id }}-{{ pool_name }}-{{ current_subnet.availability_zone }}"
 
 - name: Apply the generated MachineSet YAML to OpenShift cluster
-  kubernetes.core.k8s:
-    kubeconfig: "{{ target_kubeconfig }}"
-    state: present
-    definition: "{{ lookup('template', 'machineset.yaml.j2') | from_yaml }}"
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: "{{ lookup('template', 'machineset.yaml.j2') }}"
+  changed_when: true
   when: az_replicas | int > 0
 
 - name: Display MachineSet application status

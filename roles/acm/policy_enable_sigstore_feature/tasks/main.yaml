@@ -1,0 +1,17 @@
+---
+- name: Wait for ACM CRDs to be fully registered
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get crd managedclustersetbindings.cluster.open-cluster-management.io
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.metadata.name}' 2>/dev/null || true
+  register: _crd_check
+  changed_when: false
+  until: _crd_check.stdout != ""
+  retries: 60
+  delay: 10
+
+- name: Deploy Sigstore Feature Gate Policy
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: "{{ lookup('template', 'sigstore-featuregate-policy.yaml.j2') }}"
+  changed_when: true

@@ -1,31 +1,32 @@
 ---
 - name: "Ensure the Operator Namespace Exists"
-  kubernetes.core.k8s:
-    kubeconfig: "{{ target_kubeconfig }}"
-    api_version: v1
-    kind: Namespace
-    name: "{{ gitops_operator_namespace }}"
-    state: present
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ gitops_operator_namespace }}"
+  changed_when: true
 
 # Note: If installing to 'openshift-operators', the OperatorGroup already exists.
 # We only create one if we are using a custom namespace.
 - name: "Create OperatorGroup for GitOps (if custom namespace)"
-  kubernetes.core.k8s:
-    kubeconfig: "{{ target_kubeconfig }}"
-    state: present
-    definition:
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
       apiVersion: operators.coreos.com/v1
       kind: OperatorGroup
       metadata:
         name: openshift-gitops-operator-group
         namespace: "{{ gitops_operator_namespace }}"
+  changed_when: true
   when: gitops_operator_namespace != "openshift-operators"
 
 - name: "Subscribe to OpenShift GitOps Operator"
-  kubernetes.core.k8s:
-    kubeconfig: "{{ target_kubeconfig }}"
-    state: present
-    definition:
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
       apiVersion: operators.coreos.com/v1alpha1
       kind: Subscription
       metadata:
@@ -37,6 +38,32 @@
         name: openshift-gitops-operator
         source: "{{ gitops_operator_source }}"
         sourceNamespace: "{{ gitops_operator_source_namespace }}"
+  changed_when: true
+
+- name: "Check if GitOps Operator CSV is already installed"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get subscription openshift-gitops-operator
+    -n {{ gitops_operator_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.installedCSV}' 2>/dev/null || true
+  register: _existing_csv
+  changed_when: false
+  when: wait_for_operator_ready
+
+- name: "Wait for redhat-operators CatalogSource to be READY"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get catalogsource {{ gitops_operator_source }}
+    -n {{ gitops_operator_source_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.connectionState.lastObservedState}' 2>/dev/null || true
+  register: _cs_state
+  until: _cs_state.stdout == "READY"
+  retries: 60
+  delay: 15
+  changed_when: false
+  when:
+    - wait_for_operator_ready
+    - _existing_csv.stdout | default('') == ""
 
 - name: "Wait for GitOps Operator CSV to be installed"
   ansible.builtin.shell: >
@@ -46,10 +73,12 @@
     -o jsonpath='{.status.installedCSV}{.status.currentCSV}' 2>/dev/null || true
   register: gitops_sub
   until: gitops_sub.stdout != ""
-  retries: 30
+  retries: 90
   delay: 10
   changed_when: false
-  when: wait_for_operator_ready
+  when:
+    - wait_for_operator_ready
+    - _existing_csv.stdout | default('') == ""
 
 - name: "Wait for the GitOps Operator Deployment to be Ready"
   ansible.builtin.shell: >
@@ -73,15 +102,14 @@
     -o jsonpath='{.metadata.name}' 2>/dev/null || true
   register: default_argocd
   until: default_argocd.stdout == "openshift-gitops"
-  retries: 30  # Wait up to 5 minutes (30 * 10s) for the operator to scaffold the instance
+  retries: 60
   delay: 10
   changed_when: false
 
 - name: "Teach ArgoCD how to evaluate OLM health (Patch)"
-  kubernetes.core.k8s:
-    kubeconfig: "{{ target_kubeconfig }}"
-    state: present
-    definition:
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
       apiVersion: argoproj.io/v1beta1
       kind: ArgoCD
       metadata:
@@ -149,7 +177,8 @@
               end
               return hs
   register: argocd_patch
-  until: argocd_patch is not failed
+  changed_when: true
+  until: argocd_patch.rc == 0
   retries: 12
   delay: 10
 

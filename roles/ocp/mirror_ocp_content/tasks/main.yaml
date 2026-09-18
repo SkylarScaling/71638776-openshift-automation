@@ -1,0 +1,323 @@
+---
+- name: Create oc-mirror workspace directory
+  ansible.builtin.file:
+    state: directory
+    path: "{{ oc_mirror_workspace }}"
+    mode: '0755'
+
+- name: Template ImageSetConfiguration
+  ansible.builtin.template:
+    src: "{{ role_path }}/templates/imageset-config.yaml.j2"
+    dest: "{{ oc_mirror_workspace }}/imageset-config.yaml"
+    mode: '0644'
+
+- name: Display ImageSetConfiguration
+  ansible.builtin.debug:
+    msg: "ImageSetConfiguration written to {{ oc_mirror_workspace }}/imageset-config.yaml"
+
+# Consider mirroring complete only when BOTH the IDMS and a CatalogSource file
+# exist. A partial rc=14 failure writes the IDMS but not the CatalogSource, so
+# checking only for the IDMS causes re-runs to skip mirroring while leaving
+# oc_mirror_catalogsource_manifests empty.
+- name: Check for existing oc-mirror v2 IDMS results
+  ansible.builtin.find:
+    paths: "{{ oc_mirror_workspace }}/working-dir/cluster-resources"
+    patterns:
+      - "idms-*.yaml"
+      - "imageDigestMirrorSet*.yaml"
+    file_type: file
+  register: existing_idms
+  failed_when: false
+
+- name: Check for existing oc-mirror v2 CatalogSource results
+  ansible.builtin.find:
+    paths: "{{ oc_mirror_workspace }}/working-dir/cluster-resources"
+    patterns: "cs-*.yaml"
+    file_type: file
+  register: existing_cs
+  failed_when: false
+
+- name: Read mirror version sentinel if present
+  ansible.builtin.slurp:
+    src: "{{ oc_mirror_workspace }}/.mirror-version"
+  register: _existing_mirror_version
+  failed_when: false
+
+- name: Check existing CatalogSource files for a valid image pointing to the local mirror registry
+  ansible.builtin.shell: |
+    python3 -c "
+    import glob, sys
+    try:
+        import yaml
+    except ImportError:
+        import subprocess, sys
+        subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'pyyaml', '-q'])
+        import yaml
+    cs_dir = '{{ oc_mirror_workspace }}/working-dir/cluster-resources'
+    mirror = '{{ mirror_registry_url }}'
+    valid = False
+    for f in glob.glob(cs_dir + '/cs-*.yaml'):
+        for doc in yaml.safe_load_all(open(f)):
+            if doc and doc.get('kind') == 'CatalogSource':
+                img = doc.get('spec', {}).get('image', '')
+                if img and mirror in img:
+                    valid = True
+    print('valid' if valid else 'invalid')
+    "
+  register: _cs_image_valid
+  changed_when: false
+  failed_when: false
+
+# Require that IDMS files, CatalogSource files, a version sentinel matching
+# the current version, AND a cs-*.yaml whose spec.image references the local
+# mirror registry all exist before skipping. The image check prevents stale
+# workspace files (e.g. from a failed Quay remirror that overwrote cs-*.yaml
+# with image:"") from suppressing a fresh mirror run.
+- name: Set oc-mirror completion flag
+  ansible.builtin.set_fact:
+    _oc_mirror_complete: >-
+      {{ existing_idms.files | default([]) | length > 0
+         and existing_cs.files | default([]) | length > 0
+         and (_existing_mirror_version.content | default('') | b64decode | trim)
+             == (openshift_version ~ '.' ~ ocp_patch_version)
+         and _cs_image_valid.stdout | default('invalid') == 'valid' }}
+
+- name: Print log path for live monitoring
+  ansible.builtin.debug:
+    msg: >
+      Starting oc-mirror. This may take 60-120+ minutes depending on bandwidth.
+      Monitor progress: tail -f {{ oc_mirror_workspace }}/.oc-mirror.log
+      or: watch -n 5 'du -sh {{ oc_mirror_workspace }}'
+  when: not _oc_mirror_complete
+
+- name: Create auth directory for oc-mirror credentials
+  ansible.builtin.file:
+    state: directory
+    path: "{{ oc_mirror_workspace }}/containers"
+    mode: '0700'
+  when: not _oc_mirror_complete
+
+- name: Write merged pull secret for oc-mirror authentication
+  ansible.builtin.copy:
+    src: "{{ mirror_registry_dir }}/pull-secret-merged.json"
+    dest: "{{ oc_mirror_workspace }}/containers/auth.json"
+    mode: '0600'
+  when: not _oc_mirror_complete
+
+- name: Run oc-mirror to mirror content to registry
+  ansible.builtin.command: >
+    {{ bin_dir }}/oc-mirror
+    --v2
+    --config {{ oc_mirror_workspace }}/imageset-config.yaml
+    --workspace file://{{ oc_mirror_workspace }}
+    docker://{{ mirror_registry_url }}/{{ mirror_base_path }}
+  environment:
+    XDG_RUNTIME_DIR: "{{ oc_mirror_workspace }}"
+  args:
+    chdir: "{{ oc_mirror_workspace }}"
+  async: 7200
+  poll: 0
+  register: oc_mirror_job
+  when: not _oc_mirror_complete
+
+- name: Wait for oc-mirror to complete (up to 2 hours)
+  ansible.builtin.async_status:
+    jid: "{{ oc_mirror_job.ansible_job_id }}"
+  register: oc_mirror_result
+  until: oc_mirror_result.finished
+  retries: 240
+  delay: 30
+  when: oc_mirror_job is defined and oc_mirror_job.ansible_job_id is defined
+  # rc=4: partial success — manifest format incompatibility with certain multi-arch images.
+  # rc=12/14: partial failure — transient network errors or auth issues for a subset of images.
+  #           IDMS is still generated; failed images are retried below with oc image mirror.
+  # All are handled by the retry block below. Check working-dir/logs/mirroring_errors_*.txt.
+  failed_when:
+    - oc_mirror_result.finished
+    - oc_mirror_result.rc not in [0, 4, 12, 14]
+
+# ==============================================================================
+# WORKAROUND: oc-mirror v2 manifest format bug
+#
+# oc-mirror v2 fails with rc=4 on certain multi-arch manifest list images
+# (notably multicluster-engine/hive-rhel9) because it cannot convert the
+# manifest format while preserving digests. This leaves required operator
+# images out of the mirror and causes downstream operator install failures.
+#
+# Workaround: after rc=4, parse the error log and retry failed images using
+# `oc image mirror --filter-by-os=linux/amd64`, which copies only the
+# linux/amd64 layer and avoids the manifest format constraint.
+#
+# NOTE: This produces a single-arch image with a different digest than the
+# original multi-arch manifest. The IDMS from oc-mirror references the
+# original multi-arch digest, so the cluster will fall through to the mirror
+# via tag rather than digest. This is acceptable for operator images.
+#
+# REMOVE THIS BLOCK when the upstream oc-mirror v2 bug is fixed:
+# https://github.com/openshift/oc-mirror/issues (search: "preserve digests manifest list")
+# ==============================================================================
+- name: Find oc-mirror v2 error log
+  ansible.builtin.find:
+    paths: "{{ oc_mirror_workspace }}/working-dir/logs"
+    patterns: "mirroring_errors_*.txt"
+    file_type: file
+  register: oc_mirror_error_logs
+  when:
+    - oc_mirror_result is defined
+    - oc_mirror_result.rc is defined
+    - oc_mirror_result.rc in [4, 12, 14]
+
+- name: Extract failed non-bundle image refs from error log
+  ansible.builtin.shell: >
+    grep -oP 'docker://\S+' {{ (oc_mirror_error_logs.files | sort(attribute='path') | last).path }}
+    | grep -v 'operator-bundle'
+    | sort -u
+  register: failed_images_raw
+  when:
+    - oc_mirror_error_logs is defined
+    - oc_mirror_error_logs.files | default([]) | length > 0
+  changed_when: false
+  failed_when: false
+
+- name: Retry failed images with oc image mirror (linux/amd64 only)
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc image mirror
+    --filter-by-os=linux/amd64
+    --insecure=true
+    -a {{ oc_mirror_workspace }}/containers/auth.json
+    {{ item | regex_replace('^docker://', '') }}
+    {{ mirror_registry_url }}/{{ mirror_base_path }}/{{ item | regex_replace('^docker://[^/]+/', '') | regex_replace('@sha256:[a-f0-9]+$', '') }}
+  loop: "{{ failed_images_raw.stdout_lines | default([]) }}"
+  loop_control:
+    label: "{{ item | regex_replace('^docker://', '') | truncate(80, True, '...') }}"
+  when:
+    - failed_images_raw is defined
+    - failed_images_raw.stdout_lines | default([]) | length > 0
+  changed_when: true
+  failed_when: false
+
+- name: Extract failed operator bundle image refs from error log
+  ansible.builtin.shell: >
+    grep -oP 'docker://\S+' {{ (oc_mirror_error_logs.files | sort(attribute='path') | last).path }}
+    | grep 'operator-bundle'
+    | sort -u
+  register: failed_bundles_raw
+  when:
+    - oc_mirror_error_logs is defined
+    - oc_mirror_error_logs.files | default([]) | length > 0
+  changed_when: false
+  failed_when: false
+
+- name: Retry failed operator bundle images with oc image mirror
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc image mirror
+    --insecure=true
+    -a {{ oc_mirror_workspace }}/containers/auth.json
+    {{ item | regex_replace('^docker://', '') }}
+    {{ mirror_registry_url }}/{{ mirror_base_path }}/{{ item | regex_replace('^docker://[^/]+/', '') | regex_replace('@sha256:[a-f0-9]+$', '') }}
+  loop: "{{ failed_bundles_raw.stdout_lines | default([]) }}"
+  loop_control:
+    label: "{{ item | regex_replace('^docker://', '') | truncate(80, True, '...') }}"
+  when:
+    - failed_bundles_raw is defined
+    - failed_bundles_raw.stdout_lines | default([]) | length > 0
+  changed_when: true
+  failed_when: false
+
+- name: Display oc-mirror partial failure summary
+  ansible.builtin.debug:
+    msg:
+      - "WARNING: oc-mirror rc={{ oc_mirror_result.rc }} — some images failed and were retried with 'oc image mirror'."
+      - "rc=4: manifest format incompatibility; rc=14: transient network failure."
+      - "See {{ oc_mirror_workspace }}/working-dir/logs/ for details."
+      - "Remove the workaround block in mirror_ocp_content/tasks/main.yaml when oc-mirror v2 fixes the manifest preservation bug."
+  when:
+    - oc_mirror_result is defined
+    - oc_mirror_result.rc is defined
+    - oc_mirror_result.rc in [4, 12, 14]
+
+# When rc=14 oc-mirror exits before generating the CatalogSource (cs-*.yaml)
+# because 0 operator images were mirrored. The oc image mirror retry above
+# restores the images, but cluster-resources are not regenerated. Re-run
+# oc-mirror so it produces the cs-*.yaml; all images are now in the destination
+# so this second run only verifies and writes cluster-resources (fast).
+- name: Re-run oc-mirror to regenerate cluster-resources after rc=14 image recovery
+  ansible.builtin.command: >
+    {{ bin_dir }}/oc-mirror
+    --v2
+    --config {{ oc_mirror_workspace }}/imageset-config.yaml
+    --workspace file://{{ oc_mirror_workspace }}
+    docker://{{ mirror_registry_url }}/{{ mirror_base_path }}
+  environment:
+    XDG_RUNTIME_DIR: "{{ oc_mirror_workspace }}"
+  args:
+    chdir: "{{ oc_mirror_workspace }}"
+  async: 7200
+  poll: 0
+  register: oc_mirror_regen_job
+  when:
+    - oc_mirror_result is defined
+    - oc_mirror_result.rc is defined
+    - oc_mirror_result.rc == 14
+
+- name: Wait for oc-mirror cluster-resource regeneration to complete
+  ansible.builtin.async_status:
+    jid: "{{ oc_mirror_regen_job.ansible_job_id }}"
+  register: oc_mirror_regen_result
+  until: oc_mirror_regen_result.finished
+  retries: 240
+  delay: 30
+  when:
+    - oc_mirror_regen_job is defined
+    - oc_mirror_regen_job.ansible_job_id is defined
+  failed_when:
+    - oc_mirror_regen_result.finished
+    - oc_mirror_regen_result.rc not in [0, 4]
+
+- name: Find IDMS files in oc-mirror v2 cluster-resources output
+  ansible.builtin.find:
+    paths: "{{ oc_mirror_workspace }}/working-dir/cluster-resources"
+    patterns:
+      - "idms-*.yaml"
+      - "imageDigestMirrorSet*.yaml"
+      - "imageContentSourcePolicy*.yaml"
+    file_type: file
+  register: idms_files
+
+- name: Find CatalogSource files in oc-mirror v2 cluster-resources output
+  ansible.builtin.find:
+    paths: "{{ oc_mirror_workspace }}/working-dir/cluster-resources"
+    patterns: "cs-*.yaml"
+    file_type: file
+  register: catalogsource_files
+
+- name: Read all IDMS manifests
+  ansible.builtin.slurp:
+    src: "{{ item.path }}"
+  loop: "{{ idms_files.files }}"
+  register: idms_contents
+
+- name: Read all CatalogSource manifests
+  ansible.builtin.slurp:
+    src: "{{ item.path }}"
+  loop: "{{ catalogsource_files.files }}"
+  register: catalogsource_contents
+
+- name: Set mirroring result facts for downstream roles
+  ansible.builtin.set_fact:
+    oc_mirror_idms_manifests: "{{ idms_contents.results | map(attribute='content') | map('b64decode') | list }}"
+    oc_mirror_catalogsource_manifests: "{{ catalogsource_contents.results | map(attribute='content') | map('b64decode') | list }}"
+
+- name: Write mirror version sentinel
+  ansible.builtin.copy:
+    content: "{{ openshift_version }}.{{ ocp_patch_version }}"
+    dest: "{{ oc_mirror_workspace }}/.mirror-version"
+    mode: '0644'
+
+- name: Display mirroring summary
+  ansible.builtin.debug:
+    msg:
+      - "oc-mirror complete"
+      - "Cluster resources: {{ oc_mirror_workspace }}/working-dir/cluster-resources"
+      - "IDMS manifests found: {{ idms_files.files | length }}"
+      - "CatalogSource manifests found: {{ catalogsource_files.files | length }}"

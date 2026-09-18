@@ -1,0 +1,342 @@
+---
+- name: Set AWS environment for all tasks
+  ansible.builtin.set_fact:
+    _aws_env:
+      AWS_ACCESS_KEY_ID: "{{ aws.aws_access_key_id }}"
+      AWS_SECRET_ACCESS_KEY: "{{ aws.aws_secret_access_key }}"
+      AWS_SESSION_TOKEN: ""
+
+# ==============================================================================
+# KEY PAIR
+# ==============================================================================
+- name: Check if EC2 key pair already exists
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-key-pairs
+    --key-names {{ jumphost_key_pair_name }}
+    --region {{ jumphost_aws_region }}
+    --query 'KeyPairs[0].KeyName'
+    --output text
+  environment: "{{ _aws_env }}"
+  register: keypair_check
+  changed_when: false
+  failed_when: false
+
+- name: Import SSH public key as EC2 key pair
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 import-key-pair
+    --key-name {{ jumphost_key_pair_name }}
+    --public-key-material fileb://{{ jumphost_ssh_private_key }}.pub
+    --region {{ jumphost_aws_region }}
+  environment: "{{ _aws_env }}"
+  when: keypair_check.rc != 0 or keypair_check.stdout == 'None'
+
+# ==============================================================================
+# VPC + SUBNET — discover since there may be no default VPC
+# ==============================================================================
+# ==============================================================================
+# VPC + SUBNET — discover existing or create a minimal jumphost VPC
+# ==============================================================================
+- name: Find existing VPC tagged for jumphost
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-vpcs
+    --filters Name=tag:Name,Values={{ jumphost_name }}-vpc
+    --query 'Vpcs[0].VpcId'
+    --output text
+    --region {{ jumphost_aws_region }}
+  environment: "{{ _aws_env }}"
+  register: tagged_vpc
+  changed_when: false
+
+- name: Set VPC ID from existing tagged VPC
+  ansible.builtin.set_fact:
+    _jumphost_vpc_id: "{{ tagged_vpc.stdout | trim }}"
+  when: tagged_vpc.stdout | trim not in ['None', '']
+
+- name: Find any other existing VPC (fallback)
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-vpcs
+    --filters Name=state,Values=available
+    --query 'Vpcs[0].VpcId'
+    --output text
+    --region {{ jumphost_aws_region }}
+  environment: "{{ _aws_env }}"
+  register: any_vpc
+  changed_when: false
+  when: _jumphost_vpc_id is not defined
+
+- name: Set VPC ID from existing VPC
+  ansible.builtin.set_fact:
+    _jumphost_vpc_id: "{{ any_vpc.stdout | trim }}"
+  when:
+    - _jumphost_vpc_id is not defined
+    - any_vpc.stdout | trim not in ['None', '']
+
+- name: Create VPC for jumphost (no existing VPC found)
+  when: _jumphost_vpc_id is not defined
+  block:
+    - name: Create VPC
+      ansible.builtin.command: >
+        {{ bin_dir }}/aws ec2 create-vpc
+        --cidr-block 10.0.0.0/16
+        --tag-specifications "ResourceType=vpc,Tags=[{Key=Name,Value={{ jumphost_name }}-vpc}]"
+        --query 'Vpc.VpcId'
+        --output text
+        --region {{ jumphost_aws_region }}
+      environment: "{{ _aws_env }}"
+      register: vpc_create
+      changed_when: true
+
+    - name: Enable DNS hostnames on new VPC
+      ansible.builtin.command: >
+        {{ bin_dir }}/aws ec2 modify-vpc-attribute
+        --vpc-id {{ vpc_create.stdout | trim }}
+        --enable-dns-hostnames
+        --region {{ jumphost_aws_region }}
+      environment: "{{ _aws_env }}"
+      changed_when: true
+
+    - name: Create internet gateway
+      ansible.builtin.command: >
+        {{ bin_dir }}/aws ec2 create-internet-gateway
+        --tag-specifications "ResourceType=internet-gateway,Tags=[{Key=Name,Value={{ jumphost_name }}-igw}]"
+        --query 'InternetGateway.InternetGatewayId'
+        --output text
+        --region {{ jumphost_aws_region }}
+      environment: "{{ _aws_env }}"
+      register: igw_create
+      changed_when: true
+
+    - name: Attach internet gateway to VPC
+      ansible.builtin.command: >
+        {{ bin_dir }}/aws ec2 attach-internet-gateway
+        --internet-gateway-id {{ igw_create.stdout | trim }}
+        --vpc-id {{ vpc_create.stdout | trim }}
+        --region {{ jumphost_aws_region }}
+      environment: "{{ _aws_env }}"
+      changed_when: true
+
+    - name: Create public subnet
+      ansible.builtin.command: >
+        {{ bin_dir }}/aws ec2 create-subnet
+        --vpc-id {{ vpc_create.stdout | trim }}
+        --cidr-block 10.0.0.0/24
+        --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value={{ jumphost_name }}-subnet}]"
+        --query 'Subnet.SubnetId'
+        --output text
+        --region {{ jumphost_aws_region }}
+      environment: "{{ _aws_env }}"
+      register: subnet_create
+      changed_when: true
+
+    - name: Create route table
+      ansible.builtin.command: >
+        {{ bin_dir }}/aws ec2 create-route-table
+        --vpc-id {{ vpc_create.stdout | trim }}
+        --tag-specifications "ResourceType=route-table,Tags=[{Key=Name,Value={{ jumphost_name }}-rt}]"
+        --query 'RouteTable.RouteTableId'
+        --output text
+        --region {{ jumphost_aws_region }}
+      environment: "{{ _aws_env }}"
+      register: rt_create
+      changed_when: true
+
+    - name: Add default route to internet gateway
+      ansible.builtin.command: >
+        {{ bin_dir }}/aws ec2 create-route
+        --route-table-id {{ rt_create.stdout | trim }}
+        --destination-cidr-block 0.0.0.0/0
+        --gateway-id {{ igw_create.stdout | trim }}
+        --region {{ jumphost_aws_region }}
+      environment: "{{ _aws_env }}"
+      changed_when: true
+
+    - name: Associate route table with subnet
+      ansible.builtin.command: >
+        {{ bin_dir }}/aws ec2 associate-route-table
+        --route-table-id {{ rt_create.stdout | trim }}
+        --subnet-id {{ subnet_create.stdout | trim }}
+        --region {{ jumphost_aws_region }}
+      environment: "{{ _aws_env }}"
+      changed_when: true
+
+    - name: Set VPC and subnet facts from newly created resources
+      ansible.builtin.set_fact:
+        _jumphost_vpc_id: "{{ vpc_create.stdout | trim }}"
+        _jumphost_subnet_id: "{{ subnet_create.stdout | trim }}"
+
+- name: Find subnet in existing VPC (when VPC was pre-existing)
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-subnets
+    --filters
+      Name=vpc-id,Values={{ _jumphost_vpc_id }}
+      Name=state,Values=available
+    --query 'sort_by(Subnets, &AvailableIpAddressCount)[-1].SubnetId'
+    --output text
+    --region {{ jumphost_aws_region }}
+  environment: "{{ _aws_env }}"
+  register: subnet_result
+  changed_when: false
+  when: _jumphost_subnet_id is not defined
+
+- name: Set subnet ID fact from existing VPC
+  ansible.builtin.set_fact:
+    _jumphost_subnet_id: "{{ subnet_result.stdout | trim }}"
+  when: _jumphost_subnet_id is not defined
+
+# ==============================================================================
+# SECURITY GROUP
+# ==============================================================================
+- name: Check if security group already exists
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-security-groups
+    --filters
+      Name=group-name,Values={{ jumphost_security_group }}
+      Name=vpc-id,Values={{ _jumphost_vpc_id }}
+    --query 'SecurityGroups[0].GroupId'
+    --output text
+    --region {{ jumphost_aws_region }}
+  environment: "{{ _aws_env }}"
+  register: sg_check
+  changed_when: false
+
+- name: Create security group for jumphost
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 create-security-group
+    --group-name {{ jumphost_security_group }}
+    --description "Disconnected install jumphost - SSH and mirror registry"
+    --vpc-id {{ _jumphost_vpc_id }}
+    --region {{ jumphost_aws_region }}
+    --query 'GroupId'
+    --output text
+  environment: "{{ _aws_env }}"
+  register: sg_create
+  when: sg_check.stdout == 'None' or sg_check.stdout == ''
+  changed_when: true
+
+- name: Set security group ID fact
+  ansible.builtin.set_fact:
+    _jumphost_sg_id: "{{ sg_create.stdout if sg_create.changed else sg_check.stdout }}"
+
+- name: Add SSH inbound rule to security group
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 authorize-security-group-ingress
+    --group-id {{ _jumphost_sg_id }}
+    --protocol tcp
+    --port 22
+    --cidr 0.0.0.0/0
+    --region {{ jumphost_aws_region }}
+  environment: "{{ _aws_env }}"
+  register: ssh_rule
+  failed_when:
+    - ssh_rule.rc != 0
+    - "'InvalidPermission.Duplicate' not in ssh_rule.stderr"
+  changed_when: ssh_rule.rc == 0
+
+- name: Add mirror registry inbound rule to security group
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 authorize-security-group-ingress
+    --group-id {{ _jumphost_sg_id }}
+    --protocol tcp
+    --port {{ jumphost_mirror_registry_port }}
+    --cidr 0.0.0.0/0
+    --region {{ jumphost_aws_region }}
+  environment: "{{ _aws_env }}"
+  register: registry_rule
+  failed_when:
+    - registry_rule.rc != 0
+    - "'InvalidPermission.Duplicate' not in registry_rule.stderr"
+  changed_when: registry_rule.rc == 0
+
+# ==============================================================================
+# AMI — Latest RHEL 9
+# ==============================================================================
+- name: Find latest RHEL 9 AMI
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-images
+    --owners 309956199498
+    --filters
+      Name=name,Values=RHEL-9.*_HVM-*-x86_64-*-Hourly2-GP3
+      Name=state,Values=available
+    --query 'sort_by(Images, &CreationDate)[-1].ImageId'
+    --output text
+    --region {{ jumphost_aws_region }}
+  environment: "{{ _aws_env }}"
+  register: rhel9_ami
+  changed_when: false
+
+# ==============================================================================
+# EC2 INSTANCE
+# ==============================================================================
+- name: Check if jumphost instance already exists
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-instances
+    --filters
+      Name=tag:Name,Values={{ jumphost_name }}
+      Name=instance-state-name,Values=running,stopped,pending
+    --query 'Reservations[0].Instances[0].InstanceId'
+    --output text
+    --region {{ jumphost_aws_region }}
+  environment: "{{ _aws_env }}"
+  register: instance_check
+  changed_when: false
+
+- name: Launch jumphost EC2 instance
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 run-instances
+    --image-id {{ rhel9_ami.stdout }}
+    --instance-type {{ jumphost_instance_type }}
+    --key-name {{ jumphost_key_pair_name }}
+    --security-group-ids {{ _jumphost_sg_id }}
+    --subnet-id {{ _jumphost_subnet_id }}
+    --associate-public-ip-address
+    --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":{{ jumphost_volume_size_gb }},\"VolumeType\":\"gp3\"}}]"
+    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value={{ jumphost_name }}}]"
+    --query 'Instances[0].InstanceId'
+    --output text
+    --region {{ jumphost_aws_region }}
+  environment: "{{ _aws_env }}"
+  register: instance_launch
+  when: instance_check.stdout == 'None' or instance_check.stdout == ''
+  changed_when: true
+
+- name: Set instance ID fact
+  ansible.builtin.set_fact:
+    _jumphost_instance_id: "{{ instance_launch.stdout if instance_launch.changed else instance_check.stdout }}"
+
+- name: Wait for instance to reach running state
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-instances
+    --instance-ids {{ _jumphost_instance_id }}
+    --query 'Reservations[0].Instances[0].State.Name'
+    --output text
+    --region {{ jumphost_aws_region }}
+  environment: "{{ _aws_env }}"
+  register: instance_state
+  until: instance_state.stdout == 'running'
+  retries: 30
+  delay: 10
+  changed_when: false
+
+- name: Get jumphost public IP address
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-instances
+    --instance-ids {{ _jumphost_instance_id }}
+    --query 'Reservations[0].Instances[0].PublicIpAddress'
+    --output text
+    --region {{ jumphost_aws_region }}
+  environment: "{{ _aws_env }}"
+  register: jumphost_ip_result
+  changed_when: false
+
+- name: Set jumphost public IP fact
+  ansible.builtin.set_fact:
+    jumphost_public_ip: "{{ jumphost_ip_result.stdout }}"
+    jumphost_public_dns: "ec2-{{ jumphost_ip_result.stdout | replace('.', '-') }}.{{ jumphost_aws_region }}.compute.amazonaws.com"
+
+- name: Wait for SSH to become available
+  ansible.builtin.wait_for:
+    host: "{{ jumphost_public_ip }}"
+    port: 22
+    timeout: 300
+    delay: 15
+    state: started

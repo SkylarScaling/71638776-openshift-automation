@@ -1,0 +1,50 @@
+---
+- name: Check if mirror-registry is already installed
+  ansible.builtin.stat:
+    path: "{{ bin_dir }}/mirror-registry"
+  register: mirror_registry_stat
+
+- name: Create temporary directory for mirror-registry download
+  ansible.builtin.tempfile:
+    state: directory
+    suffix: mirror-registry
+  register: mirror_registry_temp_dir
+  when: force_update | bool or not mirror_registry_stat.stat.exists
+
+- name: Download mirror-registry installer
+  ansible.builtin.get_url:
+    url: "{{ mirror_registry_installer_url }}"
+    dest: "{{ mirror_registry_temp_dir.path }}/mirror-registry.tar.gz"
+    mode: '0644'
+  when: force_update | bool or not mirror_registry_stat.stat.exists
+
+- name: Extract mirror-registry installer
+  ansible.builtin.unarchive:
+    src: "{{ mirror_registry_temp_dir.path }}/mirror-registry.tar.gz"
+    dest: "{{ mirror_registry_temp_dir.path }}"
+    remote_src: yes
+  when: force_update | bool or not mirror_registry_stat.stat.exists
+
+- name: Copy all mirror-registry bundle files to bin_dir (flattening any subdirectories)
+  ansible.builtin.shell: |
+    find {{ mirror_registry_temp_dir.path }} -type f | while read f; do
+      cp "$f" {{ bin_dir }}/
+    done
+    chmod 0755 {{ bin_dir }}/mirror-registry
+  when: force_update | bool or not mirror_registry_stat.stat.exists
+  changed_when: true
+
+- name: Show what was installed to bin_dir from mirror-registry bundle
+  ansible.builtin.shell: ls -lh {{ bin_dir }}/ | grep -E 'mirror-registry|\.tar$'
+  changed_when: false
+  register: mirror_registry_files_installed
+
+- name: Display installed mirror-registry files
+  ansible.builtin.debug:
+    msg: "{{ mirror_registry_files_installed.stdout_lines }}"
+
+- name: Clean up temporary download directory
+  ansible.builtin.file:
+    path: "{{ mirror_registry_temp_dir.path }}"
+    state: absent
+  when: mirror_registry_temp_dir.path is defined

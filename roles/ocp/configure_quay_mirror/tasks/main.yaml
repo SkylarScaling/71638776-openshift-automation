@@ -1,0 +1,278 @@
+---
+# ==============================================================================
+# CONFIGURE QUAY AS MIRROR REGISTRY
+#
+# Waits for Quay to be healthy, then uses oc exec into the Quay app pod to
+# configure everything via Quay's Python model layer: admin user, mirror org,
+# robot account. Outputs the robot token for oc-mirror to use.
+#
+# All configuration bypasses the HTTP API (which requires CSRF/OAuth) by
+# calling Quay's internal model functions directly in the container.
+# ==============================================================================
+
+- name: Wait for QuayRegistry to be Available
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get quayregistry {{ quay_mirror_registry_name }}
+    -n {{ quay_mirror_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}' 2>/dev/null || true
+  register: _quay_conditions
+  changed_when: false
+  until: "'Available=True' in _quay_conditions.stdout"
+  retries: 60
+  delay: 30
+
+- name: Get Quay Route hostname
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get route
+    -n {{ quay_mirror_namespace }}
+    -l "quay-component=quay-app-route,quay-operator/quayregistry={{ quay_mirror_registry_name }}"
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.items[0].spec.host}' 2>/dev/null || true
+  register: _quay_route_raw
+  changed_when: false
+  retries: 10
+  delay: 10
+  until: _quay_route_raw.stdout != ""
+
+- name: Set Quay registry URL facts
+  ansible.builtin.set_fact:
+    quay_registry_url: "{{ _quay_route_raw.stdout | trim }}"
+    quay_mirror_push_url: "{{ _quay_route_raw.stdout | trim }}/{{ quay_mirror_org }}"
+
+- name: Get Quay config bundle secret name
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get quayregistry {{ quay_mirror_registry_name }}
+    -n {{ quay_mirror_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.spec.configBundleSecret}' 2>/dev/null || true
+  register: _quay_config_secret_name
+  changed_when: false
+
+- name: Enable mirror-required Quay config settings
+  ansible.builtin.shell: |
+    set -e
+    SECRET="{{ _quay_config_secret_name.stdout | trim }}"
+    if [ -z "$SECRET" ]; then
+      echo "skip: no configBundleSecret found"
+      exit 0
+    fi
+    CURRENT=$({{ bin_dir }}/oc get secret "$SECRET" \
+      -n {{ quay_mirror_namespace }} \
+      --kubeconfig {{ target_kubeconfig }} \
+      -o jsonpath='{.data.config\.yaml}' | base64 -d)
+    UPDATED="$CURRENT"
+    NEEDS_PATCH=false
+    for SETTING in CREATE_PRIVATE_REPO_ON_PUSH FEATURE_EXTENDED_REPOSITORY_NAMES; do
+      if ! echo "$UPDATED" | grep -q "${SETTING}: true"; then
+        UPDATED=$(echo "$UPDATED"; echo "${SETTING}: true")
+        NEEDS_PATCH=true
+      fi
+    done
+    if [ "$NEEDS_PATCH" = "false" ]; then
+      echo "skip: all settings already enabled"
+      exit 0
+    fi
+    {{ bin_dir }}/oc patch secret "$SECRET" \
+      -n {{ quay_mirror_namespace }} \
+      --kubeconfig {{ target_kubeconfig }} \
+      --type=merge \
+      -p "{\"data\":{\"config.yaml\":\"$(echo -n "$UPDATED" | base64 -w 0)\"}}"
+    echo "changed: enabled mirror config settings"
+  args:
+    executable: /bin/bash
+  register: _quay_config_patch
+  changed_when: "'changed:' in _quay_config_patch.stdout"
+
+- name: Wait for Quay Operator to apply new config to running pods
+  ansible.builtin.shell: |
+    POD=$({{ bin_dir }}/oc get pod -n {{ quay_mirror_namespace }} \
+      --kubeconfig {{ target_kubeconfig }} \
+      -l quay-component=quay-app \
+      --field-selector=status.phase=Running \
+      --no-headers -o custom-columns=NAME:.metadata.name | head -1)
+    if [ -z "$POD" ]; then
+      echo "no-running-pod"
+      exit 0
+    fi
+    cat << 'PYEOF' | {{ bin_dir }}/oc exec -i -n {{ quay_mirror_namespace }} \
+      --kubeconfig {{ target_kubeconfig }} "$POD" -- python3 -
+    import sys, os
+    sys.path.insert(0, '/quay-registry')
+    os.chdir('/quay-registry')
+    from app import app
+    with app.app_context():
+        if app.config.get('FEATURE_EXTENDED_REPOSITORY_NAMES', False):
+            print('confirmed')
+        else:
+            print('missing')
+    PYEOF
+  args:
+    executable: /bin/bash
+  register: _quay_feature_verify
+  until: "'confirmed' in _quay_feature_verify.stdout"
+  retries: 24
+  delay: 15
+  when: _quay_config_patch is changed
+  changed_when: false
+
+- name: Get Quay app pod name
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get pod -n {{ quay_mirror_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+    -l quay-component=quay-app
+    --no-headers -o custom-columns=NAME:.metadata.name | head -1
+  register: _quay_app_pod
+  changed_when: false
+
+- name: Configure Quay admin user, mirror org, and robot account via Python model
+  ansible.builtin.shell: |
+    cat << 'PYEOF' | {{ bin_dir }}/oc exec -i -n {{ quay_mirror_namespace }} \
+      --kubeconfig {{ target_kubeconfig }} \
+      {{ _quay_app_pod.stdout | trim }} \
+      -- python3 -
+    import sys, os
+    sys.path.insert(0, '/quay-registry')
+    os.chdir('/quay-registry')
+    from app import app
+    from data.model import user as user_model, organization as org_model, team as team_model
+    from data.database import User
+
+    with app.app_context():
+        # ---- Admin user ----
+        admin = None
+        try:
+            admin = user_model.get_user('{{ quay_mirror_admin_user }}')
+        except Exception:
+            pass
+
+        if admin is None:
+            admin = user_model.create_user(
+                '{{ quay_mirror_admin_user }}',
+                '{{ quay_mirror_admin_password }}',
+                '{{ quay_mirror_admin_user }}@local.invalid'
+            )
+            User.update(verified=True).where(
+                User.username == '{{ quay_mirror_admin_user }}'
+            ).execute()
+        else:
+            user_model.change_password(admin, '{{ quay_mirror_admin_password }}')
+            User.update(verified=True).where(
+                User.username == '{{ quay_mirror_admin_user }}'
+            ).execute()
+        admin = user_model.get_user('{{ quay_mirror_admin_user }}')
+
+        # ---- Mirror organization ----
+        org = None
+        try:
+            org = org_model.get_organization('{{ quay_mirror_org }}')
+        except Exception:
+            pass
+        if org is None:
+            org = org_model.create_organization(
+                '{{ quay_mirror_org }}',
+                '{{ quay_mirror_org }}@local.invalid',
+                admin
+            )
+
+        # ---- Robot account ----
+        robot_token = None
+        try:
+            robot, robot_token = user_model.create_robot(
+                '{{ quay_mirror_robot_account }}', org
+            )
+        except Exception as e:
+            if 'exist' in str(e).lower() or 'unique' in str(e).lower() or 'InvalidRobot' in type(e).__name__:
+                # Robot already exists — retrieve its token directly from the DB
+                from data.database import User, RobotAccountToken
+                robot_fullname = '{{ quay_mirror_org }}+{{ quay_mirror_robot_account }}'
+                robot = User.get(User.username == robot_fullname)
+                token_record = RobotAccountToken.get(RobotAccountToken.robot_account == robot)
+                raw = token_record.token
+                robot_token = raw.decrypt() if hasattr(raw, 'decrypt') else str(raw)
+            else:
+                print('ERROR creating robot: ' + str(e), file=sys.stderr)
+                sys.exit(1)
+
+        # ---- Grant robot owners access ----
+        try:
+            owners = team_model.get_organization_team('{{ quay_mirror_org }}', 'owners')
+            team_model.add_user_to_team(robot, owners)
+        except Exception:
+            pass  # Already a member
+
+        print('ROBOT_TOKEN=' + robot_token)
+    PYEOF
+  args:
+    executable: /bin/bash
+  register: _quay_setup
+  changed_when: true
+  no_log: true
+
+- name: Parse robot account credentials from Quay setup output
+  ansible.builtin.set_fact:
+    quay_robot_username: "{{ quay_mirror_org }}+{{ quay_mirror_robot_account }}"
+    quay_robot_token: >-
+      {{
+        _quay_setup.stdout_lines
+        | select('match', '^ROBOT_TOKEN=')
+        | first
+        | replace('ROBOT_TOKEN=', '')
+      }}
+  no_log: true
+
+- name: Check if Quay robot credentials already exist in global pull secret
+  ansible.builtin.shell: |
+    set -e
+    CURRENT=$({{ bin_dir }}/oc get secret pull-secret \
+      -n openshift-config \
+      --kubeconfig {{ target_kubeconfig }} \
+      -o jsonpath='{.data.\.dockerconfigjson}' | base64 -d)
+    EXISTING_AUTH=$(echo "$CURRENT" | jq -r '.auths["{{ quay_registry_url }}"].auth // ""')
+    if [ "$EXISTING_AUTH" = "{{ (quay_robot_username ~ ':' ~ quay_robot_token) | b64encode }}" ]; then
+      echo "present"
+    else
+      echo "missing"
+    fi
+  args:
+    executable: /bin/bash
+  register: _quay_pull_secret_check
+  changed_when: false
+  no_log: true
+
+- name: Merge Quay robot credentials into cluster global pull secret
+  ansible.builtin.shell: |
+    set -e
+    MERGED=$({{ bin_dir }}/oc get secret pull-secret \
+      -n openshift-config \
+      --kubeconfig {{ target_kubeconfig }} \
+      -o jsonpath='{.data.\.dockerconfigjson}' \
+      | base64 -d \
+      | jq -c \
+          --arg host "{{ quay_registry_url }}" \
+          --arg auth "{{ (quay_robot_username ~ ':' ~ quay_robot_token) | b64encode }}" \
+          '.auths[$host] = {"auth": $auth, "email": ""}')
+
+    {{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f - <<EOF
+    apiVersion: v1
+    kind: Secret
+    metadata:
+      name: pull-secret
+      namespace: openshift-config
+    type: kubernetes.io/dockerconfigjson
+    data:
+      .dockerconfigjson: "$(echo -n "$MERGED" | base64 -w 0)"
+    EOF
+  args:
+    executable: /bin/bash
+  changed_when: true
+  no_log: true
+  when: _quay_pull_secret_check.stdout | trim == "missing"
+
+- name: Display Quay mirror configuration summary
+  ansible.builtin.debug:
+    msg:
+      - "Quay mirror registry configured"
+      - "Registry URL:  {{ quay_registry_url }}"
+      - "Push target:   {{ quay_mirror_push_url }}"
+      - "Robot account: {{ quay_robot_username }}"

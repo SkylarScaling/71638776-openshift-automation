@@ -1,6 +1,6 @@
 ---
 - name: Create the OpenShift GitOps Application for Global Hub
-  kubernetes.core.k8s:
-    kubeconfig: "{{ target_kubeconfig }}"
-    state: present
-    template: global-hub-argocd-app.yaml.j2
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: "{{ lookup('template', 'global-hub-argocd-app.yaml.j2') }}"
+  changed_when: true

@@ -6,22 +6,23 @@
 
 # Create ManagedCluster first so ACM doesn't garbage collect the namespace
 - name: Create ManagedCluster object on Hub
-  kubernetes.core.k8s:
-    kubeconfig: "{{ hub_kubeconfig }}"
-    state: present
-    template: "01-managed-cluster.yaml.j2"
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ hub_kubeconfig }} -f -"
+    stdin: "{{ lookup('template', '01-managed-cluster.yaml.j2') }}"
+  changed_when: true
 
 - name: Create Spoke Cluster Namespace on Hub
-  kubernetes.core.k8s:
-    kubeconfig: "{{ hub_kubeconfig }}"
-    state: present
-    template: "02-namespace.yaml.j2"
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ hub_kubeconfig }} -f -"
+    stdin: "{{ lookup('template', '02-namespace.yaml.j2') }}"
+  changed_when: true
 
 - name: Create auto-import-secret on Hub
-  kubernetes.core.k8s:
-    kubeconfig: "{{ hub_kubeconfig }}"
-    state: present
-    template: "03-auto-import-secret.yaml.j2"
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ hub_kubeconfig }} -f -"
+    stdin: "{{ lookup('template', '03-auto-import-secret.yaml.j2') }}"
+  changed_when: true
+  no_log: true
 
 - name: Wait for Spoke Cluster to join the Hub
   ansible.builtin.shell: >

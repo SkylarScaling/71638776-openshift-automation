@@ -1,0 +1,222 @@
+---
+- name: Check if mirror registry is already running
+  ansible.builtin.uri:
+    url: "https://{{ mirror_registry_hostname }}:{{ mirror_registry_port }}/health/instance"
+    validate_certs: false
+    status_code: [200, 301]
+    timeout: 30
+  register: registry_health
+  failed_when: false
+  changed_when: false
+
+- name: Skip mirror registry setup if already running
+  ansible.builtin.debug:
+    msg: "Mirror registry is already running at {{ mirror_registry_hostname }}:{{ mirror_registry_port }}, skipping setup."
+  when: registry_health.status | default(0) in [200, 301]
+
+# If the registry is not responding but a previous installation exists on disk,
+# the EC2 instance was likely stopped and restarted (Podman containers don't
+# auto-start). Attempt mirror-registry start before falling through to a fresh
+# install — mirror-registry install hangs when it finds an existing installation.
+- name: Check if mirror registry was previously installed (quay-config directory present)
+  ansible.builtin.stat:
+    path: "{{ mirror_registry_dir }}/quay-config/config.yaml"
+  register: _quay_config_stat
+  when: registry_health.status | default(0) not in [200, 301]
+
+- name: Start existing mirror registry installation (stopped after host restart)
+  ansible.builtin.command: >
+    {{ bin_dir }}/mirror-registry start
+    --quayHostname {{ mirror_registry_hostname }}
+    --quayRoot {{ mirror_registry_dir }}
+  register: _registry_start
+  changed_when: true
+  when:
+    - registry_health.status | default(0) not in [200, 301]
+    - _quay_config_stat.stat is defined and _quay_config_stat.stat.exists
+
+# After mirror-registry start the Quay containers can take several minutes to
+# become ready. Poll with a per-attempt timeout so we don't block indefinitely
+# on slow public-hostname TCP connections. 40 retries × 15s = 10 minutes max.
+- name: Wait for started mirror registry to be healthy
+  ansible.builtin.uri:
+    url: "https://{{ mirror_registry_hostname }}:{{ mirror_registry_port }}/health/instance"
+    validate_certs: false
+    status_code: [200, 301]
+    timeout: 30
+  register: _registry_post_start_health
+  until: _registry_post_start_health.status | default(0) in [200, 301]
+  retries: 40
+  delay: 15
+  when:
+    - _quay_config_stat.stat is defined and _quay_config_stat.stat.exists
+
+# Use the post-start result to gate the install block. Setting registry_health
+# here prevents the install block from running when the registry was started
+# rather than freshly installed.
+- name: Mark registry as running after successful start
+  ansible.builtin.set_fact:
+    registry_health: "{{ _registry_post_start_health }}"
+  when:
+    - _quay_config_stat.stat is defined and _quay_config_stat.stat.exists
+    - _registry_post_start_health.status | default(0) in [200, 301]
+
+- name: Fail if existing mirror registry could not be started
+  ansible.builtin.fail:
+    msg: >-
+      mirror-registry start was attempted but the registry did not become healthy
+      within 10 minutes. Check Podman container logs:
+        podman logs quay-app
+        podman logs quay-redis
+  when:
+    - _quay_config_stat.stat is defined and _quay_config_stat.stat.exists
+    - _registry_post_start_health.status | default(0) not in [200, 301]
+
+- name: Install and configure mirror registry
+  block:
+    - name: Create mirror registry data directory
+      ansible.builtin.file:
+        state: directory
+        path: "{{ mirror_registry_dir }}"
+        mode: '0755'
+
+    - name: Run mirror-registry installer
+      ansible.builtin.command: >
+        {{ bin_dir }}/mirror-registry install
+        --quayHostname {{ mirror_registry_hostname }}
+        --quayRoot {{ mirror_registry_dir }}
+        --initUser {{ mirror_registry_init_user }}
+        --initPassword {{ mirror_registry_init_password }}
+      register: mirror_registry_install
+      changed_when: "'has been installed' in mirror_registry_install.stdout"
+
+    - name: Display mirror registry install output
+      ansible.builtin.debug:
+        msg: "{{ mirror_registry_install.stdout_lines[-5:] }}"
+
+    # mirror-registry has no --quayConfig install flag; patch config.yaml directly.
+    # PUSH_TEMP_TAG_EXPIRATION_SEC (default 300s) controls how long an in-progress
+    # blob upload session is kept alive — raise it so large OCP release blobs in
+    # mirrorToMirror mode don't time out mid-transfer.
+    - name: Extend Quay upload session timeout in generated config
+      ansible.builtin.lineinfile:
+        path: "{{ mirror_registry_dir }}/quay-config/config.yaml"
+        regexp: "^PUSH_TEMP_TAG_EXPIRATION_SEC:"
+        line: "PUSH_TEMP_TAG_EXPIRATION_SEC: {{ mirror_registry_push_timeout }}"
+        insertafter: EOF
+      become: true
+
+    - name: Find Quay app container name
+      ansible.builtin.shell: |
+        podman ps --format json | python3 -c "
+        import sys, json
+        for c in json.load(sys.stdin):
+            name = (c.get('Names') or [''])[0]
+            nl = name.lower()
+            if 'quay' in nl and 'postgres' not in nl and 'redis' not in nl:
+                print(name)
+                break
+        "
+      register: _quay_container_name
+      changed_when: false
+      failed_when: _quay_container_name.stdout | trim == ""
+
+    - name: Restart Quay container to apply config change
+      ansible.builtin.command: "podman restart {{ _quay_container_name.stdout | trim }}"
+      changed_when: true
+
+    - name: Wait for registry to be healthy after restart
+      ansible.builtin.uri:
+        url: "https://{{ mirror_registry_hostname }}:{{ mirror_registry_port }}/health/instance"
+        validate_certs: false
+        status_code: [200, 301]
+      register: _registry_restart_health
+      until: _registry_restart_health.status in [200, 301]
+      retries: 20
+      delay: 10
+      failed_when: false
+  when: registry_health.status is not defined or registry_health.status not in [200, 301]
+
+- name: Set mirror registry CA cert path
+  ansible.builtin.set_fact:
+    mirror_registry_ca_cert_path: "{{ mirror_registry_dir }}/quay-rootCA/rootCA.pem"
+
+- name: Read mirror registry CA certificate
+  ansible.builtin.slurp:
+    src: "{{ mirror_registry_ca_cert_path }}"
+  register: mirror_registry_ca_raw
+
+- name: Set mirror registry facts for downstream roles
+  ansible.builtin.set_fact:
+    mirror_registry_url: "{{ mirror_registry_hostname }}:{{ mirror_registry_port }}"
+    mirror_registry_ca_bundle: "{{ mirror_registry_ca_raw.content | b64decode }}"
+
+- name: Trust the mirror registry CA on the jumphost
+  ansible.builtin.copy:
+    content: "{{ mirror_registry_ca_bundle }}"
+    dest: "/etc/pki/ca-trust/source/anchors/mirror-registry-ca.pem"
+    mode: '0644'
+  become: true
+
+- name: Update CA trust store
+  ansible.builtin.command: update-ca-trust
+  become: true
+  changed_when: true
+
+# RHEL 9 runs firewalld by default. mirror-registry configures Podman to
+# listen on the registry port, but does not open the OS-level firewall.
+# Without this rule, the AWS security group allows external traffic in but
+# firewalld drops it before Podman sees it — cluster nodes get i/o timeout
+# when pulling images even though the registry is running and the EC2 SG is open.
+- name: Check if firewalld is installed
+  ansible.builtin.command: which firewall-cmd
+  register: _fw_available
+  changed_when: false
+  failed_when: false
+
+- name: Open mirror registry port in firewalld
+  ansible.builtin.command: >
+    firewall-cmd --add-port={{ mirror_registry_port }}/tcp --permanent
+  become: true
+  register: _fw_rule
+  changed_when: "'already' not in _fw_rule.stdout"
+  failed_when: _fw_rule.rc != 0 and 'NOT_RUNNING' not in _fw_rule.stderr
+  when: _fw_available.rc == 0
+
+- name: Reload firewalld to apply rule
+  ansible.builtin.command: firewall-cmd --reload
+  become: true
+  when: _fw_available.rc == 0 and _fw_rule is changed
+  changed_when: true
+  failed_when: false
+
+- name: Build base64 auth token for mirror registry
+  ansible.builtin.set_fact:
+    mirror_registry_auth: "{{ (mirror_registry_init_user ~ ':' ~ mirror_registry_init_password) | b64encode }}"
+
+- name: Build merged pull secret with mirror registry credentials
+  ansible.builtin.set_fact:
+    disconnected_pull_secret: >-
+      {{
+        pull_secret | combine({
+          'auths': pull_secret.auths | combine({
+            mirror_registry_url: {
+              'auth': mirror_registry_auth,
+              'email': ''
+            }
+          })
+        })
+      }}
+
+- name: Write merged pull secret for oc-mirror authentication
+  ansible.builtin.copy:
+    content: "{{ disconnected_pull_secret | to_nice_json }}"
+    dest: "{{ mirror_registry_dir }}/pull-secret-merged.json"
+    mode: '0600'
+
+- name: Display mirror registry connection info
+  ansible.builtin.debug:
+    msg:
+      - "Mirror registry URL:    {{ mirror_registry_url }}"
+      - "CA certificate:         {{ mirror_registry_ca_cert_path }}"
+      - "Merged pull secret:     {{ mirror_registry_dir }}/pull-secret-merged.json"

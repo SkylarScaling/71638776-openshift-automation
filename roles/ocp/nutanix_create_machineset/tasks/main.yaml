@@ -17,38 +17,44 @@
   when: pool_replicas | int == 0
 
 - name: Get Cluster Infrastructure Name (Cluster ID)
-  kubernetes.core.k8s_info:
-    kubeconfig: "{{ target_kubeconfig }}"
-    api_version: config.openshift.io/v1
-    kind: Infrastructure
-    name: cluster
-  register: infra_info
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get infrastructure cluster
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.infrastructureName}'
+  register: _infra_name
+  changed_when: false
 
 - name: Set cluster_id fact
   ansible.builtin.set_fact:
-    cluster_id: "{{ infra_info.resources[0].status.infrastructureName }}"
+    cluster_id: "{{ _infra_name.stdout }}"
 
-- name: Get all MachineSets in the machine-api namespace
-  kubernetes.core.k8s_info:
-    kubeconfig: "{{ target_kubeconfig }}"
-    api_version: machine.openshift.io/v1beta1
-    kind: MachineSet
-    namespace: openshift-machine-api
-  register: all_machinesets
-
-- name: Extract the first worker MachineSet
-  ansible.builtin.set_fact:
-    worker_machineset: "{{ all_machinesets.resources | selectattr('metadata.name', 'search', '-worker-') | first | default(None) }}"
+- name: Get first worker MachineSet name
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get machineset.machine.openshift.io -n openshift-machine-api
+    --kubeconfig {{ target_kubeconfig }}
+    --no-headers -o custom-columns=NAME:.metadata.name
+    | grep '\-worker\-' | head -1
+  register: _worker_ms_name
+  changed_when: false
 
 - name: Verify a worker MachineSet was found
   ansible.builtin.assert:
     that:
-      - worker_machineset is not none
+      - _worker_ms_name.stdout != ""
     fail_msg: "Could not find any MachineSets with '-worker-' in the name. Please verify the cluster has provisioned worker nodes and your KUBECONFIG is correct."
 
-- name: Set image_name from the found worker MachineSet
+- name: Get Nutanix image name from worker MachineSet
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get machineset.machine.openshift.io {{ _worker_ms_name.stdout | trim }}
+    -n openshift-machine-api
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.spec.template.spec.providerSpec.value.image.name}'
+  register: _image_name_raw
+  changed_when: false
+
+- name: Set nutanix_image_name fact
   ansible.builtin.set_fact:
-    nutanix_image_name: "{{ worker_machineset.spec.template.spec.providerSpec.value.image.name }}"
+    nutanix_image_name: "{{ _image_name_raw.stdout }}"
 
 - name: Set MachineSet name
   ansible.builtin.set_fact:
@@ -62,10 +68,10 @@
       - "Building Pool: {{ pool_name }} ({{ pool_replicas }} replicas)"
 
 - name: Apply the generated MachineSet YAML to OpenShift cluster
-  kubernetes.core.k8s:
-    kubeconfig: "{{ target_kubeconfig }}"
-    state: present
-    definition: "{{ lookup('template', 'machineset.yaml.j2') | from_yaml }}"
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: "{{ lookup('template', 'machineset.yaml.j2') }}"
+  changed_when: true
 
 - name: Display MachineSet application status
   ansible.builtin.debug:

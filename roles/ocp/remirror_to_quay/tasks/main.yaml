@@ -1,0 +1,392 @@
+---
+# ==============================================================================
+# REMIRROR OCP CONTENT TO QUAY
+#
+# Uses oc-mirror v2 with a fresh workspace to push all mirrored content
+# (OCP release, operators, additional images) to the Quay instance on the
+# hub cluster. A fresh workspace is required — reusing the jumphost workspace
+# causes oc-mirror to treat content as already-synced and skip the push.
+#
+# After the mirror, IDMS and CatalogSource manifests are read from the new
+# workspace's cluster-resources output. No string substitution is needed —
+# oc-mirror generates manifests referencing the Quay destination directly.
+#
+# Prerequisites: configure_quay_mirror must have run first (sets quay_registry_url,
+# quay_mirror_org, quay_robot_username, quay_robot_token).
+# ==============================================================================
+
+- name: Extract cluster ingress CA certificate
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get configmap default-ingress-cert
+    -n openshift-config-managed
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.data.ca-bundle\.crt}'
+  register: _ingress_ca_raw
+  changed_when: false
+
+- name: Trust cluster ingress CA on jumphost
+  ansible.builtin.copy:
+    content: "{{ _ingress_ca_raw.stdout }}"
+    dest: "/etc/pki/ca-trust/source/anchors/ocp-ingress-ca.pem"
+    mode: '0644'
+  become: true
+  register: _ingress_ca_installed
+
+- name: Update CA trust store for ingress CA
+  ansible.builtin.command: update-ca-trust
+  become: true
+  changed_when: true
+  when: _ingress_ca_installed is changed
+
+- name: Verify Quay registry is reachable from this host
+  ansible.builtin.uri:
+    url: "https://{{ quay_registry_url }}/health/instance"
+    validate_certs: false
+    status_code: [200, 301]
+  register: _quay_health
+  until: _quay_health.status | default(0) in [200, 301]
+  retries: 20
+  delay: 15
+  failed_when: _quay_health.status | default(0) not in [200, 301]
+
+- name: Check for existing Quay oc-mirror results
+  block:
+    - name: Check for existing Quay IDMS results
+      ansible.builtin.find:
+        paths: "{{ quay_mirror_workspace }}/working-dir/cluster-resources"
+        patterns:
+          - "idms-*.yaml"
+          - "imageDigestMirrorSet*.yaml"
+        file_type: file
+      register: _quay_existing_idms
+      failed_when: false
+
+    - name: Check for existing Quay CatalogSource results
+      ansible.builtin.find:
+        paths: "{{ quay_mirror_workspace }}/working-dir/cluster-resources"
+        patterns: "cs-*.yaml"
+        file_type: file
+      register: _quay_existing_cs
+      failed_when: false
+
+    - name: Read Quay mirror version sentinel if present
+      ansible.builtin.slurp:
+        src: "{{ quay_mirror_workspace }}/.mirror-version"
+      register: _quay_mirror_version
+      failed_when: false
+
+    - name: Check existing Quay CatalogSource files reference the Quay registry
+      ansible.builtin.shell: |
+        python3 -c "
+        import glob, sys
+        try:
+            import yaml
+        except ImportError:
+            import subprocess, sys
+            subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'pyyaml', '-q'])
+            import yaml
+        cs_dir = '{{ quay_mirror_workspace }}/working-dir/cluster-resources'
+        quay = '{{ quay_registry_url }}'
+        valid = False
+        for f in glob.glob(cs_dir + '/cs-*.yaml'):
+            for doc in yaml.safe_load_all(open(f)):
+                if doc and doc.get('kind') == 'CatalogSource':
+                    img = doc.get('spec', {}).get('image', '')
+                    if img and quay in img:
+                        valid = True
+        print('valid' if valid else 'invalid')
+        "
+      register: _quay_cs_image_valid
+      changed_when: false
+      failed_when: false
+
+- name: Set Quay oc-mirror completion flag
+  ansible.builtin.set_fact:
+    _quay_mirror_complete: >-
+      {{ _quay_existing_idms.files | default([]) | length > 0
+         and _quay_existing_cs.files | default([]) | length > 0
+         and (_quay_mirror_version.content | default('') | b64decode | trim)
+             == (openshift_version ~ '.' ~ ocp_patch_version)
+         and _quay_cs_image_valid.stdout | default('invalid') == 'valid' }}
+
+- name: Clean stale Quay oc-mirror workspace for fresh re-run
+  ansible.builtin.file:
+    state: absent
+    path: "{{ quay_mirror_workspace }}/working-dir"
+  when: not _quay_mirror_complete
+
+- name: Prepare Quay oc-mirror workspace
+  block:
+    - name: Create Quay oc-mirror workspace directory
+      ansible.builtin.file:
+        state: directory
+        path: "{{ quay_mirror_workspace }}"
+        mode: '0755'
+
+    - name: Copy ImageSetConfiguration from initial mirror run
+      ansible.builtin.copy:
+        src: "{{ initial_mirror_workspace }}/imageset-config.yaml"
+        dest: "{{ quay_mirror_workspace }}/imageset-config.yaml"
+        mode: '0644'
+
+    - name: Create auth directory for Quay oc-mirror credentials
+      ansible.builtin.file:
+        state: directory
+        path: "{{ quay_mirror_workspace }}/containers"
+        mode: '0700'
+
+    - name: Build combined auth.json with Red Hat and Quay credentials
+      ansible.builtin.shell: |
+        set -e
+        cp "{{ initial_mirror_workspace }}/containers/auth.json" \
+           "{{ quay_mirror_workspace }}/containers/auth.json"
+        jq -c \
+          --arg host "{{ quay_registry_url }}" \
+          --arg auth "{{ (quay_robot_username ~ ':' ~ quay_robot_token) | b64encode }}" \
+          '.auths[$host] = {"auth": $auth, "email": ""}' \
+          "{{ quay_mirror_workspace }}/containers/auth.json" \
+          > "{{ quay_mirror_workspace }}/containers/auth.json.tmp" \
+          && mv "{{ quay_mirror_workspace }}/containers/auth.json.tmp" \
+                "{{ quay_mirror_workspace }}/containers/auth.json"
+      args:
+        executable: /bin/bash
+      changed_when: true
+      no_log: true
+  when: not _quay_mirror_complete
+
+- name: Print log path for live monitoring
+  ansible.builtin.debug:
+    msg: >
+      Starting oc-mirror to Quay. This may take 60-120+ minutes depending on bandwidth.
+      Monitor progress: tail -f {{ quay_mirror_workspace }}/.oc-mirror.log
+  when: not _quay_mirror_complete
+
+- name: Run oc-mirror to push content to Quay
+  ansible.builtin.command: >
+    {{ bin_dir }}/oc-mirror
+    --v2
+    --config {{ quay_mirror_workspace }}/imageset-config.yaml
+    --workspace file://{{ quay_mirror_workspace }}
+    docker://{{ quay_registry_url }}/{{ quay_mirror_org }}
+  environment:
+    XDG_RUNTIME_DIR: "{{ quay_mirror_workspace }}"
+  args:
+    chdir: "{{ quay_mirror_workspace }}"
+  async: 7200
+  poll: 0
+  register: _quay_mirror_job
+  when: not _quay_mirror_complete
+
+- name: Wait for oc-mirror to Quay to complete (up to 2 hours)
+  ansible.builtin.async_status:
+    jid: "{{ _quay_mirror_job.ansible_job_id }}"
+  register: _quay_mirror_result
+  until: _quay_mirror_result.finished
+  retries: 240
+  delay: 30
+  when:
+    - _quay_mirror_job is defined
+    - _quay_mirror_job.ansible_job_id is defined
+  failed_when:
+    - _quay_mirror_result.finished
+    - _quay_mirror_result.rc not in [0, 4, 12, 14]
+
+# Handle partial failures with oc image mirror retries
+- name: Find oc-mirror error log (Quay run)
+  ansible.builtin.find:
+    paths: "{{ quay_mirror_workspace }}/working-dir/logs"
+    patterns: "mirroring_errors_*.txt"
+    file_type: file
+  register: _quay_error_logs
+  when:
+    - _quay_mirror_result is defined
+    - _quay_mirror_result.rc is defined
+    - _quay_mirror_result.rc in [4, 12, 14]
+
+- name: Extract failed non-bundle image refs from Quay error log
+  ansible.builtin.shell: >
+    grep -oP 'docker://\S+' {{ (_quay_error_logs.files | sort(attribute='path') | last).path }}
+    | grep -v 'operator-bundle'
+    | sort -u
+  register: _quay_failed_images
+  when:
+    - _quay_error_logs is defined
+    - _quay_error_logs.files | default([]) | length > 0
+  changed_when: false
+  failed_when: false
+
+- name: Retry failed images to Quay with oc image mirror (linux/amd64 only)
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc image mirror
+    --filter-by-os=linux/amd64
+    --insecure=true
+    -a {{ quay_mirror_workspace }}/containers/auth.json
+    {{ item | regex_replace('^docker://', '') }}
+    {{ quay_registry_url }}/{{ quay_mirror_org }}/{{ item | regex_replace('^docker://[^/]+/', '') | regex_replace('@sha256:[a-f0-9]+$', '') }}
+  loop: "{{ _quay_failed_images.stdout_lines | default([]) }}"
+  loop_control:
+    label: "{{ item | regex_replace('^docker://', '') | truncate(80, True, '...') }}"
+  when:
+    - _quay_failed_images is defined
+    - _quay_failed_images.stdout_lines | default([]) | length > 0
+  changed_when: true
+  failed_when: false
+
+- name: Extract failed operator bundle refs from Quay error log
+  ansible.builtin.shell: >
+    grep -oP 'docker://\S+' {{ (_quay_error_logs.files | sort(attribute='path') | last).path }}
+    | grep 'operator-bundle'
+    | sort -u
+  register: _quay_failed_bundles
+  when:
+    - _quay_error_logs is defined
+    - _quay_error_logs.files | default([]) | length > 0
+  changed_when: false
+  failed_when: false
+
+- name: Retry failed bundle images to Quay with oc image mirror
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc image mirror
+    --insecure=true
+    -a {{ quay_mirror_workspace }}/containers/auth.json
+    {{ item | regex_replace('^docker://', '') }}
+    {{ quay_registry_url }}/{{ quay_mirror_org }}/{{ item | regex_replace('^docker://[^/]+/', '') | regex_replace('@sha256:[a-f0-9]+$', '') }}
+  loop: "{{ _quay_failed_bundles.stdout_lines | default([]) }}"
+  loop_control:
+    label: "{{ item | regex_replace('^docker://', '') | truncate(80, True, '...') }}"
+  when:
+    - _quay_failed_bundles is defined
+    - _quay_failed_bundles.stdout_lines | default([]) | length > 0
+  changed_when: true
+  failed_when: false
+
+# After all image retries, check if CatalogSource was generated. A missing
+# CatalogSource means the catalog index image failed during the oc-mirror
+# run (regardless of rc). Re-run oc-mirror to generate cluster-resources —
+# at this point the catalog index should be in Quay (pushed by the retry),
+# so oc-mirror will skip the blob uploads and just generate the manifests.
+- name: Check if CatalogSource was generated after retries
+  ansible.builtin.find:
+    paths: "{{ quay_mirror_workspace }}/working-dir/cluster-resources"
+    patterns: "cs-*.yaml"
+    file_type: file
+  register: _quay_post_retry_cs
+  when: not _quay_mirror_complete
+
+- name: Re-run oc-mirror to generate CatalogSource after image retries
+  ansible.builtin.command: >
+    {{ bin_dir }}/oc-mirror
+    --v2
+    --config {{ quay_mirror_workspace }}/imageset-config.yaml
+    --workspace file://{{ quay_mirror_workspace }}
+    docker://{{ quay_registry_url }}/{{ quay_mirror_org }}
+  environment:
+    XDG_RUNTIME_DIR: "{{ quay_mirror_workspace }}"
+  args:
+    chdir: "{{ quay_mirror_workspace }}"
+  async: 7200
+  poll: 0
+  register: _quay_regen_job
+  when:
+    - not _quay_mirror_complete
+    - _quay_post_retry_cs.files | default([]) | length == 0
+
+- name: Wait for CatalogSource regeneration to complete
+  ansible.builtin.async_status:
+    jid: "{{ _quay_regen_job.ansible_job_id }}"
+  register: _quay_regen_result
+  until: _quay_regen_result.finished
+  retries: 240
+  delay: 30
+  when:
+    - _quay_regen_job is defined
+    - _quay_regen_job.ansible_job_id is defined
+  failed_when:
+    - _quay_regen_result.finished
+    - _quay_regen_result.rc not in [0, 4, 12, 14]
+
+# Read generated manifests from Quay workspace
+- name: Find IDMS files in Quay oc-mirror output
+  ansible.builtin.find:
+    paths: "{{ quay_mirror_workspace }}/working-dir/cluster-resources"
+    patterns:
+      - "idms-*.yaml"
+      - "imageDigestMirrorSet*.yaml"
+      - "imageContentSourcePolicy*.yaml"
+    file_type: file
+  register: _quay_idms_files
+
+- name: Find CatalogSource files in Quay oc-mirror output
+  ansible.builtin.find:
+    paths: "{{ quay_mirror_workspace }}/working-dir/cluster-resources"
+    patterns: "cs-*.yaml"
+    file_type: file
+  register: _quay_cs_files
+
+- name: Fail if oc-mirror did not generate CatalogSource manifests
+  ansible.builtin.fail:
+    msg: >-
+      oc-mirror did not generate any CatalogSource manifests in
+      {{ quay_mirror_workspace }}/working-dir/cluster-resources/.
+      The operator catalog index image was not successfully pushed to Quay.
+      Verify CREATE_PRIVATE_REPO_ON_PUSH is enabled, then delete the stale
+      workspace and re-run: rm -rf {{ quay_mirror_workspace }}/working-dir
+  when: _quay_cs_files.files | length == 0
+
+- name: Read Quay IDMS manifests
+  ansible.builtin.slurp:
+    src: "{{ item.path }}"
+  loop: "{{ _quay_idms_files.files }}"
+  register: _quay_idms_contents
+
+- name: Read Quay CatalogSource manifests
+  ansible.builtin.slurp:
+    src: "{{ item.path }}"
+  loop: "{{ _quay_cs_files.files }}"
+  register: _quay_cs_contents
+
+- name: Set Quay IDMS manifests fact
+  ansible.builtin.set_fact:
+    quay_idms_manifests: "{{ _quay_idms_contents.results | map(attribute='content') | map('b64decode') | list }}"
+
+- name: Validate CatalogSource manifests contain operator catalog index
+  ansible.builtin.set_fact:
+    _quay_cs_catalog_entries: >-
+      {{ _quay_cs_contents.results
+          | map(attribute='content')
+          | map('b64decode')
+          | map('from_yaml_all')
+          | flatten
+          | select('mapping')
+          | selectattr('kind', 'equalto', 'CatalogSource')
+          | selectattr('spec.image', 'defined')
+          | selectattr('spec.image', 'search', 'redhat-operator-index')
+          | list }}
+
+- name: Fail if no CatalogSource references operator catalog index
+  ansible.builtin.fail:
+    msg: >-
+      oc-mirror generated CatalogSource manifests but none reference
+      'redhat-operator-index'. The operator catalog index image was not
+      successfully pushed to Quay. Check the oc-mirror error log at
+      {{ quay_mirror_workspace }}/working-dir/logs/ and verify
+      CREATE_PRIVATE_REPO_ON_PUSH is enabled on the Quay instance.
+  when: _quay_cs_catalog_entries | length == 0
+
+- name: Extract Quay catalog image from CatalogSource manifest
+  ansible.builtin.set_fact:
+    quay_catalog_image: "{{ _quay_cs_catalog_entries | map(attribute='spec.image') | first }}"
+
+- name: Write Quay mirror version sentinel
+  ansible.builtin.copy:
+    content: "{{ openshift_version }}.{{ ocp_patch_version }}"
+    dest: "{{ quay_mirror_workspace }}/.mirror-version"
+    mode: '0644'
+
+- name: Display remirror summary
+  ansible.builtin.debug:
+    msg:
+      - "oc-mirror to Quay complete"
+      - "Destination:   {{ quay_registry_url }}/{{ quay_mirror_org }}"
+      - "Catalog image: {{ quay_catalog_image }}"
+      - "IDMS manifests: {{ quay_idms_manifests | length }}"

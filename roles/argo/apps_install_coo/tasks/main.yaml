@@ -1,6 +1,6 @@
 ---
 - name: Create the OpenShift GitOps Application for COO
-  kubernetes.core.k8s:
-    kubeconfig: "{{ target_kubeconfig }}"
-    state: present
-    template: coo-argocd-app.yaml.j2
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: "{{ lookup('template', 'coo-argocd-app.yaml.j2') }}"
+  changed_when: true

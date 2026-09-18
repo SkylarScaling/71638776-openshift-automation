@@ -1,0 +1,29 @@
+---
+spokes_clusterset: default
+image_policy_namespace: default
+
+# enforce = block non-compliant pods; inform = report only
+policy_remediation_action: enforce
+
+# Namespaces where image signature validation will be enforced
+validated_namespaces: []
+#  - my-app-namespace
+
+# Image registries/patterns that MUST have a valid cosign signature
+# (images you control and sign with your own key)
+signed_image_scopes: []
+#  - "quay.io/my-org/*"
+#  - "registry.example.com/production/*"
+
+# Third-party images NOT under your control — explicitly exempted from your signing policy.
+# Creates a separate ImagePolicy using authorities[static.action=pass] so exemptions are
+# visible in the cluster and trackable via ACM compliance, rather than silently out of scope.
+excluded_images: []
+#  - "registry.redhat.io/*"
+#  - "registry.access.redhat.com/*"
+
+# Base64-encoded PEM public key used to verify cosign signatures (signing_public_key_data)
+signing_public_key_data: ""
+
+# Rekor transparency log URL for cosign signature verification
+sigstore_rekor_url: "https://rekor.sigstore.dev"
