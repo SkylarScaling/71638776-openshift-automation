@@ -1,0 +1,85 @@
+---
+- name: Create Ingress TLS Secret
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: "{{ ssl_ingress_secret_name }}"
+        namespace: openshift-ingress
+      type: kubernetes.io/tls
+      data:
+        tls.crt: "{{ ssl.ingress.cert | b64encode }}"
+        tls.key: "{{ ssl.ingress.key | b64encode }}"
+  changed_when: true
+  when: ssl.ingress is defined
+
+- name: Patch IngressController to use custom TLS certificate
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc patch ingresscontroller default
+    -n openshift-ingress-operator
+    --kubeconfig {{ target_kubeconfig }}
+    --type=merge
+    -p '{"spec":{"defaultCertificate":{"name":"{{ ssl_ingress_secret_name }}"}}}'
+  changed_when: true
+  when: ssl.ingress is defined
+
+- name: Create API Server TLS Secret
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: "{{ ssl_api_secret_name }}"
+        namespace: openshift-config
+      type: kubernetes.io/tls
+      data:
+        tls.crt: "{{ ssl.api.cert | b64encode }}"
+        tls.key: "{{ ssl.api.key | b64encode }}"
+  changed_when: true
+  when: ssl.api is defined
+
+- name: Get cluster API server hostname
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get infrastructure cluster
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.apiServerURL}'
+    | sed 's|https://||' | cut -d: -f1
+  register: _api_hostname
+  changed_when: false
+  when: ssl.api is defined
+
+- name: Patch APIServer to use custom TLS certificate
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc patch apiserver cluster
+    --kubeconfig {{ target_kubeconfig }}
+    --type=merge
+    -p '{"spec":{"servingCerts":{"namedCertificates":[{"names":["{{ _api_hostname.stdout | trim }}"],"servingCertificate":{"name":"{{ ssl_api_secret_name }}"}}]}}}'
+  changed_when: true
+  when: ssl.api is defined
+
+- name: Create trusted CA bundle ConfigMap
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: "{{ ssl_ca_configmap_name }}"
+        namespace: openshift-config
+      data:
+        ca-bundle.crt: |
+          {{ ssl.ca_bundle | indent(10) }}
+  changed_when: true
+  when: ssl.ca_bundle | default('') != ''
+
+- name: Patch cluster Proxy to use trusted CA bundle
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc patch proxy cluster
+    --kubeconfig {{ target_kubeconfig }}
+    --type=merge
+    -p '{"spec":{"trustedCA":{"name":"{{ ssl_ca_configmap_name }}"}}}'
+  changed_when: true
+  when: ssl.ca_bundle | default('') != ''

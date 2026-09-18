@@ -1,0 +1,3 @@
+---
+rbac_bindings: []
+# Each entry: { group: "group-name", cluster_role: "cluster-admin|edit|view|..." }

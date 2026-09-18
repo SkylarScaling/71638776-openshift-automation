@@ -1,0 +1,131 @@
+---
+- name: Create MetalLB namespace
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ metallb_namespace }}"
+        labels:
+          openshift.io/cluster-monitoring: "true"
+  changed_when: true
+
+- name: Create OperatorGroup for MetalLB
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: operators.coreos.com/v1
+      kind: OperatorGroup
+      metadata:
+        name: metallb-operator-group
+        namespace: "{{ metallb_namespace }}"
+      spec:
+        targetNamespaces:
+          - "{{ metallb_namespace }}"
+  changed_when: true
+
+- name: Subscribe to MetalLB Operator
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: operators.coreos.com/v1alpha1
+      kind: Subscription
+      metadata:
+        name: metallb-operator
+        namespace: "{{ metallb_namespace }}"
+      spec:
+        channel: "{{ metallb_operator_channel }}"
+        installPlanApproval: Automatic
+        name: metallb-operator
+        source: "{{ metallb_operator_source }}"
+        sourceNamespace: "{{ metallb_operator_source_namespace }}"
+  changed_when: true
+
+- name: Check if MetalLB Operator CSV is already installed
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get subscription metallb-operator
+    -n {{ metallb_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.installedCSV}' 2>/dev/null || true
+  register: _metallb_existing_csv
+  changed_when: false
+
+- name: Wait for MetalLB Operator CSV to be installed
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get subscription metallb-operator
+    -n {{ metallb_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.installedCSV}{.status.currentCSV}' 2>/dev/null || true
+  register: _metallb_csv
+  until: _metallb_csv.stdout != ""
+  retries: 60
+  delay: 10
+  changed_when: false
+  when: _metallb_existing_csv.stdout | default('') == ""
+
+- name: Wait for MetalLB CRD to be available
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get crd metallbs.metallb.io
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.metadata.name}' 2>/dev/null || true
+  register: _metallb_crd
+  until: _metallb_crd.stdout != ""
+  retries: 30
+  delay: 10
+  changed_when: false
+
+- name: Apply MetalLB instance
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: metallb.io/v1beta1
+      kind: MetalLB
+      metadata:
+        name: metallb
+        namespace: "{{ metallb_namespace }}"
+  changed_when: true
+
+- name: Wait for MetalLB controller to be ready
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get deployment controller
+    -n {{ metallb_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.availableReplicas}' 2>/dev/null || true
+  register: _metallb_controller
+  until: (_metallb_controller.stdout | default('0') | int) > 0
+  retries: 30
+  delay: 10
+  changed_when: false
+
+- name: Apply IPAddressPool {{ item.name }}
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: metallb.io/v1beta1
+      kind: IPAddressPool
+      metadata:
+        name: "{{ item.name }}"
+        namespace: "{{ metallb_namespace }}"
+      spec:
+        addresses: {{ item.addresses | to_yaml | trim }}
+        autoAssign: {{ item.auto_assign | default(true) | bool | lower }}
+  loop: "{{ metallb.ip_address_pools | default([]) }}"
+  changed_when: true
+  when: metallb.ip_address_pools | default([]) | length > 0
+
+- name: Apply L2Advertisement for {{ item.name }}
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: metallb.io/v1beta1
+      kind: L2Advertisement
+      metadata:
+        name: "{{ item.name }}-l2adv"
+        namespace: "{{ metallb_namespace }}"
+      spec:
+        ipAddressPools:
+          - "{{ item.name }}"
+  loop: "{{ metallb.ip_address_pools | default([]) }}"
+  changed_when: true
+  when: metallb.ip_address_pools | default([]) | length > 0

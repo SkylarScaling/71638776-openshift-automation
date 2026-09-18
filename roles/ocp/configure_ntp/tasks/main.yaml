@@ -1,0 +1,83 @@
+---
+- name: Assert NTP servers are defined
+  ansible.builtin.assert:
+    that:
+      - ntp_servers | length > 0
+    fail_msg: "ntp_servers must be a non-empty list"
+
+- name: Build chrony.conf content
+  ansible.builtin.set_fact:
+    _chrony_conf: |
+      {% for server in ntp_servers %}
+      pool {{ server }} iburst
+      {% endfor %}
+      driftfile /var/lib/chrony/drift
+      makestep 1.0 3
+      rtcsync
+      logdir /var/log/chrony
+
+- name: Base64-encode chrony.conf
+  ansible.builtin.set_fact:
+    _chrony_conf_b64: "{{ _chrony_conf | b64encode }}"
+
+- name: Apply NTP MachineConfig for master pool
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: machineconfiguration.openshift.io/v1
+      kind: MachineConfig
+      metadata:
+        name: 99-master-chrony
+        labels:
+          machineconfiguration.openshift.io/role: master
+      spec:
+        config:
+          ignition:
+            version: 3.4.0
+          storage:
+            files:
+              - path: /etc/chrony.conf
+                mode: 420
+                overwrite: true
+                contents:
+                  source: "data:text/plain;charset=utf-8;base64,{{ _chrony_conf_b64 }}"
+  changed_when: true
+
+- name: Apply NTP MachineConfig for worker pool
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: machineconfiguration.openshift.io/v1
+      kind: MachineConfig
+      metadata:
+        name: 99-worker-chrony
+        labels:
+          machineconfiguration.openshift.io/role: worker
+      spec:
+        config:
+          ignition:
+            version: 3.4.0
+          storage:
+            files:
+              - path: /etc/chrony.conf
+                mode: 420
+                overwrite: true
+                contents:
+                  source: "data:text/plain;charset=utf-8;base64,{{ _chrony_conf_b64 }}"
+  changed_when: true
+
+- name: Wait for master MachineConfigPool to finish updating
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc wait mcp master
+    --for=condition=Updated=True
+    --timeout=600s
+    --kubeconfig {{ target_kubeconfig }}
+  changed_when: false
+
+- name: Wait for worker MachineConfigPool to finish updating
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc wait mcp worker
+    --for=condition=Updated=True
+    --timeout=600s
+    --kubeconfig {{ target_kubeconfig }}
+  changed_when: false

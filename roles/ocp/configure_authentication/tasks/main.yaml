@@ -1,0 +1,52 @@
+---
+- name: Assert required LDAP vars are defined
+  ansible.builtin.assert:
+    that:
+      - ldap.url is defined and ldap.url != ""
+      - ldap.bind_dn is defined and ldap.bind_dn != ""
+    fail_msg: "ldap.url and ldap.bind_dn must be defined"
+
+- name: Ensure openshift-config namespace exists
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: openshift-config
+  changed_when: true
+
+- name: Create LDAP bind password Secret
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: "{{ ldap_bind_secret_name }}"
+        namespace: openshift-config
+      type: Opaque
+      stringData:
+        bindPassword: "{{ ldap.bind_password }}"
+  changed_when: true
+
+- name: Create LDAP CA ConfigMap
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: "{{ ldap_ca_configmap_name }}"
+        namespace: openshift-config
+      data:
+        ca.crt: |
+          {{ ldap.ca_cert | indent(10) }}
+  changed_when: true
+  when: ldap.ca_cert | default('') != ''
+
+- name: Apply OAuth cluster CR with LDAP identity provider
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: "{{ lookup('template', 'oauth-ldap.yaml.j2') }}"
+  changed_when: true

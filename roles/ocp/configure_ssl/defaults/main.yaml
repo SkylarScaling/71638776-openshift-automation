@@ -1,0 +1,5 @@
+---
+ssl: {}
+ssl_ingress_secret_name: "custom-ingress-tls"
+ssl_api_secret_name: "custom-api-tls"
+ssl_ca_configmap_name: "custom-ca-bundle"

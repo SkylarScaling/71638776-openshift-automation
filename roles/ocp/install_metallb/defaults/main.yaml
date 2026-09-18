@@ -1,0 +1,6 @@
+---
+metallb: {}
+metallb_namespace: "metallb-system"
+metallb_operator_channel: "stable"
+metallb_operator_source: "redhat-operators"
+metallb_operator_source_namespace: "openshift-marketplace"

@@ -1,0 +1,98 @@
+---
+- name: Create Group Sync Operator namespace
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ groupsync_namespace }}"
+  changed_when: true
+
+- name: Create OperatorGroup for Group Sync Operator
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: operators.coreos.com/v1
+      kind: OperatorGroup
+      metadata:
+        name: group-sync-operator-group
+        namespace: "{{ groupsync_namespace }}"
+      spec:
+        targetNamespaces:
+          - "{{ groupsync_namespace }}"
+  changed_when: true
+
+- name: Subscribe to Group Sync Operator
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: operators.coreos.com/v1alpha1
+      kind: Subscription
+      metadata:
+        name: group-sync-operator
+        namespace: "{{ groupsync_namespace }}"
+      spec:
+        channel: alpha
+        installPlanApproval: Automatic
+        name: group-sync-operator
+        source: community-operators
+        sourceNamespace: openshift-marketplace
+  changed_when: true
+
+- name: Check if Group Sync Operator CSV is already installed
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get subscription group-sync-operator
+    -n {{ groupsync_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.installedCSV}' 2>/dev/null || true
+  register: _groupsync_existing_csv
+  changed_when: false
+
+- name: Wait for Group Sync Operator CSV to be installed
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get subscription group-sync-operator
+    -n {{ groupsync_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.installedCSV}{.status.currentCSV}' 2>/dev/null || true
+  register: _groupsync_csv
+  until: _groupsync_csv.stdout != ""
+  retries: 60
+  delay: 10
+  changed_when: false
+  when: _groupsync_existing_csv.stdout | default('') == ""
+
+- name: Create LDAP CA secret for Group Sync
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: groupsync-ldap-ca
+        namespace: "{{ groupsync_namespace }}"
+      type: Opaque
+      stringData:
+        ca.crt: "{{ groupsync.ca_cert }}"
+  changed_when: true
+  when: groupsync.ca_cert | default('') != ''
+
+- name: Create LDAP bind secret for Group Sync
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: groupsync-ldap-bind
+        namespace: "{{ groupsync_namespace }}"
+      type: Opaque
+      stringData:
+        bindPassword: "{{ groupsync.bind_password }}"
+  changed_when: true
+
+- name: Apply GroupSync CR
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: "{{ lookup('template', 'groupsync-cr.yaml.j2') }}"
+  changed_when: true

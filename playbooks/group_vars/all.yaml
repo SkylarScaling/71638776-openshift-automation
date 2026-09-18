@@ -10,4 +10,53 @@ enable_uwm: false
 # Standalone playbook extra-vars (pass via -e when running acm/ or argo/ playbooks directly)
 # cluster_name: ""       # Name of the target cluster (maps to install_dir/<name>/auth/kubeconfig)
 # spokes_clusterset: ""  # ClusterSet to target for ACM policy placement
+
+# Day 2 Configuration (set these in inventory.yaml to enable)
+# ntp_servers:
+#   - 169.254.169.123  # AWS time server
+#   - 0.rhel.pool.ntp.org
+
+# ldap:
+#   name: "ldap"
+#   url: "ldaps://ldap.example.com:636/ou=users,dc=example,dc=com?uid"
+#   bind_dn: "cn=serviceaccount,dc=example,dc=com"
+#   bind_password: "{{ vault_ldap_bind_password }}"
+#   insecure: false
+#   ca_cert: ""
+#   attributes:
+#     id: ["dn"]
+#     email: ["mail"]
+#     name: ["cn"]
+#     preferred_username: ["uid"]
+
+# rbac_bindings:
+#   - group: "openshift-admins"
+#     cluster_role: "cluster-admin"
+#   - group: "openshift-viewers"
+#     cluster_role: "view"
+
+# groupsync:
+#   schedule: "0 * * * *"
+#   ldap_url: "ldaps://ldap.example.com:636"
+#   bind_dn: "cn=serviceaccount,dc=example,dc=com"
+#   bind_password: "{{ vault_ldap_bind_password }}"
+#   ca_cert: ""
+#   groups_base_dn: "ou=groups,dc=example,dc=com"
+#   groups_filter: "(&(objectClass=group)(cn=openshift-*))"
+#   users_base_dn: "ou=users,dc=example,dc=com"
+
+# metallb:
+#   ip_address_pools:
+#     - name: "default-pool"
+#       addresses:
+#         - "192.168.1.100-192.168.1.200"
+
+# ssl:
+#   ingress:
+#     cert: "{{ lookup('file', '~/certs/ingress.crt') }}"
+#     key: "{{ lookup('file', '~/certs/ingress.key') }}"
+#   api:
+#     cert: "{{ lookup('file', '~/certs/api.crt') }}"
+#     key: "{{ lookup('file', '~/certs/api.key') }}"
+#   ca_bundle: ""
 ...

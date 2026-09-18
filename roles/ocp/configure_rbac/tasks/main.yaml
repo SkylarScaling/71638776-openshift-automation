@@ -1,0 +1,23 @@
+---
+- name: Skip if no RBAC bindings defined
+  ansible.builtin.meta: end_host
+  when: rbac_bindings | length == 0
+
+- name: Apply ClusterRoleBinding for {{ item.group }}
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: "{{ item.group | replace(' ', '-') | lower }}-{{ item.cluster_role }}"
+      subjects:
+        - apiGroup: rbac.authorization.k8s.io
+          kind: Group
+          name: "{{ item.group }}"
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: "{{ item.cluster_role }}"
+  loop: "{{ rbac_bindings }}"
+  changed_when: true

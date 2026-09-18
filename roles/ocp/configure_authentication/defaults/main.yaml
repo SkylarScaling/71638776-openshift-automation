@@ -1,0 +1,4 @@
+---
+ldap: {}
+ldap_bind_secret_name: "ldap-bind-secret"
+ldap_ca_configmap_name: "ldap-ca-config-map"
