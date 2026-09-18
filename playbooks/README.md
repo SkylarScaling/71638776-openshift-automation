@@ -479,6 +479,16 @@ all:
         - name: cluster-observability-operator
           channels:
             - name: "stable"
+        # MetalLB — required if metallb: is defined in Day 2 config
+        - name: metallb-operator
+          channels:
+            - name: "stable"
+      # Community operators (mirrored from community-operator-index, separate from redhat-operators)
+      # Required if groupsync: is defined in Day 2 config
+      community_operators:
+        - name: group-sync-operator
+          channels:
+            - name: "alpha"
       # Optional: additional images to mirror (not part of release or operator catalogs)
       # additional_images:
       #   - registry.redhat.io/ubi9/ubi:latest
@@ -500,6 +510,80 @@ all:
       app_password: "<16 char app password>"
       default_to: "<default_email>@gmail.com"
       esp_to: "<esp_rule_email>@gmail.com"
+
+    # ---------------------------------------------------------------------------
+    # Day 2 Configuration — remove the '#' prefix on any block to enable it.
+    # All vars are optional; omitting them skips the corresponding role entirely.
+    # ---------------------------------------------------------------------------
+
+    # NTP: applied as a MachineConfig to master and worker pools on every cluster.
+    # Use the same servers across all clusters for consistency.
+    ntp_servers:
+      - 169.254.169.123        # AWS time sync service (link-local, available in all regions)
+      - 0.rhel.pool.ntp.org    # fallback public NTP pool
+
+    # LDAP / Active Directory identity provider
+    ldap:
+      name: "ldap"             # Label shown on the OCP login screen
+      url: "ldaps://<ldap-host>:636/ou=users,dc=example,dc=com?uid"  # baseDN + attribute in URL
+      bind_dn: "cn=serviceaccount,ou=serviceaccounts,dc=example,dc=com"
+      bind_password: "<ldap_bind_password>"   # use ansible-vault to encrypt
+      insecure: false          # set true only for plain LDAP (not recommended)
+      ca_cert: ""              # PEM content of LDAP CA cert; leave empty if using a public CA
+      attributes:
+        id: ["dn"]
+        email: ["mail"]
+        name: ["cn"]
+        preferred_username: ["uid"]
+
+    # RBAC: maps AD/LDAP groups to OCP cluster roles on every cluster
+    rbac_bindings:
+      - group: "openshift-admins"
+        cluster_role: "cluster-admin"
+      - group: "openshift-developers"
+        cluster_role: "edit"
+      - group: "openshift-viewers"
+        cluster_role: "view"
+
+    # GroupSync: installs the Group Sync Operator and syncs AD/LDAP groups on a schedule.
+    # Requires group-sync-operator in disconnected.community_operators above.
+    groupsync:
+      schedule: "0 * * * *"   # cron — every hour
+      ldap_url: "ldaps://<ldap-host>:636"
+      bind_dn: "cn=serviceaccount,ou=serviceaccounts,dc=example,dc=com"
+      bind_password: "<ldap_bind_password>"   # use ansible-vault to encrypt
+      ca_cert: ""              # PEM content of LDAP CA cert; leave empty if using a public CA
+      groups_base_dn: "ou=groups,dc=example,dc=com"
+      groups_filter: "(&(objectClass=group)(cn=openshift-*))"
+      users_base_dn: "ou=users,dc=example,dc=com"
+      group_uid_attribute: "dn"
+      group_name_attributes: ["cn"]
+      group_membership_attributes: ["member"]
+      user_uid_attribute: "dn"
+      user_name_attributes: ["uid"]
+      tolerate_member_not_found: true
+      tolerate_member_out_of_scope: true
+
+    # MetalLB: installs MetalLB and configures IP address pools.
+    # Requires metallb-operator in disconnected.operators above.
+    metallb:
+      ip_address_pools:
+        - name: "default-pool"
+          addresses:
+            - "<start-ip>-<end-ip>"   # e.g. 192.168.10.100-192.168.10.200
+          auto_assign: true
+
+    # SSL: applies custom TLS certificates to IngressController and/or APIServer.
+    # Cert/key are read from files on the control node at run time.
+    # ssl:
+    #   ingress:
+    #     cert: "{{ lookup('file', '~/certs/ingress.crt') }}"
+    #     key: "{{ lookup('file', '~/certs/ingress.key') }}"
+    #   api:
+    #     cert: "{{ lookup('file', '~/certs/api.crt') }}"
+    #     key: "{{ lookup('file', '~/certs/api.key') }}"
+    #   ca_bundle: ""          # PEM CA bundle; patches cluster Proxy trustedCA if set
+
   children:
     hub_cluster:
       hosts:
@@ -601,9 +685,10 @@ all:
 | `disconnected.mirror_registry.init_user` | No | `init` | Mirror registry admin username |
 | `disconnected.mirror_registry.init_password` | Yes | — | Mirror registry admin password |
 | `disconnected.mirror_base_path` | No | `ocp4` | Base path prefix in the mirror registry |
-| `disconnected.operators` | Yes | — | List of operators to mirror (see example above). ODF requires all 12 sub-operator packages — see example inventory. |
+| `disconnected.operators` | Yes | — | List of operators to mirror from `redhat-operator-index`. ODF requires all 12 sub-operator packages — see example inventory. |
 | `disconnected.operators[].name` | Yes | — | Operator package name from the Red Hat catalog |
-| `disconnected.operators[].channels` | No | — | List of channels to mirror (omit to mirror default channel). Always specify channels — omitting causes the catalog default to be mirrored, which may pull far more content than intended. |
+| `disconnected.operators[].channels` | No | — | List of channels to mirror. Always specify channels — omitting pulls the full catalog default. |
+| `disconnected.community_operators` | No | `[]` | List of operators to mirror from `community-operator-index`. Required when using GroupSync (`group-sync-operator`). Same structure as `operators`. |
 | `disconnected.additional_images` | No | `[]` | Extra images to mirror beyond release and operators |
 | `disconnected.gitea.admin_password` | No | `R3dH4t!gitea` | Admin password for the Gitea Git server deployed on the hub cluster |
 | `disconnected.quay_mirror.namespace` | No | `local-quay` | Namespace where the Quay operator is deployed |

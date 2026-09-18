@@ -25,6 +25,26 @@ mirror:
 {% endfor %}
 {% endif %}
 {% endfor %}
+{% if disconnected.community_operators is defined and disconnected.community_operators | length > 0 %}
+    - catalog: registry.redhat.io/redhat/community-operator-index:v{{ openshift_version }}
+      packages:
+{% for operator in disconnected.community_operators %}
+        - name: {{ operator.name }}
+{% if operator.channels is defined %}
+          defaultChannel: {{ operator.channels[0].name }}
+          channels:
+{% for channel in operator.channels %}
+            - name: {{ channel.name }}
+{% if channel.min_version is defined %}
+              minVersion: "{{ channel.min_version }}"
+{% endif %}
+{% if channel.max_version is defined %}
+              maxVersion: "{{ channel.max_version }}"
+{% endif %}
+{% endfor %}
+{% endif %}
+{% endfor %}
+{% endif %}
   additionalImages:
     - name: docker.io/gitea/gitea:1.22-rootless
 {% if disconnected.additional_images is defined and disconnected.additional_images | length > 0 %}
