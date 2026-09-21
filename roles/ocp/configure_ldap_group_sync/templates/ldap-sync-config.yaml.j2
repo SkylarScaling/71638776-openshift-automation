@@ -1,0 +1,36 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: "{{ groupsync_configmap }}"
+  namespace: "{{ groupsync_namespace }}"
+data:
+  sync.yaml: |
+    kind: LDAPSyncConfig
+    apiVersion: v1
+    url: "{{ groupsync.ldap_url }}"
+    bindDN: "{{ groupsync.bind_dn }}"
+    bindPassword:
+      file: /etc/secrets/bindPassword
+{% if groupsync.ca_cert | default('') != '' %}
+    ca: /etc/ca/ca.crt
+{% endif %}
+    insecure: {{ groupsync.insecure | default(false) | bool | lower }}
+    rfc2307:
+      groupsQuery:
+        baseDN: "{{ groupsync.groups_base_dn }}"
+        scope: sub
+        derefAliases: never
+        filter: "{{ groupsync.groups_filter | default('(objectClass=group)') }}"
+        pageSize: 0
+      groupUIDAttribute: "{{ groupsync.group_uid_attribute | default('dn') }}"
+      groupNameAttributes: {{ groupsync.group_name_attributes | default(['cn']) | to_yaml | trim }}
+      groupMembershipAttributes: {{ groupsync.group_membership_attributes | default(['member']) | to_yaml | trim }}
+      usersQuery:
+        baseDN: "{{ groupsync.users_base_dn }}"
+        scope: sub
+        derefAliases: never
+        pageSize: 0
+      userUIDAttribute: "{{ groupsync.user_uid_attribute | default('dn') }}"
+      userNameAttributes: {{ groupsync.user_name_attributes | default(['uid']) | to_yaml | trim }}
+      tolerateMemberNotFoundErrors: {{ groupsync.tolerate_member_not_found | default(true) | bool | lower }}
+      tolerateMemberOutOfScopeErrors: {{ groupsync.tolerate_member_out_of_scope | default(true) | bool | lower }}

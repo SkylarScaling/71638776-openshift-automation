@@ -1,0 +1,44 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: "{{ groupsync_cronjob }}"
+  namespace: "{{ groupsync_namespace }}"
+spec:
+  schedule: "{{ groupsync.schedule | default('0 * * * *') }}"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: "{{ groupsync_serviceaccount }}"
+          restartPolicy: OnFailure
+          containers:
+            - name: ldap-group-sync
+              image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+              command:
+                - /bin/bash
+                - -c
+                - oc adm groups sync --sync-config=/etc/config/sync.yaml --confirm
+              volumeMounts:
+                - name: sync-config
+                  mountPath: /etc/config
+                - name: bind-password
+                  mountPath: /etc/secrets
+{% if groupsync.ca_cert | default('') != '' %}
+                - name: ldap-ca
+                  mountPath: /etc/ca
+{% endif %}
+          volumes:
+            - name: sync-config
+              configMap:
+                name: "{{ groupsync_configmap }}"
+            - name: bind-password
+              secret:
+                secretName: "{{ groupsync_secret }}"
+{% if groupsync.ca_cert | default('') != '' %}
+            - name: ldap-ca
+              configMap:
+                name: "{{ groupsync_ca_configmap }}"
+{% endif %}

@@ -117,9 +117,9 @@
         target_kubeconfig: "{{ hub_kubeconfig }}"
       when: rbac_bindings | default([]) | length > 0
 
-    - name: Install Group Sync Operator on Hub
+    - name: Configure LDAP Group Sync on Hub
       ansible.builtin.include_role:
-        name: ocp/install_groupsync
+        name: ocp/configure_ldap_group_sync
       vars:
         target_kubeconfig: "{{ hub_kubeconfig }}"
       when: groupsync is defined
@@ -250,9 +250,9 @@
         target_kubeconfig: "{{ managed_cluster_kubeconfig }}"
       when: rbac_bindings | default([]) | length > 0
 
-    - name: Install Group Sync Operator on Managed Cluster
+    - name: Configure LDAP Group Sync on Managed Cluster
       ansible.builtin.include_role:
-        name: ocp/install_groupsync
+        name: ocp/configure_ldap_group_sync
       vars:
         target_kubeconfig: "{{ managed_cluster_kubeconfig }}"
       when: groupsync is defined

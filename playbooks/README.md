@@ -483,12 +483,6 @@ all:
         - name: metallb-operator
           channels:
             - name: "stable"
-      # Community operators (mirrored from community-operator-index, separate from redhat-operators)
-      # Required if groupsync: is defined in Day 2 config
-      community_operators:
-        - name: group-sync-operator
-          channels:
-            - name: "alpha"
       # Optional: additional images to mirror (not part of release or operator catalogs)
       # additional_images:
       #   - registry.redhat.io/ubi9/ubi:latest
@@ -545,8 +539,8 @@ all:
       - group: "openshift-viewers"
         cluster_role: "view"
 
-    # GroupSync: installs the Group Sync Operator and syncs AD/LDAP groups on a schedule.
-    # Requires group-sync-operator in disconnected.community_operators above.
+    # GroupSync: deploys a CronJob using the built-in 'oc adm groups sync' command.
+    # No additional operator required — uses the cli ImageStream already in the cluster.
     groupsync:
       schedule: "0 * * * *"   # cron — every hour
       ldap_url: "ldaps://<ldap-host>:636"
@@ -688,7 +682,7 @@ all:
 | `disconnected.operators` | Yes | — | List of operators to mirror from `redhat-operator-index`. ODF requires all 12 sub-operator packages — see example inventory. |
 | `disconnected.operators[].name` | Yes | — | Operator package name from the Red Hat catalog |
 | `disconnected.operators[].channels` | No | — | List of channels to mirror. Always specify channels — omitting pulls the full catalog default. |
-| `disconnected.community_operators` | No | `[]` | List of operators to mirror from `community-operator-index`. Required when using GroupSync (`group-sync-operator`). Same structure as `operators`. |
+| `disconnected.community_operators` | No | `[]` | List of operators to mirror from `community-operator-index`. Not required by any default Day 2 role. Same structure as `operators`. |
 | `disconnected.additional_images` | No | `[]` | Extra images to mirror beyond release and operators |
 | `disconnected.gitea.admin_password` | No | `R3dH4t!gitea` | Admin password for the Gitea Git server deployed on the hub cluster |
 | `disconnected.quay_mirror.namespace` | No | `local-quay` | Namespace where the Quay operator is deployed |

@@ -1,0 +1,9 @@
+---
+groupsync: {}
+groupsync_namespace: "openshift-config"
+groupsync_serviceaccount: "ldap-group-syncer"
+groupsync_clusterrole: "ldap-group-syncer"
+groupsync_configmap: "ldap-group-sync-config"
+groupsync_secret: "ldap-group-sync-bind"
+groupsync_ca_configmap: "ldap-group-sync-ca"
+groupsync_cronjob: "ldap-group-sync"

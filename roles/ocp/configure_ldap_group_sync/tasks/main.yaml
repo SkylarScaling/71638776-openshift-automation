@@ -1,0 +1,101 @@
+---
+- name: Assert required groupsync vars are defined
+  ansible.builtin.assert:
+    that:
+      - groupsync.ldap_url is defined and groupsync.ldap_url != ""
+      - groupsync.bind_dn is defined and groupsync.bind_dn != ""
+      - groupsync.groups_base_dn is defined and groupsync.groups_base_dn != ""
+      - groupsync.users_base_dn is defined and groupsync.users_base_dn != ""
+    fail_msg: "groupsync.ldap_url, bind_dn, groups_base_dn, and users_base_dn must all be defined"
+
+- name: Create ServiceAccount for LDAP group sync
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: "{{ groupsync_serviceaccount }}"
+        namespace: "{{ groupsync_namespace }}"
+  changed_when: true
+
+- name: Create ClusterRole for LDAP group sync
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRole
+      metadata:
+        name: "{{ groupsync_clusterrole }}"
+      rules:
+        - apiGroups:
+            - user.openshift.io
+          resources:
+            - groups
+          verbs:
+            - get
+            - list
+            - create
+            - update
+            - patch
+            - delete
+  changed_when: true
+
+- name: Bind ClusterRole to ServiceAccount
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: "{{ groupsync_clusterrole }}"
+      subjects:
+        - kind: ServiceAccount
+          name: "{{ groupsync_serviceaccount }}"
+          namespace: "{{ groupsync_namespace }}"
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: "{{ groupsync_clusterrole }}"
+  changed_when: true
+
+- name: Create LDAP bind password Secret
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: "{{ groupsync_secret }}"
+        namespace: "{{ groupsync_namespace }}"
+      type: Opaque
+      stringData:
+        bindPassword: "{{ groupsync.bind_password }}"
+  changed_when: true
+
+- name: Create LDAP CA ConfigMap
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: "{{ groupsync_ca_configmap }}"
+        namespace: "{{ groupsync_namespace }}"
+      data:
+        ca.crt: |
+          {{ groupsync.ca_cert | indent(10) }}
+  changed_when: true
+  when: groupsync.ca_cert | default('') != ''
+
+- name: Create LDAPSyncConfig ConfigMap
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: "{{ lookup('template', 'ldap-sync-config.yaml.j2') }}"
+  changed_when: true
+
+- name: Create LDAP group sync CronJob
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: "{{ lookup('template', 'ldap-group-sync-cronjob.yaml.j2') }}"
+  changed_when: true
