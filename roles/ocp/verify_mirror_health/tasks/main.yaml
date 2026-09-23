@@ -1,0 +1,79 @@
+---
+- name: "[Mirror] Check all CatalogSources are READY"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get catalogsource -n openshift-marketplace
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.connectionState.lastObservedState}{"\n"}{end}'
+  register: _cs_raw
+  changed_when: false
+
+- name: "[Mirror] Identify degraded CatalogSources"
+  ansible.builtin.set_fact:
+    _cs_degraded: "{{ _cs_raw.stdout_lines | reject('match', '^.*\\tREADY$') | list }}"
+    _cs_all: "{{ _cs_raw.stdout_lines }}"
+
+- name: "[Mirror] Assert all CatalogSources are READY"
+  ansible.builtin.assert:
+    that: _cs_degraded | length == 0
+    fail_msg: |
+      Degraded CatalogSources:
+      {% for cs in _cs_degraded %}  {{ cs }}
+      {% endfor %}
+    success_msg: "All {{ _cs_all | length }} CatalogSources are READY"
+
+- name: "[Mirror] Check ImageDigestMirrorSet exists"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get imagedigestmirrorset
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.items[*].metadata.name}'
+  register: _idms_names
+  changed_when: false
+
+- name: "[Mirror] Assert at least one IDMS is present"
+  ansible.builtin.assert:
+    that: _idms_names.stdout != ""
+    fail_msg: "No ImageDigestMirrorSet found — mirror redirect is not configured"
+    success_msg: "IDMS found: {{ _idms_names.stdout }}"
+
+- name: "[Mirror] Check CatalogSources reference the local mirror registry"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get catalogsource -n openshift-marketplace
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.image}{"\n"}{end}'
+  register: _cs_images
+  changed_when: false
+
+- name: "[Mirror] Identify CatalogSources pointing outside the mirror"
+  ansible.builtin.set_fact:
+    _cs_external: >-
+      {{ _cs_images.stdout_lines
+         | reject('match', '.*' + (disconnected.mirror_registry.hostname | default('')) + '.*')
+         | reject('match', '^\\s*$')
+         | list }}
+
+- name: "[Mirror] Assert all CatalogSources use the local mirror"
+  ansible.builtin.assert:
+    that: _cs_external | length == 0
+    fail_msg: |
+      These CatalogSources are NOT pointing at the local mirror registry:
+      {% for cs in _cs_external %}  {{ cs }}
+      {% endfor %}
+    success_msg: "All CatalogSources reference the local mirror registry"
+  when: disconnected.mirror_registry.hostname is defined
+
+- name: "[Mirror] Check Quay registry is Available"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get quayregistry
+    -n {{ disconnected.quay_mirror.namespace | default('local-quay') }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.items[0].status.conditions[?(@.type=="Available")].status}'
+    2>/dev/null || true
+  register: _quay_status
+  changed_when: false
+
+- name: "[Mirror] Assert Quay registry is Available"
+  ansible.builtin.assert:
+    that: _quay_status.stdout == 'True'
+    fail_msg: "QuayRegistry is not Available (status: '{{ _quay_status.stdout }}')"
+    success_msg: "Quay registry is Available"
+  when: _quay_status.stdout != ""

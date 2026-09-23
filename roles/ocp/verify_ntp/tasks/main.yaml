@@ -1,0 +1,66 @@
+---
+# Check MachineConfigs exist and their content matches the inventory ntp_servers.
+# Avoids slow 'oc debug node' by decoding the applied MachineConfig directly.
+
+- name: "[NTP] Check NTP MachineConfigs exist"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get machineconfig {{ item }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.metadata.name}' 2>/dev/null || true
+  register: _mc_exists
+  changed_when: false
+  loop:
+    - 99-master-chrony
+    - 99-worker-chrony
+
+- name: "[NTP] Assert NTP MachineConfigs exist"
+  ansible.builtin.assert:
+    that: item.stdout != ""
+    fail_msg: "MachineConfig '{{ item.item }}' not found — configure_ntp role may not have run"
+    success_msg: "MachineConfig '{{ item.item }}' exists"
+  loop: "{{ _mc_exists.results }}"
+
+- name: "[NTP] Check MachineConfigPools are Updated"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get mcp {{ item }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.conditions[?(@.type=="Updated")].status}'
+  register: _mcp_status
+  changed_when: false
+  loop:
+    - master
+    - worker
+
+- name: "[NTP] Assert MachineConfigPools are Updated"
+  ansible.builtin.assert:
+    that: item.stdout == 'True'
+    fail_msg: "MachineConfigPool '{{ item.item }}' is not Updated — nodes may still be rebooting"
+    success_msg: "MachineConfigPool '{{ item.item }}' is Updated"
+  loop: "{{ _mcp_status.results }}"
+
+- name: "[NTP] Read applied chrony.conf from worker MachineConfig"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get machineconfig 99-worker-chrony
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.spec.config.storage.files[0].contents.source}'
+  register: _mc_source
+  changed_when: false
+
+- name: "[NTP] Decode chrony.conf from MachineConfig data URL"
+  ansible.builtin.set_fact:
+    _applied_chrony_conf: >-
+      {{ _mc_source.stdout
+         | regex_replace('^data:[^,]+,', '')
+         | b64decode }}
+
+- name: "[NTP] Verify each inventory NTP server is in the applied config"
+  ansible.builtin.assert:
+    that: item in _applied_chrony_conf
+    fail_msg: "NTP server '{{ item }}' from inventory is NOT in the applied chrony.conf"
+    success_msg: "NTP server '{{ item }}' is present in the applied chrony.conf"
+  loop: "{{ ntp_servers | default([]) }}"
+
+- name: "[NTP] Store applied NTP servers for cross-cluster summary"
+  ansible.builtin.set_fact:
+    verified_ntp_servers: "{{ ntp_servers | default([]) }}"
+    verified_ntp_cluster: "{{ ocp_cluster.name }}"

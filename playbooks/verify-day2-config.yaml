@@ -1,0 +1,159 @@
+---
+# ==============================================================================
+# Day 2 Configuration Verification
+# Checks mirror health, authentication, GroupSync, RBAC, and NTP across
+# hub and spoke clusters. All checks are non-destructive except the
+# GroupSync verification, which creates and immediately deletes a one-off job.
+#
+# Run from playbooks/ directory:
+#   ansible-playbook verify-day2-config.yaml -i inventory.yaml
+#
+# Scope with tags:
+#   --tags mirror    Mirror health and CatalogSource checks (hub only)
+#   --tags auth      LDAP IDP, GroupSync, and RBAC checks
+#   --tags ntp       NTP MachineConfig and MCP checks
+#   --tags hub       Hub cluster only
+#   --tags spokes    Spoke clusters only
+# ==============================================================================
+
+# ==============================================================================
+# MIRROR: Hub only — Quay, CatalogSources, IDMS
+# ==============================================================================
+- name: Verify Mirror Health
+  hosts: hub_cluster
+  connection: local
+  gather_facts: false
+  tags: ['mirror', 'hub']
+  tasks:
+    - name: Set Hub Kubeconfig
+      ansible.builtin.set_fact:
+        hub_kubeconfig: "{{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig"
+
+    - name: Verify mirror registry and catalog health
+      ansible.builtin.include_role:
+        name: ocp/verify_mirror_health
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+
+# ==============================================================================
+# AUTH: Hub
+# ==============================================================================
+- name: Verify Authentication, GroupSync and RBAC (Hub)
+  hosts: hub_cluster
+  connection: local
+  gather_facts: false
+  tags: ['auth', 'hub']
+  tasks:
+    - name: Set Hub Kubeconfig
+      ansible.builtin.set_fact:
+        hub_kubeconfig: "{{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig"
+
+    - name: Verify authentication configuration
+      ansible.builtin.include_role:
+        name: ocp/verify_authentication
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+
+# ==============================================================================
+# AUTH: Spokes
+# ==============================================================================
+- name: Verify Authentication, GroupSync and RBAC (Spokes)
+  hosts: managed_clusters
+  connection: local
+  gather_facts: false
+  tags: ['auth', 'spokes']
+  tasks:
+    - name: Set Spoke Kubeconfig
+      ansible.builtin.set_fact:
+        spoke_kubeconfig: "{{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig"
+
+    - name: Verify authentication configuration
+      ansible.builtin.include_role:
+        name: ocp/verify_authentication
+      vars:
+        target_kubeconfig: "{{ spoke_kubeconfig }}"
+
+# ==============================================================================
+# NTP: Hub
+# ==============================================================================
+- name: Verify NTP Configuration (Hub)
+  hosts: hub_cluster
+  connection: local
+  gather_facts: false
+  tags: ['ntp', 'hub']
+  tasks:
+    - name: Set Hub Kubeconfig
+      ansible.builtin.set_fact:
+        hub_kubeconfig: "{{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig"
+
+    - name: Verify NTP MachineConfig and MCP status
+      ansible.builtin.include_role:
+        name: ocp/verify_ntp
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+
+# ==============================================================================
+# NTP: Spokes
+# ==============================================================================
+- name: Verify NTP Configuration (Spokes)
+  hosts: managed_clusters
+  connection: local
+  gather_facts: false
+  tags: ['ntp', 'spokes']
+  tasks:
+    - name: Set Spoke Kubeconfig
+      ansible.builtin.set_fact:
+        spoke_kubeconfig: "{{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig"
+
+    - name: Verify NTP MachineConfig and MCP status
+      ansible.builtin.include_role:
+        name: ocp/verify_ntp
+      vars:
+        target_kubeconfig: "{{ spoke_kubeconfig }}"
+
+# ==============================================================================
+# SUMMARY: Cross-cluster NTP consistency check + overall pass/fail
+# ==============================================================================
+- name: Verification Summary
+  hosts: hub_cluster
+  connection: local
+  gather_facts: false
+  tags: ['always']
+  tasks:
+    - name: Collect NTP server lists from all clusters
+      ansible.builtin.set_fact:
+        _all_ntp_configs: >-
+          {{
+            groups['hub_cluster'] + (groups['managed_clusters'] | default([]))
+            | map('extract', hostvars, 'verified_ntp_servers')
+            | select('defined')
+            | list
+          }}
+
+    - name: Check NTP server lists are consistent across all clusters
+      ansible.builtin.assert:
+        that: _all_ntp_configs | unique | length <= 1
+        fail_msg: >-
+          NTP server lists differ across clusters — all clusters should use the same ntp_servers.
+          Unique configs found: {{ _all_ntp_configs | unique }}
+        success_msg: "NTP servers are consistent across all clusters"
+      when: _all_ntp_configs | length > 0
+
+    - name: Print verification summary
+      ansible.builtin.debug:
+        msg:
+          - "=================================================================="
+          - "Day 2 Configuration Verification Complete"
+          - "=================================================================="
+          - "Clusters verified:"
+          - "{% for h in groups['hub_cluster'] %}  Hub:   {{ hostvars[h]['ocp_cluster']['name'] }}{% endfor %}"
+          - "{% for h in groups['managed_clusters'] | default([]) %}  Spoke: {{ hostvars[h]['ocp_cluster']['name'] }}{% endfor %}"
+          - ""
+          - "Checks run (per cluster):"
+          - "  [mirror] CatalogSource health, IDMS present, mirror URLs, Quay status"
+          - "  [auth]   LDAP IDP, bind secret, GroupSync CronJob, groups, ClusterRoleBindings"
+          - "  [ntp]    MachineConfig content, MachineConfigPool Updated status"
+          - ""
+          - "If any assertion above failed, it will appear as a FAILED task in the"
+          - "play recap. All checks passed if you see no failures."
+          - "=================================================================="

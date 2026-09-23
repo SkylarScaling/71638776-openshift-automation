@@ -1,0 +1,130 @@
+---
+# --------------------------------------------------------------------------
+# LDAP Identity Provider
+# --------------------------------------------------------------------------
+- name: "[Auth] Check LDAP identity provider is configured"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get oauth cluster
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.spec.identityProviders[?(@.type=="LDAP")].name}'
+  register: _ldap_idp_name
+  changed_when: false
+
+- name: "[Auth] Assert LDAP IDP is present"
+  ansible.builtin.assert:
+    that: _ldap_idp_name.stdout != ""
+    fail_msg: "No LDAP identity provider found in OAuth cluster CR"
+    success_msg: "LDAP IDP '{{ _ldap_idp_name.stdout }}' is configured"
+  when: ldap is defined
+
+- name: "[Auth] Check LDAP bind secret exists"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get secret {{ ldap_bind_secret_name | default('ldap-bind-secret') }}
+    -n openshift-config
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.metadata.name}' 2>/dev/null || true
+  register: _bind_secret
+  changed_when: false
+
+- name: "[Auth] Assert LDAP bind secret exists"
+  ansible.builtin.assert:
+    that: _bind_secret.stdout != ""
+    fail_msg: "LDAP bind secret '{{ ldap_bind_secret_name | default('ldap-bind-secret') }}' not found in openshift-config"
+    success_msg: "LDAP bind secret exists"
+  when: ldap is defined
+
+# --------------------------------------------------------------------------
+# ClusterRoleBindings
+# --------------------------------------------------------------------------
+- name: "[Auth] Check ClusterRoleBindings exist"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get clusterrolebinding
+    {{ item.group | replace(' ', '-') | lower }}-{{ item.cluster_role }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.metadata.name}' 2>/dev/null || true
+  register: _crb_results
+  changed_when: false
+  loop: "{{ rbac_bindings | default([]) }}"
+
+- name: "[Auth] Assert ClusterRoleBindings exist"
+  ansible.builtin.assert:
+    that: item.stdout != ""
+    fail_msg: "ClusterRoleBinding missing: {{ item.item.group }} → {{ item.item.cluster_role }}"
+    success_msg: "ClusterRoleBinding present: {{ item.item.group }} → {{ item.item.cluster_role }}"
+  loop: "{{ _crb_results.results | default([]) }}"
+  when: rbac_bindings | default([]) | length > 0
+
+# --------------------------------------------------------------------------
+# GroupSync — trigger a manual run and verify groups appear in OCP
+# --------------------------------------------------------------------------
+- name: "[Auth] Check GroupSync CronJob exists"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get cronjob ldap-group-sync
+    -n openshift-config
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.metadata.name}' 2>/dev/null || true
+  register: _cronjob_check
+  changed_when: false
+  when: groupsync is defined
+
+- name: "[Auth] Assert GroupSync CronJob exists"
+  ansible.builtin.assert:
+    that: _cronjob_check.stdout == 'ldap-group-sync'
+    fail_msg: "GroupSync CronJob 'ldap-group-sync' not found in openshift-config"
+    success_msg: "GroupSync CronJob exists"
+  when: groupsync is defined
+
+- name: "[Auth] Trigger manual GroupSync job"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc create job ldap-group-sync-verify
+    --from=cronjob/ldap-group-sync
+    -n openshift-config
+    --kubeconfig {{ target_kubeconfig }}
+  register: _sync_job
+  changed_when: true
+  when:
+    - groupsync is defined
+    - _cronjob_check.stdout == 'ldap-group-sync'
+
+- name: "[Auth] Wait for GroupSync job to complete"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get job ldap-group-sync-verify
+    -n openshift-config
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}'
+  register: _job_status
+  until: _job_status.stdout == 'True'
+  retries: 20
+  delay: 15
+  changed_when: false
+  when:
+    - groupsync is defined
+    - _cronjob_check.stdout == 'ldap-group-sync'
+
+- name: "[Auth] Clean up manual GroupSync job"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc delete job ldap-group-sync-verify
+    -n openshift-config
+    --kubeconfig {{ target_kubeconfig }}
+    --ignore-not-found
+  changed_when: true
+  when:
+    - groupsync is defined
+    - _cronjob_check.stdout == 'ldap-group-sync'
+
+- name: "[Auth] Check groups from rbac_bindings exist in OCP"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get group {{ item.group | quote }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.metadata.name}' 2>/dev/null || true
+  register: _group_results
+  changed_when: false
+  loop: "{{ rbac_bindings | default([]) }}"
+
+- name: "[Auth] Assert all RBAC groups exist"
+  ansible.builtin.assert:
+    that: item.stdout != ""
+    fail_msg: "Group '{{ item.item.group }}' not found — check GroupSync logs or LDAP connectivity"
+    success_msg: "Group '{{ item.item.group }}' exists in OCP"
+  loop: "{{ _group_results.results | default([]) }}"
+  when: rbac_bindings | default([]) | length > 0
