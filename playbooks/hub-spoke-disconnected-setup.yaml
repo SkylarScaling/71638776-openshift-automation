@@ -575,3 +575,115 @@
             _summary_lines +
             ['', '==================================================================']
           }}
+
+# ==============================================================================
+# VERIFY: Day 2 Configuration
+# Runs automatically after deployment. Skip with --skip-tags verify.
+# Re-run against an existing environment with --tags verify.
+# ==============================================================================
+- name: Verify Mirror Health
+  hosts: hub_cluster
+  connection: local
+  gather_facts: false
+  tags: ['verify']
+  tasks:
+    - name: Set Hub Kubeconfig
+      ansible.builtin.set_fact:
+        hub_kubeconfig: "{{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig"
+
+    - name: Verify mirror registry and catalog health
+      ansible.builtin.include_role:
+        name: ocp/verify_mirror_health
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+
+- name: Verify Authentication, GroupSync and RBAC (Hub)
+  hosts: hub_cluster
+  connection: local
+  gather_facts: false
+  tags: ['verify']
+  tasks:
+    - name: Set Hub Kubeconfig
+      ansible.builtin.set_fact:
+        hub_kubeconfig: "{{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig"
+
+    - name: Verify authentication configuration
+      ansible.builtin.include_role:
+        name: ocp/verify_authentication
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+
+- name: Verify Authentication, GroupSync and RBAC (Spokes)
+  hosts: managed_clusters
+  connection: local
+  gather_facts: false
+  tags: ['verify']
+  tasks:
+    - name: Set Spoke Kubeconfig
+      ansible.builtin.set_fact:
+        spoke_kubeconfig: "{{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig"
+
+    - name: Verify authentication configuration
+      ansible.builtin.include_role:
+        name: ocp/verify_authentication
+      vars:
+        target_kubeconfig: "{{ spoke_kubeconfig }}"
+
+- name: Verify NTP Configuration (Hub)
+  hosts: hub_cluster
+  connection: local
+  gather_facts: false
+  tags: ['verify']
+  tasks:
+    - name: Set Hub Kubeconfig
+      ansible.builtin.set_fact:
+        hub_kubeconfig: "{{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig"
+
+    - name: Verify NTP MachineConfig and MCP status
+      ansible.builtin.include_role:
+        name: ocp/verify_ntp
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+
+- name: Verify NTP Configuration (Spokes)
+  hosts: managed_clusters
+  connection: local
+  gather_facts: false
+  tags: ['verify']
+  tasks:
+    - name: Set Spoke Kubeconfig
+      ansible.builtin.set_fact:
+        spoke_kubeconfig: "{{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig"
+
+    - name: Verify NTP MachineConfig and MCP status
+      ansible.builtin.include_role:
+        name: ocp/verify_ntp
+      vars:
+        target_kubeconfig: "{{ spoke_kubeconfig }}"
+
+- name: Verification Summary
+  hosts: hub_cluster
+  connection: local
+  gather_facts: false
+  tags: ['verify']
+  tasks:
+    - name: Check NTP server lists are consistent across all clusters
+      ansible.builtin.assert:
+        that: >-
+          {{
+            groups['hub_cluster'] + (groups['managed_clusters'] | default([]))
+            | map('extract', hostvars, 'verified_ntp_servers')
+            | select('defined') | list | unique | length <= 1
+          }}
+        fail_msg: "NTP server lists differ across clusters — all clusters must use the same ntp_servers"
+        success_msg: "NTP servers are consistent across all clusters"
+
+    - name: Print verification summary
+      ansible.builtin.debug:
+        msg:
+          - "=================================================================="
+          - "Day 2 Verification Complete — all checks passed"
+          - "  Mirror:  CatalogSources READY, IDMS present, Quay available"
+          - "  Auth:    LDAP IDP configured, GroupSync running, groups/RBAC present"
+          - "  NTP:     MachineConfigs applied, MCPs Updated, servers consistent"
+          - "=================================================================="
