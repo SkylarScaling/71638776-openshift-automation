@@ -406,6 +406,8 @@ all:
     ocp_patch_version: "13"
     force_update: true
     base_domain: "example.com"
+    automation_repo_branch: "main"        # branch of 71638776-openshift-automation to clone on jumphost
+    jumphost_private_ip: ""               # set after running install-ldap-server.yaml
     ssh_key: "{{ lookup('file', '~/.ssh/id_ed25519.pub') }}"
     pull_secret: "{{ lookup('file', '~/pull-secret.json') | from_json }}"
     aws:
