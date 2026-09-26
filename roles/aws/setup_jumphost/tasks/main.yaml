@@ -133,3 +133,28 @@
   loop:
     - /tmp/awscliv2.zip
     - /tmp/aws
+
+# ==============================================================================
+# SSH SERVER KEEPALIVE
+# The mirror registry install and oc-mirror runs can take 60+ minutes.
+# Configure sshd to send keepalive packets so AWS NAT Gateway (350s idle
+# timeout) does not drop the terminal session mid-playbook.
+# ClientAliveInterval=60  → server pings client every 60 seconds
+# ClientAliveCountMax=30  → drop connection only after 30 missed pings (30 min)
+# ==============================================================================
+- name: Configure sshd keepalive to prevent idle connection drops
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: "^#?{{ item.key }}\\b"
+    line: "{{ item.key }} {{ item.value }}"
+    state: present
+  loop:
+    - { key: "ClientAliveInterval", value: "60" }
+    - { key: "ClientAliveCountMax", value: "30" }
+  become: true
+
+- name: Reload sshd to apply keepalive settings
+  ansible.builtin.service:
+    name: sshd
+    state: reloaded
+  become: true
