@@ -13,6 +13,7 @@
       - tar
       - wget
       - jq
+      - tmux
     state: present
   become: true
 
