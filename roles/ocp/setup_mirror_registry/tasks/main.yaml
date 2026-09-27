@@ -24,6 +24,19 @@
   register: _quay_config_stat
   when: registry_health.status | default(0) not in [200, 301]
 
+# Ensure Quay's SERVER_HOSTNAME matches the current inventory value.
+# A previous run with a malformed hostname (e.g. ec2-user@host) writes the
+# bad value into config.yaml. Quay rejects non-hostname SERVER_HOSTNAME and
+# exits immediately, causing Connection reset by peer on the health check.
+- name: Ensure Quay SERVER_HOSTNAME in config.yaml matches inventory
+  ansible.builtin.lineinfile:
+    path: "{{ mirror_registry_dir }}/quay-config/config.yaml"
+    regexp: "^SERVER_HOSTNAME:"
+    line: "SERVER_HOSTNAME: {{ mirror_registry_hostname }}"
+  when:
+    - registry_health.status | default(0) not in [200, 301]
+    - _quay_config_stat.stat is defined and _quay_config_stat.stat.exists
+
 - name: Start existing mirror registry installation (stopped after host restart)
   ansible.builtin.command: >
     {{ bin_dir }}/mirror-registry start
