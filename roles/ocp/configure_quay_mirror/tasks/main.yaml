@@ -116,6 +116,17 @@
   when: _quay_config_patch is changed
   changed_when: false
 
+# After FEATURE_EXTENDED_REPOSITORY_NAMES is confirmed live, allow Quay time
+# to fully propagate CREATE_PRIVATE_REPO_ON_PUSH through its internal
+# subsystems. Without this pause, oc-mirror starts immediately and its first
+# attempt to push the catalog index fails silently (rc=0, no CatalogSource
+# generated) because Quay cannot yet auto-create the repository.
+- name: Allow Quay to fully stabilise after config change before oc-mirror starts
+  ansible.builtin.pause:
+    seconds: 60
+    prompt: "Waiting 60s for Quay to fully apply CREATE_PRIVATE_REPO_ON_PUSH..."
+  when: _quay_config_patch is changed
+
 - name: Get Quay app pod name
   ansible.builtin.shell: >
     {{ bin_dir }}/oc get pod -n {{ quay_mirror_namespace }}
