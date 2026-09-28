@@ -247,6 +247,21 @@
     - "'InvalidPermission.Duplicate' not in registry_rule.stderr"
   changed_when: registry_rule.rc == 0
 
+- name: Add LDAP inbound rule to security group (cluster nodes reach 389 DS via public IP)
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 authorize-security-group-ingress
+    --group-id {{ _jumphost_sg_id }}
+    --protocol tcp
+    --port {{ jumphost_ldap_port }}
+    --cidr 0.0.0.0/0
+    --region {{ jumphost_aws_region }}
+  environment: "{{ _aws_env }}"
+  register: ldap_rule
+  failed_when:
+    - ldap_rule.rc != 0
+    - "'InvalidPermission.Duplicate' not in ldap_rule.stderr"
+  changed_when: ldap_rule.rc == 0
+
 # ==============================================================================
 # AMI — Latest RHEL 9
 # ==============================================================================
