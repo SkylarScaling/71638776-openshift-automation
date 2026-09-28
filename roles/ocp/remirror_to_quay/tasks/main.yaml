@@ -323,15 +323,59 @@
     file_type: file
   register: _quay_cs_files
 
-- name: Fail if oc-mirror did not generate CatalogSource manifests
-  ansible.builtin.fail:
-    msg: >-
-      oc-mirror did not generate any CatalogSource manifests in
-      {{ quay_mirror_workspace }}/working-dir/cluster-resources/.
-      The operator catalog index image was not successfully pushed to Quay.
-      Verify CREATE_PRIVATE_REPO_ON_PUSH is enabled, then delete the stale
-      workspace and re-run: rm -rf {{ quay_mirror_workspace }}/working-dir
+# If CatalogSource is still missing after the regen run it means oc-mirror
+# failed to push the catalog index image itself (not just individual images).
+# The workspace state is stale — a completely fresh run is needed. Wipe
+# working-dir and run oc-mirror once more before giving up.
+- name: Wipe stale workspace and retry oc-mirror (catalog index push failed)
   when: _quay_cs_files.files | length == 0
+  block:
+    - name: Wipe Quay oc-mirror working-dir for clean retry
+      ansible.builtin.file:
+        state: absent
+        path: "{{ quay_mirror_workspace }}/working-dir"
+
+    - name: Run oc-mirror to Quay (clean retry — catalog index push failed on first attempt)
+      ansible.builtin.command: >
+        {{ bin_dir }}/oc-mirror
+        --v2
+        --config {{ quay_mirror_workspace }}/imageset-config.yaml
+        --workspace file://{{ quay_mirror_workspace }}
+        docker://{{ quay_registry_url }}/{{ quay_mirror_org }}
+      environment:
+        XDG_RUNTIME_DIR: "{{ quay_mirror_workspace }}"
+      args:
+        chdir: "{{ quay_mirror_workspace }}"
+      async: 7200
+      poll: 0
+      register: _quay_retry_job
+
+    - name: Wait for clean retry oc-mirror to complete (up to 2 hours)
+      ansible.builtin.async_status:
+        jid: "{{ _quay_retry_job.ansible_job_id }}"
+      register: _quay_retry_result
+      until: _quay_retry_result.finished
+      retries: 240
+      delay: 30
+      failed_when:
+        - _quay_retry_result.finished
+        - _quay_retry_result.rc not in [0, 4, 12, 14]
+
+    - name: Find CatalogSource files after clean retry
+      ansible.builtin.find:
+        paths: "{{ quay_mirror_workspace }}/working-dir/cluster-resources"
+        patterns: "cs-*.yaml"
+        file_type: file
+      register: _quay_cs_files
+
+    - name: Fail if CatalogSource still missing after clean retry
+      ansible.builtin.fail:
+        msg: >-
+          oc-mirror still did not generate CatalogSource manifests after a
+          clean workspace retry. Check oc-mirror logs at
+          {{ quay_mirror_workspace }}/working-dir/logs/ and verify
+          CREATE_PRIVATE_REPO_ON_PUSH is enabled on the Quay instance.
+      when: _quay_cs_files.files | length == 0
 
 - name: Read Quay IDMS manifests
   ansible.builtin.slurp:
