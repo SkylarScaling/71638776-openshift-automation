@@ -103,7 +103,7 @@
     fi
   register: _job_status
   until: _job_status.stdout in ['COMPLETE', 'FAILED']
-  retries: 20
+  retries: 40
   delay: 15
   changed_when: false
   when:
