@@ -74,6 +74,17 @@
     success_msg: "GroupSync CronJob exists"
   when: groupsync is defined
 
+- name: "[Auth] Delete any previous GroupSync verify job"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc delete job ldap-group-sync-verify
+    -n openshift-config
+    --kubeconfig {{ target_kubeconfig }}
+    --ignore-not-found
+  changed_when: true
+  when:
+    - groupsync is defined
+    - _cronjob_check.stdout == 'ldap-group-sync'
+
 - name: "[Auth] Trigger manual GroupSync job"
   ansible.builtin.shell: >
     {{ bin_dir }}/oc create job ldap-group-sync-verify
