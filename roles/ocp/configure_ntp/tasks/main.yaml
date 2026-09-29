@@ -70,7 +70,7 @@
   ansible.builtin.shell: >
     {{ bin_dir }}/oc wait mcp master
     --for=condition=Updated=True
-    --timeout=600s
+    --timeout=1800s
     --kubeconfig {{ target_kubeconfig }}
   changed_when: false
 
@@ -78,6 +78,6 @@
   ansible.builtin.shell: >
     {{ bin_dir }}/oc wait mcp worker
     --for=condition=Updated=True
-    --timeout=600s
+    --timeout=2700s
     --kubeconfig {{ target_kubeconfig }}
   changed_when: false
