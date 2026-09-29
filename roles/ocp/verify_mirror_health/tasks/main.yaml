@@ -41,7 +41,11 @@
     fail_msg: "No ImageDigestMirrorSet found — mirror redirect is not configured"
     success_msg: "IDMS found: {{ _idms_names.stdout }}"
 
-- name: "[Mirror] Check CatalogSources reference the local mirror registry"
+# After the Quay migration the CatalogSource images point to the in-cluster
+# Quay route, not the jumphost mirror. Both are valid local mirrors.
+# Check that CatalogSources do NOT reference upstream public registries
+# (registry.redhat.io, quay.io, etc.) rather than requiring a specific host.
+- name: "[Mirror] Check CatalogSource images"
   ansible.builtin.shell: >
     {{ bin_dir }}/oc get catalogsource -n openshift-marketplace
     --kubeconfig {{ target_kubeconfig }}
@@ -49,23 +53,22 @@
   register: _cs_images
   changed_when: false
 
-- name: "[Mirror] Identify CatalogSources pointing outside the mirror"
+- name: "[Mirror] Identify CatalogSources pointing at upstream public registries"
   ansible.builtin.set_fact:
     _cs_external: >-
       {{ _cs_images.stdout_lines
-         | reject('match', '.*' + (disconnected.mirror_registry.hostname | default('')) + '.*')
+         | select('match', '.*\t(registry\.redhat\.io|quay\.io|registry\.access\.redhat\.com)/.*')
          | reject('match', '^\\s*$')
          | list }}
 
-- name: "[Mirror] Assert all CatalogSources use the local mirror"
+- name: "[Mirror] Assert no CatalogSources use upstream public registries"
   ansible.builtin.assert:
     that: _cs_external | length == 0
     fail_msg: |
-      These CatalogSources are NOT pointing at the local mirror registry:
+      These CatalogSources reference upstream public registries (not the local mirror):
       {% for cs in _cs_external %}  {{ cs }}
       {% endfor %}
-    success_msg: "All CatalogSources reference the local mirror registry"
-  when: disconnected.mirror_registry.hostname is defined
+    success_msg: "All CatalogSources reference the local mirror (jumphost or Quay)"
 
 - name: "[Mirror] Check Quay registry is Available"
   ansible.builtin.shell: >
