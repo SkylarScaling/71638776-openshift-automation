@@ -87,19 +87,44 @@
     - _cronjob_check.stdout == 'ldap-group-sync'
 
 - name: "[Auth] Wait for GroupSync job to complete"
-  ansible.builtin.shell: >
-    {{ bin_dir }}/oc get job ldap-group-sync-verify
-    -n openshift-config
-    --kubeconfig {{ target_kubeconfig }}
-    -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}'
+  ansible.builtin.shell: |
+    STATUS=$({{ bin_dir }}/oc get job ldap-group-sync-verify \
+      -n openshift-config \
+      --kubeconfig {{ target_kubeconfig }} \
+      -o jsonpath='{.status.conditions[?(@.type=="Complete")].status} {.status.conditions[?(@.type=="Failed")].status}' \
+      2>/dev/null || true)
+    if echo "$STATUS" | grep -q "True"; then
+      if echo "$STATUS" | grep -qE "^True|True$"; then
+        echo "COMPLETE"
+      fi
+    fi
+    if {{ bin_dir }}/oc get job ldap-group-sync-verify \
+        -n openshift-config \
+        --kubeconfig {{ target_kubeconfig }} \
+        -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' \
+        2>/dev/null | grep -q "True"; then
+      echo "FAILED"
+    fi
   register: _job_status
-  until: _job_status.stdout == 'True'
+  until: _job_status.stdout in ['COMPLETE', 'FAILED']
   retries: 20
   delay: 15
   changed_when: false
   when:
     - groupsync is defined
     - _cronjob_check.stdout == 'ldap-group-sync'
+
+- name: "[Auth] Fail if GroupSync job failed"
+  ansible.builtin.fail:
+    msg: >-
+      GroupSync job failed. Check that the ldap_url in groupsync uses the
+      jumphost's public hostname (not private IP) — cluster nodes are in a
+      separate VPC and cannot reach the private IP. Use
+      disconnected.mirror_registry.hostname as the LDAP host.
+  when:
+    - groupsync is defined
+    - _cronjob_check.stdout == 'ldap-group-sync'
+    - _job_status.stdout == 'FAILED'
 
 - name: "[Auth] Clean up manual GroupSync job"
   ansible.builtin.shell: >
