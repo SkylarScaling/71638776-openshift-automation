@@ -1,10 +1,16 @@
 ---
-- name: "[Mirror] Check all CatalogSources are READY"
+# After a mirror migration, OLM restarts catalog pods to reconnect to the
+# new registry. TRANSIENT_FAILURE is expected immediately after the IDMS
+# update and typically resolves within a few minutes. Poll with retries.
+- name: "[Mirror] Wait for all CatalogSources to be READY"
   ansible.builtin.shell: >
     {{ bin_dir }}/oc get catalogsource -n openshift-marketplace
     --kubeconfig {{ target_kubeconfig }}
     -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.connectionState.lastObservedState}{"\n"}{end}'
   register: _cs_raw
+  until: _cs_raw.stdout_lines | reject('match', '^.*\\tREADY$') | list | length == 0
+  retries: 20
+  delay: 30
   changed_when: false
 
 - name: "[Mirror] Identify degraded CatalogSources"
@@ -16,7 +22,7 @@
   ansible.builtin.assert:
     that: _cs_degraded | length == 0
     fail_msg: |
-      Degraded CatalogSources:
+      Degraded CatalogSources after 10 minutes:
       {% for cs in _cs_degraded %}  {{ cs }}
       {% endfor %}
     success_msg: "All {{ _cs_all | length }} CatalogSources are READY"
