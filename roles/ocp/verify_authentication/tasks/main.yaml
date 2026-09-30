@@ -121,6 +121,24 @@
 # Create the verify job directly as YAML rather than --from=cronjob so we
 # can set restartPolicy: Never (pod stays in Failed state for log inspection)
 # and backoffLimit: 0 (fail immediately, don't retry into oblivion).
+- name: "[Auth] Resolve LDAP hostname for hostAlias (disconnected clusters lack external DNS)"
+  ansible.builtin.shell: |
+    python3 -c "
+    import socket, re
+    url = '{{ groupsync.ldap_url | default('') }}'
+    host = re.sub(r'^ldaps?://', '', url).split(':')[0]
+    try:
+        print(socket.gethostbyname(host) + ' ' + host)
+    except:
+        print('')
+    "
+  register: _verify_host_alias
+  changed_when: false
+  failed_when: false
+  when:
+    - groupsync is defined
+    - not _groups_present | bool
+
 - name: "[Auth] Trigger manual GroupSync job (groups missing)"
   ansible.builtin.shell:
     cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
@@ -138,6 +156,12 @@
           spec:
             restartPolicy: Never
             serviceAccountName: {{ groupsync_serviceaccount | default('ldap-group-syncer') }}
+            {% if (_verify_host_alias.stdout | default('')) != '' %}
+            hostAliases:
+              - ip: "{{ _verify_host_alias.stdout.split()[0] }}"
+                hostnames:
+                  - "{{ _verify_host_alias.stdout.split()[1] }}"
+            {% endif %}
             containers:
               - name: ldap-group-sync
                 image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest

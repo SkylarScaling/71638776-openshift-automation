@@ -8,6 +8,31 @@
       - groupsync.users_base_dn is defined and groupsync.users_base_dn != ""
     fail_msg: "groupsync.ldap_url, bind_dn, groups_base_dn, and users_base_dn must all be defined"
 
+# In disconnected OCP clusters, CoreDNS cannot resolve external hostnames.
+# Resolve the LDAP hostname to an IP HERE (on the Ansible controller, which
+# has internet DNS access) and inject it as a hostAlias in the CronJob pod
+# spec so the pod bypasses DNS and connects directly by IP.
+- name: Extract LDAP hostname from ldap_url
+  ansible.builtin.set_fact:
+    _ldap_host: "{{ groupsync.ldap_url | regex_replace('^ldaps?://([^:/]+).*', '\\1') }}"
+
+- name: Resolve LDAP hostname to IP (on Ansible controller with DNS access)
+  ansible.builtin.shell: |
+    python3 -c "
+    import socket
+    try:
+        print(socket.gethostbyname('{{ _ldap_host }}'))
+    except Exception as e:
+        print('')
+    "
+  register: _ldap_resolved_ip
+  changed_when: false
+  failed_when: false
+
+- name: Set LDAP host IP fact
+  ansible.builtin.set_fact:
+    _ldap_host_ip: "{{ _ldap_resolved_ip.stdout | trim }}"
+
 - name: Create ServiceAccount for LDAP group sync
   ansible.builtin.shell:
     cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
