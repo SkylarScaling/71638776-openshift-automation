@@ -144,7 +144,7 @@
   register: _pull_secret_apply
   changed_when: true
   no_log: true
-  when: _pull_secret_check.stdout | trim == "missing"
+  when: (_pull_secret_check.stdout | default('present') | trim) == "missing"
 
 - name: Wait for MachineConfigPool updates to begin rolling out
   ansible.builtin.debug:
@@ -152,7 +152,7 @@
       Disconnected cluster configuration applied. Node MachineConfigPools
       will begin rolling out with the updated mirror configuration.
       This may take 10-30 minutes as nodes are rebooted.
-  when: _pull_secret_check.stdout | trim == "missing"
+  when: (_pull_secret_check.stdout | default('present') | trim) == "missing"
 
 # Wait for MCO to detect and begin the rolling update before checking
 # completion. Without this pre-wait, the existing Updated=True condition
@@ -169,7 +169,7 @@
   delay: 15
   changed_when: false
   failed_when: false
-  when: _pull_secret_check.stdout | trim == "missing"
+  when: (_pull_secret_check.stdout | default('present') | trim) == "missing"
 
 - name: Wait for master MachineConfigPool to finish updating
   ansible.builtin.shell: >
@@ -193,7 +193,7 @@
   delay: 15
   changed_when: false
   failed_when: false
-  when: _pull_secret_check.stdout | trim == "missing"
+  when: (_pull_secret_check.stdout | default('present') | trim) == "missing"
 
 - name: Wait for worker MachineConfigPool to finish updating
   ansible.builtin.shell: >
