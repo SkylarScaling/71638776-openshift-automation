@@ -97,6 +97,18 @@
     - groupsync is defined
     - _cronjob_check.stdout == 'ldap-group-sync'
 
+- name: "[Auth] Constrain verify job to fail fast (backoffLimit=1, 3 min deadline)"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc patch job ldap-group-sync-verify
+    -n openshift-config
+    --kubeconfig {{ target_kubeconfig }}
+    --type=merge
+    -p '{"spec":{"backoffLimit":1,"activeDeadlineSeconds":180}}'
+  changed_when: true
+  when:
+    - groupsync is defined
+    - _cronjob_check.stdout == 'ldap-group-sync'
+
 - name: "[Auth] Wait for GroupSync job to complete"
   ansible.builtin.shell: |
     COMPLETE=$({{ bin_dir }}/oc get job ldap-group-sync-verify \
