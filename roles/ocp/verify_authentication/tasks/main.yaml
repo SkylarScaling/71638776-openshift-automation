@@ -133,13 +133,31 @@
     - groupsync is defined
     - _cronjob_check.stdout == 'ldap-group-sync'
 
+- name: "[Auth] Get GroupSync job pod logs for diagnosis"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc logs
+    -n openshift-config
+    --kubeconfig {{ target_kubeconfig }}
+    -l job-name=ldap-group-sync-verify
+    --tail=30 2>/dev/null || echo "(no pod logs available)"
+  register: _sync_job_logs
+  changed_when: false
+  failed_when: false
+  when:
+    - groupsync is defined
+    - _cronjob_check.stdout == 'ldap-group-sync'
+    - _job_status.stdout == 'FAILED'
+
 - name: "[Auth] Fail if GroupSync job failed"
   ansible.builtin.fail:
-    msg: >-
-      GroupSync job failed. Check that the ldap_url in groupsync uses the
-      jumphost's public hostname (not private IP) — cluster nodes are in a
-      separate VPC and cannot reach the private IP. Use
-      disconnected.mirror_registry.hostname as the LDAP host.
+    msg: |
+      GroupSync job failed. Pod logs:
+      {{ _sync_job_logs.stdout | default('(not available)') }}
+
+      Common causes:
+      - 389 DS not running on the jumphost (run install-ldap-server.yaml first)
+      - ldap_url uses private IP — use disconnected.mirror_registry.hostname
+      - Port 389 not open in EC2 security group
   when:
     - groupsync is defined
     - _cronjob_check.stdout == 'ldap-group-sync'
