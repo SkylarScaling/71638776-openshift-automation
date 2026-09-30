@@ -55,7 +55,8 @@
   when: rbac_bindings | default([]) | length > 0
 
 # --------------------------------------------------------------------------
-# GroupSync — trigger a manual run and verify groups appear in OCP
+# GroupSync — check groups first. The CronJob may have already synced them
+# on its schedule. Only trigger a manual job if groups are missing.
 # --------------------------------------------------------------------------
 - name: "[Auth] Check GroupSync CronJob exists"
   ansible.builtin.shell: >
@@ -74,6 +75,37 @@
     success_msg: "GroupSync CronJob exists"
   when: groupsync is defined
 
+- name: "[Auth] Check groups from rbac_bindings exist in OCP"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get group {{ item.group | quote }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.metadata.name}' 2>/dev/null || true
+  register: _group_results
+  changed_when: false
+  loop: "{{ rbac_bindings | default([]) }}"
+
+- name: "[Auth] Set groups_present fact"
+  ansible.builtin.set_fact:
+    _groups_present: >-
+      {{ _group_results.results | default([]) | selectattr('stdout', '!=', '') | list | length
+         == (rbac_bindings | default([]) | length) }}
+
+# If groups already exist (synced by the CronJob on its schedule), skip
+# the manual job test entirely — the CronJob is working.
+- name: "[Auth] Assert all RBAC groups exist (primary check)"
+  ansible.builtin.assert:
+    that: item.stdout != ""
+    fail_msg: "Group '{{ item.item.group }}' not found — GroupSync may not have run yet"
+    success_msg: "Group '{{ item.item.group }}' exists in OCP"
+  loop: "{{ _group_results.results | default([]) }}"
+  when:
+    - rbac_bindings | default([]) | length > 0
+    - _groups_present | bool
+
+# --------------------------------------------------------------------------
+# Manual job — only triggered when groups are missing, as a diagnostic
+# to confirm GroupSync can actually run and sync groups.
+# --------------------------------------------------------------------------
 - name: "[Auth] Delete any previous GroupSync verify job"
   ansible.builtin.shell: >
     {{ bin_dir }}/oc delete job ldap-group-sync-verify
@@ -84,8 +116,9 @@
   when:
     - groupsync is defined
     - _cronjob_check.stdout == 'ldap-group-sync'
+    - not _groups_present | bool
 
-- name: "[Auth] Trigger manual GroupSync job"
+- name: "[Auth] Trigger manual GroupSync job (groups missing)"
   ansible.builtin.shell: >
     {{ bin_dir }}/oc create job ldap-group-sync-verify
     --from=cronjob/ldap-group-sync
@@ -96,6 +129,7 @@
   when:
     - groupsync is defined
     - _cronjob_check.stdout == 'ldap-group-sync'
+    - not _groups_present | bool
 
 - name: "[Auth] Constrain verify job to fail fast (backoffLimit=1, 3 min deadline)"
   ansible.builtin.shell: >
@@ -108,6 +142,7 @@
   when:
     - groupsync is defined
     - _cronjob_check.stdout == 'ldap-group-sync'
+    - not _groups_present | bool
 
 - name: "[Auth] Wait for GroupSync job to complete"
   ansible.builtin.shell: |
@@ -132,20 +167,30 @@
   when:
     - groupsync is defined
     - _cronjob_check.stdout == 'ldap-group-sync'
+    - not _groups_present | bool
 
 - name: "[Auth] Get GroupSync job pod logs for diagnosis"
-  ansible.builtin.shell: >
-    {{ bin_dir }}/oc logs
-    -n openshift-config
-    --kubeconfig {{ target_kubeconfig }}
-    -l job-name=ldap-group-sync-verify
-    --tail=30 2>/dev/null || echo "(no pod logs available)"
+  ansible.builtin.shell: |
+    POD=$({{ bin_dir }}/oc get pods -n openshift-config \
+      --kubeconfig {{ target_kubeconfig }} \
+      -l job-name=ldap-group-sync-verify \
+      -o jsonpath='{.items[-1].metadata.name}' 2>/dev/null || true)
+    if [ -n "$POD" ]; then
+      {{ bin_dir }}/oc logs -n openshift-config \
+        --kubeconfig {{ target_kubeconfig }} "$POD" --previous 2>/dev/null || \
+      {{ bin_dir }}/oc logs -n openshift-config \
+        --kubeconfig {{ target_kubeconfig }} "$POD" 2>/dev/null || \
+      echo "(no logs for pod $POD)"
+    else
+      echo "(no pods found for job)"
+    fi
   register: _sync_job_logs
   changed_when: false
   failed_when: false
   when:
     - groupsync is defined
     - _cronjob_check.stdout == 'ldap-group-sync'
+    - not _groups_present | bool
     - _job_status.stdout == 'FAILED'
 
 - name: "[Auth] Fail if GroupSync job failed"
@@ -158,10 +203,35 @@
       - 389 DS not running on the jumphost (run install-ldap-server.yaml first)
       - ldap_url uses private IP — use disconnected.mirror_registry.hostname
       - Port 389 not open in EC2 security group
+      - Service account lacks read ACI in 389 DS (re-run install-ldap-server.yaml --tags testdata)
   when:
     - groupsync is defined
     - _cronjob_check.stdout == 'ldap-group-sync'
+    - not _groups_present | bool
+    - _job_status.stdout is defined
     - _job_status.stdout == 'FAILED'
+
+- name: "[Auth] Re-check groups after manual sync"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get group {{ item.group | quote }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.metadata.name}' 2>/dev/null || true
+  register: _group_recheck
+  changed_when: false
+  loop: "{{ rbac_bindings | default([]) }}"
+  when:
+    - rbac_bindings | default([]) | length > 0
+    - not _groups_present | bool
+
+- name: "[Auth] Assert all RBAC groups exist (after manual sync)"
+  ansible.builtin.assert:
+    that: item.stdout != ""
+    fail_msg: "Group '{{ item.item.group }}' still not found after manual GroupSync"
+    success_msg: "Group '{{ item.item.group }}' exists in OCP"
+  loop: "{{ _group_recheck.results | default([]) }}"
+  when:
+    - rbac_bindings | default([]) | length > 0
+    - not _groups_present | bool
 
 - name: "[Auth] Clean up manual GroupSync job"
   ansible.builtin.shell: >
@@ -173,20 +243,4 @@
   when:
     - groupsync is defined
     - _cronjob_check.stdout == 'ldap-group-sync'
-
-- name: "[Auth] Check groups from rbac_bindings exist in OCP"
-  ansible.builtin.shell: >
-    {{ bin_dir }}/oc get group {{ item.group | quote }}
-    --kubeconfig {{ target_kubeconfig }}
-    -o jsonpath='{.metadata.name}' 2>/dev/null || true
-  register: _group_results
-  changed_when: false
-  loop: "{{ rbac_bindings | default([]) }}"
-
-- name: "[Auth] Assert all RBAC groups exist"
-  ansible.builtin.assert:
-    that: item.stdout != ""
-    fail_msg: "Group '{{ item.item.group }}' not found — check GroupSync logs or LDAP connectivity"
-    success_msg: "Group '{{ item.item.group }}' exists in OCP"
-  loop: "{{ _group_results.results | default([]) }}"
-  when: rbac_bindings | default([]) | length > 0
+    - not _groups_present | bool
