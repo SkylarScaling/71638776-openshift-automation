@@ -121,66 +121,14 @@
 # Create the verify job directly as YAML rather than --from=cronjob so we
 # can set restartPolicy: Never (pod stays in Failed state for log inspection)
 # and backoffLimit: 0 (fail immediately, don't retry into oblivion).
-- name: "[Auth] Resolve LDAP hostname for hostAlias (disconnected clusters lack external DNS)"
-  ansible.builtin.shell: |
-    python3 -c "
-    import socket, re
-    url = '{{ groupsync.ldap_url | default('') }}'
-    host = re.sub(r'^ldaps?://', '', url).split(':')[0]
-    try:
-        print(socket.gethostbyname(host) + ' ' + host)
-    except:
-        print('')
-    "
-  register: _verify_host_alias
-  changed_when: false
-  failed_when: false
-  when:
-    - groupsync is defined
-    - not _groups_present | bool
-
+# Create the verify job from the CronJob template so it inherits the
+# hostAliases that configure_ldap_group_sync added for disconnected DNS.
 - name: "[Auth] Trigger manual GroupSync job (groups missing)"
-  ansible.builtin.shell:
-    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
-    stdin: |
-      apiVersion: batch/v1
-      kind: Job
-      metadata:
-        name: ldap-group-sync-verify
-        namespace: openshift-config
-      spec:
-        backoffLimit: 0
-        activeDeadlineSeconds: 300
-        ttlSecondsAfterFinished: 600
-        template:
-          spec:
-            restartPolicy: Never
-            serviceAccountName: {{ groupsync_serviceaccount | default('ldap-group-syncer') }}
-            {% if (_verify_host_alias.stdout | default('')) != '' %}
-            hostAliases:
-              - ip: "{{ _verify_host_alias.stdout.split()[0] }}"
-                hostnames:
-                  - "{{ _verify_host_alias.stdout.split()[1] }}"
-            {% endif %}
-            containers:
-              - name: ldap-group-sync
-                image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
-                command:
-                  - /bin/bash
-                  - -c
-                  - oc adm groups sync --sync-config=/etc/config/sync.yaml --confirm
-                volumeMounts:
-                  - name: sync-config
-                    mountPath: /etc/config
-                  - name: bind-password
-                    mountPath: /etc/secrets
-            volumes:
-              - name: sync-config
-                configMap:
-                  name: {{ groupsync_configmap | default('ldap-group-sync-config') }}
-              - name: bind-password
-                secret:
-                  secretName: {{ groupsync_secret | default('ldap-group-sync-bind') }}
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc create job ldap-group-sync-verify
+    --from=cronjob/ldap-group-sync
+    -n openshift-config
+    --kubeconfig {{ target_kubeconfig }}
   register: _sync_job
   changed_when: true
   when:
