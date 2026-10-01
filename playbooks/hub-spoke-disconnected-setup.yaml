@@ -671,7 +671,7 @@
       ansible.builtin.assert:
         that: >-
           {{
-            groups['hub_cluster'] + (groups['managed_clusters'] | default([]))
+            (groups['hub_cluster'] + (groups['managed_clusters'] | default([])))
             | map('extract', hostvars, 'verified_ntp_servers')
             | select('defined') | list | unique | length <= 1
           }}
