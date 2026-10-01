@@ -21,4 +21,4 @@ spec:
           name: "{{ ldap_ca_configmap_name }}"
 {% endif %}
         insecure: {{ ldap.insecure | default(false) | bool | lower }}
-        url: "{{ ldap.url }}"
+        url: "{{ _ldap_url_for_cluster | default(ldap.url) }}"

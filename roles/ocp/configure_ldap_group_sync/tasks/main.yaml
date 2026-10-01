@@ -44,6 +44,16 @@
   ansible.builtin.set_fact:
     _ldap_host_ip: "{{ _ldap_resolved_ip.stdout | trim }}"
 
+# Build cluster-facing LDAP URL with IP instead of hostname so cluster pods
+# connect directly without DNS (disconnected clusters often can't resolve
+# external hostnames via CoreDNS).
+- name: Set cluster-facing LDAP URL (IP instead of hostname)
+  ansible.builtin.set_fact:
+    _ldap_url_for_cluster: >-
+      {{ groupsync.ldap_url | replace(_ldap_host, _ldap_host_ip)
+         if _ldap_host_ip | default('') != ''
+         else groupsync.ldap_url }}
+
 - name: Create ServiceAccount for LDAP group sync
   ansible.builtin.shell:
     cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
