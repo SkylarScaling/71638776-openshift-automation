@@ -16,14 +16,25 @@
   ansible.builtin.set_fact:
     _ldap_host: "{{ groupsync.ldap_url | regex_replace('^ldaps?://([^:/]+).*', '\\1') }}"
 
-- name: Resolve LDAP hostname to IP (on Ansible controller with DNS access)
+# On AWS jumphost, socket.gethostbyname() returns the PRIVATE IP because
+# AWS internal DNS resolves EC2 public hostnames to private IPs within the VPC.
+# The cluster nodes are in a DIFFERENT VPC and cannot reach the private IP.
+# Extract the PUBLIC IP directly from the EC2 hostname format:
+#   ec2-18-222-106-115.us-east-2.compute.amazonaws.com → 18.222.106.115
+# Fall back to DNS lookup for non-EC2 hostnames.
+- name: Resolve LDAP hostname to PUBLIC IP
   ansible.builtin.shell: |
     python3 -c "
-    import socket
-    try:
-        print(socket.gethostbyname('{{ _ldap_host }}'))
-    except Exception as e:
-        print('')
+    import re, socket
+    host = '{{ _ldap_host }}'
+    m = re.match(r'^ec2-(\d+-\d+-\d+-\d+)\\..*\\.compute\\.amazonaws\\.com$', host)
+    if m:
+        print(m.group(1).replace('-', '.'))
+    else:
+        try:
+            print(socket.gethostbyname(host))
+        except:
+            print('')
     "
   register: _ldap_resolved_ip
   changed_when: false
