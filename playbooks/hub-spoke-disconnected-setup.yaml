@@ -482,6 +482,7 @@
         name: ocp/configure_ldap_group_sync
       vars:
         target_kubeconfig: "{{ spoke_kubeconfig }}"
+        ds389_hub_kubeconfig: "{{ hub_kubeconfig }}"
       when: groupsync is defined
 
     - name: Install MetalLB on Managed Cluster

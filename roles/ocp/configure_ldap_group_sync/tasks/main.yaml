@@ -99,3 +99,78 @@
     cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
     stdin: "{{ lookup('template', 'ldap-group-sync-cronjob.yaml.j2') }}"
   changed_when: true
+
+# --------------------------------------------------------------------------
+# Initial group sync — seeds groups immediately so they exist before the
+# first scheduled CronJob run. Uses port-forwarding to reach the in-cluster
+# ds389 service. When syncing to a spoke, ds389_hub_kubeconfig must point
+# to the hub cluster where ds389 runs; target_kubeconfig is the spoke.
+# --------------------------------------------------------------------------
+- name: Check if groups already exist (skip initial sync if present)
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get group {{ (rbac_bindings | default([]) | map(attribute='group') | list | first) | default('openshift-admins') | quote }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.metadata.name}' 2>/dev/null || true
+  register: _group_exists_check
+  changed_when: false
+  failed_when: false
+
+- name: Run initial GroupSync via port-forward to ds389
+  when: _group_exists_check.stdout == ""
+  block:
+    - name: Find a free local port for port-forward
+      ansible.builtin.shell: |
+        python3 -c "import socket; s=socket.socket(); s.bind(('',0)); p=s.getsockname()[1]; s.close(); print(p)"
+      register: _pf_port
+      changed_when: false
+
+    - name: Start port-forward to ds389 on hub cluster
+      ansible.builtin.shell: >
+        {{ bin_dir }}/oc port-forward svc/ds389
+        {{ _pf_port.stdout | trim }}:389
+        -n {{ groupsync_namespace }}
+        --kubeconfig {{ ds389_hub_kubeconfig | default(target_kubeconfig) }} &
+        sleep 3 && echo "ready"
+      register: _pf_started
+      changed_when: false
+
+    - name: Write bind password to temp file
+      ansible.builtin.copy:
+        content: "{{ groupsync.bind_password }}"
+        dest: "/tmp/ldap-sync-bindpw-{{ inventory_hostname | regex_replace('[^a-z0-9]', '-') }}"
+        mode: '0600'
+      no_log: true
+
+    - name: Write local sync config (localhost replaces cluster-internal URL)
+      ansible.builtin.copy:
+        content: >-
+          {{ lookup('template', 'ldap-sync-config.yaml.j2')
+             | replace(groupsync.ldap_url, 'ldap://localhost:' + (_pf_port.stdout | trim))
+             | replace('file: /etc/secrets/bindPassword',
+                       'file: /tmp/ldap-sync-bindpw-' + (inventory_hostname | regex_replace('[^a-z0-9]', '-'))) }}
+        dest: "/tmp/ldap-sync-init-{{ inventory_hostname | regex_replace('[^a-z0-9]', '-') }}.yaml"
+        mode: '0600'
+      no_log: true
+
+    - name: Run initial GroupSync with --confirm
+      ansible.builtin.shell: >
+        {{ bin_dir }}/oc adm groups sync
+        --sync-config=/tmp/ldap-sync-init-{{ inventory_hostname | regex_replace('[^a-z0-9]', '-') }}.yaml
+        --confirm
+        --kubeconfig {{ target_kubeconfig }}
+        2>&1
+      register: _initial_sync
+      changed_when: "'group/' in _initial_sync.stdout"
+
+    - name: Display initial sync result
+      ansible.builtin.debug:
+        msg: "Initial GroupSync: {{ _initial_sync.stdout_lines }}"
+
+  always:
+    - name: Stop port-forward and clean up temp files
+      ansible.builtin.shell: |
+        pkill -f "port-forward svc/ds389 {{ _pf_port.stdout | trim }}:" 2>/dev/null || true
+        rm -f "/tmp/ldap-sync-bindpw-{{ inventory_hostname | regex_replace('[^a-z0-9]', '-') }}" \
+              "/tmp/ldap-sync-init-{{ inventory_hostname | regex_replace('[^a-z0-9]', '-') }}.yaml"
+      changed_when: false
+      failed_when: false

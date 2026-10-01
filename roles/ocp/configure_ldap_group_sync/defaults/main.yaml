@@ -7,3 +7,8 @@ groupsync_configmap: "ldap-group-sync-config"
 groupsync_secret: "ldap-group-sync-bind"
 groupsync_ca_configmap: "ldap-group-sync-ca"
 groupsync_cronjob: "ldap-group-sync"
+
+# Hub cluster kubeconfig — used for port-forwarding to ds389 during initial sync.
+# When syncing to a spoke, set this to the hub kubeconfig so port-forward reaches
+# ds389 on the hub. Defaults to target_kubeconfig (works for hub-only scenarios).
+ds389_hub_kubeconfig: ""
