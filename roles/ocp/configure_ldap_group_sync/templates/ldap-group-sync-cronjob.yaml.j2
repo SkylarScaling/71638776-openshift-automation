@@ -14,12 +14,6 @@ spec:
         spec:
           serviceAccountName: "{{ groupsync_serviceaccount }}"
           restartPolicy: OnFailure
-{% if _ldap_host_ip | default('') != '' %}
-          hostAliases:
-            - ip: "{{ _ldap_host_ip }}"
-              hostnames:
-                - "{{ _ldap_host }}"
-{% endif %}
           containers:
             - name: ldap-group-sync
               image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest

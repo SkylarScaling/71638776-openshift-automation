@@ -118,63 +118,28 @@
     - _cronjob_check.stdout == 'ldap-group-sync'
     - not _groups_present | bool
 
-# Resolve the LDAP hostname to its PUBLIC IP (for disconnected clusters
-# that cannot resolve external DNS). On AWS, socket.gethostbyname() returns
-# the private IP; extract the public IP from the EC2 hostname format instead.
-- name: "[Auth] Extract LDAP hostname and public IP for hostAlias"
-  ansible.builtin.shell: |
-    python3 -c "
-    import re, socket
-    host = '{{ groupsync.ldap_url | default('') | regex_replace('^ldaps?://([^:/]+).*', '\\\\1') }}'
-    m = re.match(r'^ec2-(\d+-\d+-\d+-\d+)\..*\.compute\.amazonaws\.com$', host)
-    if m:
-        ip = m.group(1).replace('-', '.')
-    else:
-        try:
-            ip = socket.gethostbyname(host)
-        except:
-            ip = ''
-    print(ip + ' ' + host if ip else '')
-    "
-  register: _verify_host_alias
-  changed_when: false
-  failed_when: false
+# Create the verify job from the CronJob (389 DS is now cluster-internal via
+# ClusterIP service — no DNS/network issues, no hostAliases needed).
+- name: "[Auth] Trigger manual GroupSync job (groups missing)"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc create job ldap-group-sync-verify
+    --from=cronjob/ldap-group-sync
+    -n openshift-config
+    --kubeconfig {{ target_kubeconfig }}
+  register: _sync_job
+  changed_when: true
   when:
     - groupsync is defined
+    - _cronjob_check.stdout == 'ldap-group-sync'
     - not _groups_present | bool
 
-# Create the verify job as YAML with restartPolicy: Never so the pod stays
-# in Failed state for log inspection (OnFailure would restart and delete it).
-# hostAliases inlined as JSON (avoids {% if %} blocks in stdin: | YAML).
-- name: "[Auth] Trigger manual GroupSync job (groups missing)"
-  ansible.builtin.shell:
-    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
-    stdin: |
-      apiVersion: batch/v1
-      kind: Job
-      metadata:
-        name: ldap-group-sync-verify
-        namespace: openshift-config
-      spec:
-        backoffLimit: 0
-        activeDeadlineSeconds: 300
-        ttlSecondsAfterFinished: 600
-        template:
-          spec:
-            restartPolicy: Never
-            serviceAccountName: {{ groupsync_serviceaccount | default('ldap-group-syncer') }}
-            hostAliases: {{ ([{'ip': _verify_host_alias.stdout.split()[0], 'hostnames': [_verify_host_alias.stdout.split()[1]]}] | to_json) if (_verify_host_alias.stdout | default('') | trim != '') else '[]' }}
-            containers:
-              - name: ldap-group-sync
-                image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
-                command: ["/bin/bash", "-c", "oc adm groups sync --sync-config=/etc/config/sync.yaml --confirm"]
-                volumeMounts:
-                  - {name: sync-config, mountPath: /etc/config}
-                  - {name: bind-password, mountPath: /etc/secrets}
-            volumes:
-              - {name: sync-config, configMap: {name: {{ groupsync_configmap | default('ldap-group-sync-config') }}}}
-              - {name: bind-password, secret: {secretName: {{ groupsync_secret | default('ldap-group-sync-bind') }}}}
-  register: _sync_job
+- name: "[Auth] Constrain verify job to fail fast (backoffLimit=1, 5 min deadline)"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc patch job ldap-group-sync-verify
+    -n openshift-config
+    --kubeconfig {{ target_kubeconfig }}
+    --type=merge
+    -p '{"spec":{"backoffLimit":1,"activeDeadlineSeconds":300,"ttlSecondsAfterFinished":600}}'
   changed_when: true
   when:
     - groupsync is defined

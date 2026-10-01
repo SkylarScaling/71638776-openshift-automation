@@ -7,7 +7,7 @@ data:
   sync.yaml: |
     kind: LDAPSyncConfig
     apiVersion: v1
-    url: "{{ _ldap_url_for_cluster | default(groupsync.ldap_url) }}"
+    url: "{{ groupsync.ldap_url }}"
     bindDN: "{{ groupsync.bind_dn }}"
     bindPassword:
       file: /etc/secrets/bindPassword
