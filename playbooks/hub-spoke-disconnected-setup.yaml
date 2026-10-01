@@ -536,47 +536,6 @@
 # ==============================================================================
 # SUMMARY: Final Environment Handoff
 # ==============================================================================
-- name: Deployment Summary
-  hosts: hub_cluster
-  connection: local
-  gather_facts: false
-  tags: ['summary']
-  tasks:
-    - name: Build per-cluster connection info
-      ansible.builtin.set_fact:
-        _summary_lines: "{{ _summary_lines | default([]) + _entry }}"
-      vars:
-        _name: "{{ hostvars[item]['ocp_cluster']['name'] }}"
-        _role: >-
-          {%- if item in groups['hub_cluster'] -%}Hub
-          {%- else -%}Managed Cluster{%- endif -%}
-        _pwd: "{{ lookup('file', install_dir + '/' + _name + '/auth/kubeadmin-password') }}"
-        _entry:
-          - ""
-          - "{{ _role }}:  {{ _name }}"
-          - "  Console:    https://console-openshift-console.apps.{{ _name }}.{{ base_domain }}/"
-          - "  Username:   kubeadmin"
-          - "  Password:   {{ _pwd }}"
-          - "  Kubeconfig: {{ install_dir }}/{{ _name }}/auth/kubeconfig"
-      loop: >-
-        {{
-          groups['hub_cluster'] +
-          (groups['managed_clusters'] | default([]))
-        }}
-
-    - name: Print Full Deployment Summary
-      ansible.builtin.debug:
-        msg: >-
-          {{
-            ['==================================================================',
-             'Disconnected ACM Hub+Spoke Deployment Complete!',
-             '==================================================================',
-             'Mirror Registry: ' ~ (mirror_registry_url | default(disconnected.mirror_registry.hostname ~ ':' ~ (disconnected.mirror_registry.port | default(8443)))),
-             'Internal Gitea:  https://gitea.gitea.' ~ base_domain ~ ' (in-cluster: http://gitea.gitea.svc.cluster.local:3000)'] +
-            _summary_lines +
-            ['', '==================================================================']
-          }}
-
 # ==============================================================================
 # VERIFY: Day 2 Configuration
 # Runs automatically after deployment. Skip with --skip-tags verify.
@@ -688,3 +647,44 @@
           - "  Auth:    LDAP IDP configured, GroupSync running, groups/RBAC present"
           - "  NTP:     MachineConfigs applied, MCPs Updated, servers consistent"
           - "=================================================================="
+
+- name: Deployment Summary
+  hosts: hub_cluster
+  connection: local
+  gather_facts: false
+  tags: ['verify']
+  tasks:
+    - name: Build per-cluster connection info
+      ansible.builtin.set_fact:
+        _summary_lines: "{{ _summary_lines | default([]) + _entry }}"
+      vars:
+        _name: "{{ hostvars[item]['ocp_cluster']['name'] }}"
+        _role: >-
+          {%- if item in groups['hub_cluster'] -%}Hub
+          {%- else -%}Managed Cluster{%- endif -%}
+        _pwd: "{{ lookup('file', install_dir + '/' + _name + '/auth/kubeadmin-password') }}"
+        _entry:
+          - ""
+          - "{{ _role }}:  {{ _name }}"
+          - "  Console:    https://console-openshift-console.apps.{{ _name }}.{{ base_domain }}/"
+          - "  Username:   kubeadmin"
+          - "  Password:   {{ _pwd }}"
+          - "  Kubeconfig: {{ install_dir }}/{{ _name }}/auth/kubeconfig"
+      loop: >-
+        {{
+          groups['hub_cluster'] +
+          (groups['managed_clusters'] | default([]))
+        }}
+
+    - name: Print Full Deployment Summary
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            ['==================================================================',
+             'Disconnected ACM Hub+Spoke Deployment Complete!',
+             '==================================================================',
+             'Mirror Registry: ' ~ (mirror_registry_url | default(disconnected.mirror_registry.hostname ~ ':' ~ (disconnected.mirror_registry.port | default(8443)))),
+             'Internal Gitea:  https://gitea.gitea.' ~ base_domain ~ ' (in-cluster: http://gitea.gitea.svc.cluster.local:3000)'] +
+            _summary_lines +
+            ['', '==================================================================']
+          }}
