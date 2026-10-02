@@ -236,6 +236,19 @@
     # ------------------------------------------------------------------
     # Day 2: Cluster Configuration (NTP, Auth, RBAC, GroupSync, MetalLB, SSL)
     # ------------------------------------------------------------------
+    - name: Deploy 389 DS LDAP server on Hub (cluster-local — no cross-cluster networking needed)
+      ansible.builtin.include_role:
+        name: ocp/deploy_ds389
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+        ds389_root_dn: "{{ ds389_root_dn | default('cn=Directory Manager') }}"
+        ds389_root_password: "{{ ds389_root_password | default('ChangeMe123!') }}"
+        ds389_suffix: "dc={{ base_domain.split('.') | join(',dc=') }}"
+        ds389_ldap_service_account: "{{ ds389_ldap_service_account | default({'username': 'ldap-svc', 'cn': 'LDAP Service Account', 'sn': 'ServiceAccount', 'password': 'ChangeMe123!'}) }}"
+        ds389_ocp_groups: "{{ ds389_ocp_groups | default(['openshift-admins', 'openshift-developers', 'openshift-viewers']) }}"
+        ds389_ocp_users: "{{ ds389_ocp_users | default([]) }}"
+      when: ldap is defined or groupsync is defined
+
     - name: Configure NTP on Hub
       ansible.builtin.include_role:
         name: ocp/configure_ntp
@@ -455,6 +468,19 @@
         target_kubeconfig: "{{ hub_kubeconfig }}"
         search_target_namespaces:
           - "{{ ocp_cluster.name }}"
+
+    - name: Deploy 389 DS LDAP server on Managed Cluster (local instance — image from hub Quay)
+      ansible.builtin.include_role:
+        name: ocp/deploy_ds389
+      vars:
+        target_kubeconfig: "{{ spoke_kubeconfig }}"
+        ds389_root_dn: "{{ ds389_root_dn | default('cn=Directory Manager') }}"
+        ds389_root_password: "{{ ds389_root_password | default('ChangeMe123!') }}"
+        ds389_suffix: "dc={{ base_domain.split('.') | join(',dc=') }}"
+        ds389_ldap_service_account: "{{ ds389_ldap_service_account | default({'username': 'ldap-svc', 'cn': 'LDAP Service Account', 'sn': 'ServiceAccount', 'password': 'ChangeMe123!'}) }}"
+        ds389_ocp_groups: "{{ ds389_ocp_groups | default(['openshift-admins', 'openshift-developers', 'openshift-viewers']) }}"
+        ds389_ocp_users: "{{ ds389_ocp_users | default([]) }}"
+      when: ldap is defined or groupsync is defined
 
     - name: Configure NTP on Managed Cluster
       ansible.builtin.include_role:

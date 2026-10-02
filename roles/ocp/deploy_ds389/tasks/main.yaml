@@ -1,0 +1,307 @@
+---
+# Deploy 389 DS LDAP server on the target cluster as a cluster-local service.
+# Each cluster gets its own instance so OAuth controllers connect to a local
+# service URL (ldap://ds389.openshift-config.svc.cluster.local:389) with
+# no cross-cluster or internet connectivity required.
+#
+# Image: pulled from hub's Quay registry (spoke nodes CAN reach hub's public
+# ingress for image pulls — same path used for all mirrored operator images).
+
+- name: Derive hub Quay image URL for 389 DS
+  ansible.builtin.set_fact:
+    _ds389_image: >-
+      {{ disconnected.quay_mirror.registry_name }}-quay-{{ disconnected.quay_mirror.namespace -}}
+      .apps.{{ hostvars[groups['hub_cluster'][0]]['ocp_cluster']['name'] }}.{{ base_domain -}}
+      /{{ disconnected.quay_mirror.org | default('ocp4') }}/389ds/dirsrv:latest
+
+- name: Check if 389 DS Deployment already exists
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get deployment {{ ds389_deployment_name }}
+    -n {{ ds389_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.metadata.name}' 2>/dev/null || true
+  register: _ds389_exists
+  changed_when: false
+
+- name: Check if 389 DS suffix is initialized
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc exec
+    -n {{ ds389_namespace }}
+    deployment/{{ ds389_deployment_name }}
+    --kubeconfig {{ target_kubeconfig }}
+    -- ldapsearch -x -H ldap://localhost:{{ ds389_container_port }}
+    -b '{{ ds389_suffix }}' -s base dn 2>/dev/null
+  register: _suffix_check
+  changed_when: false
+  failed_when: _suffix_check.rc not in [0, 32, 1, 127]
+  when: _ds389_exists.stdout == ds389_deployment_name
+
+- name: Set deployment needed flag
+  ansible.builtin.set_fact:
+    _ds389_needs_deploy: >-
+      {{ _ds389_exists.stdout != ds389_deployment_name or
+         (_suffix_check.rc | default(32)) not in [0] }}
+
+# --------------------------------------------------------------------------
+# Deploy 389 DS if missing or not initialized
+# --------------------------------------------------------------------------
+- name: Create PVC for 389 DS data
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: {{ ds389_deployment_name }}-data
+        namespace: {{ ds389_namespace }}
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: {{ ds389_pvc_size }}
+  changed_when: true
+  when: _ds389_needs_deploy | bool
+
+- name: Create 389 DS Deployment
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: {{ ds389_deployment_name }}
+        namespace: {{ ds389_namespace }}
+        labels:
+          app: {{ ds389_deployment_name }}
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: {{ ds389_deployment_name }}
+        template:
+          metadata:
+            labels:
+              app: {{ ds389_deployment_name }}
+          spec:
+            containers:
+              - name: 389ds
+                image: {{ _ds389_image }}
+                imagePullPolicy: Always
+                ports:
+                  - containerPort: {{ ds389_container_port }}
+                env:
+                  - name: DS_DM_PASSWORD
+                    value: "{{ ds389_root_password }}"
+                  - name: DS_SUFFIX_NAME
+                    value: "{{ ds389_suffix }}"
+                volumeMounts:
+                  - name: data
+                    mountPath: /data
+            volumes:
+              - name: data
+                persistentVolumeClaim:
+                  claimName: {{ ds389_deployment_name }}-data
+  changed_when: true
+  when: _ds389_needs_deploy | bool
+  no_log: true
+
+- name: Create 389 DS ClusterIP Service
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: {{ ds389_service_name }}
+        namespace: {{ ds389_namespace }}
+      spec:
+        type: ClusterIP
+        selector:
+          app: {{ ds389_deployment_name }}
+        ports:
+          - name: ldap
+            port: 389
+            targetPort: {{ ds389_container_port }}
+  changed_when: true
+  when: _ds389_needs_deploy | bool
+
+- name: Wait for 389 DS Deployment to be available
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc rollout status deployment/{{ ds389_deployment_name }}
+    -n {{ ds389_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+    --timeout=300s
+  changed_when: false
+  when: _ds389_needs_deploy | bool
+
+# --------------------------------------------------------------------------
+# Wait for LDAP and initialize directory
+# --------------------------------------------------------------------------
+- name: Wait for 389 DS LDAP to accept connections
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc exec
+    -n {{ ds389_namespace }}
+    deployment/{{ ds389_deployment_name }}
+    --kubeconfig {{ target_kubeconfig }}
+    -- ldapsearch -x -H ldap://localhost:{{ ds389_container_port }}
+    -b "" -s base namingContexts 2>/dev/null
+  register: _ldap_ready
+  until: _ldap_ready.rc == 0
+  retries: 24
+  delay: 5
+  changed_when: false
+  when: _ds389_needs_deploy | bool
+
+- name: Check if suffix base entry exists after wait
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc exec
+    -n {{ ds389_namespace }}
+    deployment/{{ ds389_deployment_name }}
+    --kubeconfig {{ target_kubeconfig }}
+    -- ldapsearch -x -H ldap://localhost:{{ ds389_container_port }}
+    -b '{{ ds389_suffix }}' -s base dn 2>/dev/null
+  register: _suffix_ready
+  changed_when: false
+  failed_when: _suffix_ready.rc not in [0, 32]
+
+- name: Create backend and base entry via dsconf (if missing)
+  ansible.builtin.shell: |
+    {{ bin_dir }}/oc exec \
+      -n {{ ds389_namespace }} \
+      deployment/{{ ds389_deployment_name }} \
+      --kubeconfig {{ target_kubeconfig }} \
+      -- bash -c "
+        INSTANCE=\$(ls /etc/dirsrv/ 2>/dev/null | grep '^slapd-' | head -1 | sed 's/slapd-//')
+        dsconf \"\$INSTANCE\" backend create \
+          --suffix '{{ ds389_suffix }}' \
+          --be-name userroot \
+          --create-suffix 2>&1
+      "
+  register: _backend_create
+  changed_when: _backend_create.rc == 0
+  failed_when: >
+    _backend_create.rc != 0 and
+    'already exists' not in (_backend_create.stdout + _backend_create.stderr) | lower
+  when: _suffix_ready.rc == 32
+
+# --------------------------------------------------------------------------
+# Configure directory content (idempotent — rc=68 already exists is OK)
+# --------------------------------------------------------------------------
+- name: Add read ACI for authenticated users
+  ansible.builtin.shell: |
+    {{ bin_dir }}/oc exec -i \
+      -n {{ ds389_namespace }} \
+      deployment/{{ ds389_deployment_name }} \
+      --kubeconfig {{ target_kubeconfig }} \
+      -- ldapmodify -x \
+      -H ldap://localhost:{{ ds389_container_port }} \
+      -D '{{ ds389_root_dn }}' \
+      -w '{{ ds389_root_password }}' << 'LDIF'
+    dn: {{ ds389_suffix }}
+    changetype: modify
+    add: aci
+    aci: (targetattr="*")(version 3.0; acl "Allow authenticated read"; allow (read,search,compare) userdn="ldap:///all";)
+    LDIF
+  register: _aci
+  changed_when: _aci.rc == 0
+  failed_when: _aci.rc not in [0, 20]
+  no_log: true
+
+- name: Create OUs
+  ansible.builtin.shell: |
+    {{ bin_dir }}/oc exec -i \
+      -n {{ ds389_namespace }} \
+      deployment/{{ ds389_deployment_name }} \
+      --kubeconfig {{ target_kubeconfig }} \
+      -- ldapadd -x \
+      -H ldap://localhost:{{ ds389_container_port }} \
+      -D '{{ ds389_root_dn }}' \
+      -w '{{ ds389_root_password }}' << 'LDIF'
+    dn: ou=people,{{ ds389_suffix }}
+    objectClass: organizationalUnit
+    ou: people
+
+    dn: ou=groups,{{ ds389_suffix }}
+    objectClass: organizationalUnit
+    ou: groups
+    LDIF
+  register: _ous
+  changed_when: _ous.rc == 0
+  failed_when: _ous.rc not in [0, 68]
+  no_log: true
+
+- name: Create LDAP service account
+  ansible.builtin.shell: |
+    {{ bin_dir }}/oc exec -i \
+      -n {{ ds389_namespace }} \
+      deployment/{{ ds389_deployment_name }} \
+      --kubeconfig {{ target_kubeconfig }} \
+      -- ldapadd -x \
+      -H ldap://localhost:{{ ds389_container_port }} \
+      -D '{{ ds389_root_dn }}' \
+      -w '{{ ds389_root_password }}' << 'LDIF'
+    dn: uid={{ ds389_ldap_service_account.username }},ou=people,{{ ds389_suffix }}
+    objectClass: inetOrgPerson
+    objectClass: organizationalPerson
+    objectClass: person
+    objectClass: top
+    uid: {{ ds389_ldap_service_account.username }}
+    cn: {{ ds389_ldap_service_account.cn }}
+    sn: {{ ds389_ldap_service_account.sn }}
+    userPassword: {{ ds389_ldap_service_account.password }}
+    LDIF
+  register: _svc_acct
+  changed_when: _svc_acct.rc == 0
+  failed_when: _svc_acct.rc not in [0, 68]
+  no_log: true
+
+- name: Create test users
+  ansible.builtin.shell: |
+    {{ bin_dir }}/oc exec -i \
+      -n {{ ds389_namespace }} \
+      deployment/{{ ds389_deployment_name }} \
+      --kubeconfig {{ target_kubeconfig }} \
+      -- ldapadd -x \
+      -H ldap://localhost:{{ ds389_container_port }} \
+      -D '{{ ds389_root_dn }}' \
+      -w '{{ ds389_root_password }}' << 'LDIF'
+    dn: uid={{ item.username }},ou=people,{{ ds389_suffix }}
+    objectClass: inetOrgPerson
+    objectClass: organizationalPerson
+    objectClass: person
+    objectClass: top
+    uid: {{ item.username }}
+    cn: {{ item.cn }}
+    sn: {{ item.sn }}
+    mail: {{ item.username }}@example.com
+    userPassword: {{ item.password }}
+    LDIF
+  register: _users
+  changed_when: _users.rc == 0
+  failed_when: _users.rc not in [0, 68]
+  loop: "{{ ds389_ocp_users }}"
+  no_log: true
+
+- name: Create OCP groups with members
+  ansible.builtin.shell: |
+    {{ bin_dir }}/oc exec -i \
+      -n {{ ds389_namespace }} \
+      deployment/{{ ds389_deployment_name }} \
+      --kubeconfig {{ target_kubeconfig }} \
+      -- ldapadd -x \
+      -H ldap://localhost:{{ ds389_container_port }} \
+      -D '{{ ds389_root_dn }}' \
+      -w '{{ ds389_root_password }}' << 'LDIF'
+    dn: cn={{ item }},ou=groups,{{ ds389_suffix }}
+    objectClass: groupOfNames
+    objectClass: top
+    cn: {{ item }}
+    {% for user in ds389_ocp_users if item in (user.groups | default([])) %}
+    member: uid={{ user.username }},ou=people,{{ ds389_suffix }}
+    {% endfor %}
+    LDIF
+  register: _groups
+  changed_when: _groups.rc == 0
+  failed_when: _groups.rc not in [0, 68]
+  loop: "{{ ds389_ocp_groups }}"
+  no_log: true
