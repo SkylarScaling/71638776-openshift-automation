@@ -43,6 +43,11 @@
     mode: '0755'
   become: true
 
+- name: Set directory ownership to container's dirsrv user (uid 389)
+  ansible.builtin.command: chown 389:389 /data/ds389
+  changed_when: true
+  become: true
+
 - name: Run 389 DS container
   ansible.builtin.command: >
     podman run -d --name ds389
@@ -103,6 +108,11 @@
         path: /data/ds389
         state: directory
         mode: '0755'
+      become: true
+
+    - name: Set directory ownership to container's dirsrv user (uid 389)
+      ansible.builtin.command: chown 389:389 /data/ds389
+      changed_when: true
       become: true
 
     - name: Re-run 389 DS container with clean data
