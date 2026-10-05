@@ -26,6 +26,16 @@
   become: true
   when: (_ds389_running.stdout | trim) != 'true'
 
+# Remove any stopped/failed container so podman run doesn't error on name conflict.
+# A container that exited (State.Running=false) still occupies the name slot.
+- name: Remove stopped ds389 container if present
+  ansible.builtin.command: podman rm -f ds389
+  register: _ds389_rm
+  changed_when: _ds389_rm.rc == 0
+  failed_when: false
+  become: true
+  when: (_ds389_running.stdout | trim) != 'true'
+
 - name: Create 389 DS data directory
   ansible.builtin.file:
     path: /data/ds389
@@ -40,12 +50,73 @@
     -p 389:{{ ds389_container_port }}
     -e DS_DM_PASSWORD={{ ds389_root_password }}
     -e DS_SUFFIX_NAME={{ ds389_suffix }}
-    -v /data/ds389:/data
+    -v /data/ds389:/data:z
     {{ ds389_source_image }}
   changed_when: true
   become: true
   when: (_ds389_running.stdout | trim) != 'true'
   no_log: true
+
+# Give the container a moment to start, then verify it is actually running.
+# If it crashed (SELinux label issue, stale data, etc.), capture logs, wipe
+# the data directory, and retry once with a clean slate.
+- name: Wait briefly for 389 DS container to initialise
+  ansible.builtin.pause:
+    seconds: 5
+  when: (_ds389_running.stdout | trim) != 'true'
+
+- name: Check whether container is still running after start
+  ansible.builtin.shell: >
+    podman inspect ds389 --format '{% raw %}{{.State.Running}}{% endraw %}' 2>/dev/null || echo false
+  register: _ds389_post_start
+  changed_when: false
+  failed_when: false
+  become: true
+
+- name: Recover from crashed container (show logs, wipe data, retry)
+  when: (_ds389_post_start.stdout | trim) != 'true'
+  block:
+    - name: Show container logs for diagnostics
+      ansible.builtin.command: podman logs ds389
+      register: _ds389_crash_logs
+      changed_when: false
+      failed_when: false
+      become: true
+
+    - name: Display crash logs
+      ansible.builtin.debug:
+        msg: "{{ (_ds389_crash_logs.stdout_lines | default([])) + (_ds389_crash_logs.stderr_lines | default([])) }}"
+
+    - name: Remove crashed container
+      ansible.builtin.command: podman rm -f ds389
+      changed_when: true
+      become: true
+
+    - name: Wipe stale data directory (prevents re-init failure)
+      ansible.builtin.file:
+        path: /data/ds389
+        state: absent
+      become: true
+
+    - name: Recreate data directory
+      ansible.builtin.file:
+        path: /data/ds389
+        state: directory
+        mode: '0755'
+      become: true
+
+    - name: Re-run 389 DS container with clean data
+      ansible.builtin.command: >
+        podman run -d --name ds389
+        --restart=always
+        -p 389:{{ ds389_container_port }}
+        -e DS_DM_PASSWORD={{ ds389_root_password }}
+        -e DS_SUFFIX_NAME={{ ds389_suffix }}
+        -v /data/ds389:/data:z
+        {{ ds389_source_image }}
+      changed_when: true
+      become: true
+      no_log: true
 
 - name: Wait for 389 DS LDAP to accept connections
   ansible.builtin.command: >
