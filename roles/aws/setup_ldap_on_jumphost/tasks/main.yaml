@@ -125,10 +125,24 @@
     -b "" -s base namingContexts
   register: _ldap_ready
   until: _ldap_ready.rc == 0
-  retries: 24
+  retries: 60
   delay: 5
   changed_when: false
+  failed_when: false
   become: true
+
+- name: Show container logs if LDAP did not become ready
+  ansible.builtin.command: podman logs --tail 50 ds389
+  register: _ds389_init_logs
+  changed_when: false
+  failed_when: false
+  become: true
+  when: _ldap_ready.rc | default(1) != 0
+
+- name: Display logs and fail if LDAP never became ready
+  ansible.builtin.fail:
+    msg: "389 DS LDAP did not become ready after 300s. Container logs:\n{{ (_ds389_init_logs.stdout_lines | default([])) | join('\n') }}\n{{ (_ds389_init_logs.stderr_lines | default([])) | join('\n') }}"
+  when: _ldap_ready.rc | default(1) != 0
 
 - name: Check if suffix base entry exists
   ansible.builtin.command: >
