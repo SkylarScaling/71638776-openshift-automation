@@ -41,6 +41,32 @@
           - "=================================================================="
 
 # ==============================================================================
+# JUMPHOST-LDAP: Deploy 389 DS on Jumphost (independent of cluster lifecycle)
+# ==============================================================================
+# LDAP runs on the jumphost BEFORE any cluster is built so that:
+# - OAuth and GroupSync config can reference a stable, pre-existing LDAP server
+# - Day 2 cluster config has no build-time dependency on LDAP provisioning
+# - Re-running cluster Day 2 (--tags hub,spokes) never touches LDAP state
+#
+# Cluster pods reach LDAP at the mirror registry hostname (same VPC path used
+# for image pulls). Use the jumphost private IP in ldap.url / groupsync.ldap_url
+# to avoid public DNS resolution inside disconnected cluster pods.
+#
+# Tagged 'jumphost' so --tags jumphost runs the full pre-cluster phase,
+# and --tags ldap runs just LDAP setup independently.
+# ==============================================================================
+- name: Jumphost - Setup LDAP Server (389 DS)
+  hosts: hub_cluster
+  connection: local
+  gather_facts: false
+  tags: ['ldap', 'jumphost']
+  tasks:
+    - name: Setup 389 DS LDAP server on jumphost
+      ansible.builtin.include_role:
+        name: aws/setup_ldap_on_jumphost
+      when: ldap is defined or groupsync is defined
+
+# ==============================================================================
 # HUB: Provision Disconnected ACM Hub (IPI)
 # ==============================================================================
 - name: Hub - Provision Disconnected ACM Hub
@@ -236,19 +262,6 @@
     # ------------------------------------------------------------------
     # Day 2: Cluster Configuration (NTP, Auth, RBAC, GroupSync, MetalLB, SSL)
     # ------------------------------------------------------------------
-    - name: Deploy 389 DS LDAP server on Hub (cluster-local — no cross-cluster networking needed)
-      ansible.builtin.include_role:
-        name: ocp/deploy_ds389
-      vars:
-        target_kubeconfig: "{{ hub_kubeconfig }}"
-        ds389_root_dn: "{{ ds389_root_dn | default('cn=Directory Manager') }}"
-        ds389_root_password: "{{ ds389_root_password | default('ChangeMe123!') }}"
-        ds389_suffix: "dc={{ base_domain.split('.') | join(',dc=') }}"
-        ds389_ldap_service_account: "{{ ds389_ldap_service_account | default({'username': 'ldap-svc', 'cn': 'LDAP Service Account', 'sn': 'ServiceAccount', 'password': 'ChangeMe123!'}) }}"
-        ds389_ocp_groups: "{{ ds389_ocp_groups | default(['openshift-admins', 'openshift-developers', 'openshift-viewers']) }}"
-        ds389_ocp_users: "{{ ds389_ocp_users | default([]) }}"
-      when: ldap is defined or groupsync is defined
-
     - name: Configure NTP on Hub
       ansible.builtin.include_role:
         name: ocp/configure_ntp
@@ -469,19 +482,6 @@
         search_target_namespaces:
           - "{{ ocp_cluster.name }}"
 
-    - name: Deploy 389 DS LDAP server on Managed Cluster (local instance — image from hub Quay)
-      ansible.builtin.include_role:
-        name: ocp/deploy_ds389
-      vars:
-        target_kubeconfig: "{{ spoke_kubeconfig }}"
-        ds389_root_dn: "{{ ds389_root_dn | default('cn=Directory Manager') }}"
-        ds389_root_password: "{{ ds389_root_password | default('ChangeMe123!') }}"
-        ds389_suffix: "dc={{ base_domain.split('.') | join(',dc=') }}"
-        ds389_ldap_service_account: "{{ ds389_ldap_service_account | default({'username': 'ldap-svc', 'cn': 'LDAP Service Account', 'sn': 'ServiceAccount', 'password': 'ChangeMe123!'}) }}"
-        ds389_ocp_groups: "{{ ds389_ocp_groups | default(['openshift-admins', 'openshift-developers', 'openshift-viewers']) }}"
-        ds389_ocp_users: "{{ ds389_ocp_users | default([]) }}"
-      when: ldap is defined or groupsync is defined
-
     - name: Configure NTP on Managed Cluster
       ansible.builtin.include_role:
         name: ocp/configure_ntp
@@ -508,7 +508,6 @@
         name: ocp/configure_ldap_group_sync
       vars:
         target_kubeconfig: "{{ spoke_kubeconfig }}"
-        ds389_hub_kubeconfig: "{{ hub_kubeconfig }}"
       when: groupsync is defined
 
     - name: Install MetalLB on Managed Cluster

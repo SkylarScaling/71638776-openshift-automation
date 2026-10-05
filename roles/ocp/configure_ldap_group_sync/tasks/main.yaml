@@ -88,6 +88,23 @@
   changed_when: true
   when: groupsync.ca_cert | default('') != ''
 
+# --------------------------------------------------------------------------
+# Extract LDAP host for CronJob pod hostAliases.
+# If groupsync.ldap_url contains an EC2 hostname (ec2-A-B-C-D.region...),
+# extract the IP so pods can resolve it without external DNS.
+# If the URL already contains an IP, _ldap_host_ip stays empty (no alias needed).
+# --------------------------------------------------------------------------
+- name: Extract LDAP host from groupsync URL
+  ansible.builtin.set_fact:
+    _ldap_host: "{{ groupsync.ldap_url | regex_search('ldap://([^:/?]+)', '\\1') | first | default('') }}"
+
+- name: Extract IP from EC2-format hostname for disconnected pod DNS bypass
+  ansible.builtin.set_fact:
+    _ldap_host_ip: >-
+      {{ _ldap_host
+         | regex_search('^ec2-(\d+)-(\d+)-(\d+)-(\d+)\.', '\1', '\2', '\3', '\4')
+         | join('.') }}
+
 - name: Create LDAPSyncConfig ConfigMap
   ansible.builtin.shell:
     cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
@@ -102,9 +119,10 @@
 
 # --------------------------------------------------------------------------
 # Initial group sync — seeds groups immediately so they exist before the
-# first scheduled CronJob run. Uses port-forwarding to reach the in-cluster
-# ds389 service. When syncing to a spoke, ds389_hub_kubeconfig must point
-# to the hub cluster where ds389 runs; target_kubeconfig is the spoke.
+# first scheduled CronJob run.
+# LDAP now runs on the jumphost (same machine running this playbook), so
+# groupsync.ldap_url is directly reachable — no port-forward required.
+# The only substitution needed: replace the k8s secret path with a local file.
 # --------------------------------------------------------------------------
 - name: Check if groups already exist (skip initial sync if present)
   ansible.builtin.shell: >
@@ -115,25 +133,9 @@
   changed_when: false
   failed_when: false
 
-- name: Run initial GroupSync via port-forward to ds389
+- name: Run initial GroupSync directly (LDAP is on jumphost, same machine)
   when: _group_exists_check.stdout == ""
   block:
-    - name: Find a free local port for port-forward
-      ansible.builtin.shell: |
-        python3 -c "import socket; s=socket.socket(); s.bind(('',0)); p=s.getsockname()[1]; s.close(); print(p)"
-      register: _pf_port
-      changed_when: false
-
-    - name: Start port-forward to ds389 on hub cluster
-      ansible.builtin.shell: >
-        {{ bin_dir }}/oc port-forward svc/ds389
-        {{ _pf_port.stdout | trim }}:389
-        -n {{ groupsync_namespace }}
-        --kubeconfig {{ ds389_hub_kubeconfig | default(target_kubeconfig) }} &
-        sleep 3 && echo "ready"
-      register: _pf_started
-      changed_when: false
-
     - name: Write bind password to temp file
       ansible.builtin.copy:
         content: "{{ groupsync.bind_password }}"
@@ -141,11 +143,10 @@
         mode: '0600'
       no_log: true
 
-    - name: Write local sync config (localhost replaces cluster-internal URL)
+    - name: Write local sync config (replace k8s secret path with temp file)
       ansible.builtin.copy:
         content: >-
           {{ lookup('template', 'ldap-sync-config.yaml.j2')
-             | replace(groupsync.ldap_url, 'ldap://localhost:' + (_pf_port.stdout | trim))
              | replace('file: /etc/secrets/bindPassword',
                        'file: /tmp/ldap-sync-bindpw-' + (inventory_hostname | regex_replace('[^a-z0-9]', '-'))) }}
         dest: "/tmp/ldap-sync-init-{{ inventory_hostname | regex_replace('[^a-z0-9]', '-') }}.yaml"
@@ -167,9 +168,8 @@
         msg: "Initial GroupSync: {{ _initial_sync.stdout_lines }}"
 
   always:
-    - name: Stop port-forward and clean up temp files
+    - name: Clean up temp files
       ansible.builtin.shell: |
-        pkill -f "port-forward svc/ds389 {{ _pf_port.stdout | trim }}:" 2>/dev/null || true
         rm -f "/tmp/ldap-sync-bindpw-{{ inventory_hostname | regex_replace('[^a-z0-9]', '-') }}" \
               "/tmp/ldap-sync-init-{{ inventory_hostname | regex_replace('[^a-z0-9]', '-') }}.yaml"
       changed_when: false

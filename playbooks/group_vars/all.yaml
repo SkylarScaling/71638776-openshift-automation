@@ -16,13 +16,13 @@ enable_uwm: false
 #   - 169.254.169.123  # AWS time server
 #   - 0.rhel.pool.ntp.org
 
-# ds389_lb_dns: ""   # NLB DNS from install-ldap-server.yaml — set once, drives both ldap.url and groupsync.ldap_url
-
 # ldap:
 #   name: "ldap"
-#   # Use the public hostname — cluster nodes reach the jumphost LDAP server
-#   # the same way they reach the mirror registry (public DNS, not private IP).
-#   url: "ldap://{{ ds389_lb_dns }}:389/ou=people,dc={{ base_domain.split('.') | join(',dc=') }}?uid"
+#   # Use the mirror registry hostname (jumphost private IP within the VPC).
+#   # OCP cluster pods (OAuth controller) reach LDAP via the same VPC path as
+#   # image pulls — no internet access required. Using a private IP avoids
+#   # external DNS resolution failures in disconnected cluster pods.
+#   url: "ldap://{{ disconnected.mirror_registry.hostname }}:389/ou=people,dc={{ base_domain.split('.') | join(',dc=') }}?uid"
 #   bind_dn: "uid=ldap-svc,ou=people,dc={{ base_domain.split('.') | join(',dc=') }}"
 #   bind_password: "{{ vault_ldap_bind_password }}"
 #   insecure: true
@@ -41,7 +41,7 @@ enable_uwm: false
 
 # groupsync:          # Uses built-in 'oc adm groups sync' — no additional operator required
 #   schedule: "0 * * * *"
-#   ldap_url: "ldap://{{ ds389_lb_dns }}:389"
+#   ldap_url: "ldap://{{ disconnected.mirror_registry.hostname }}:389"
 #   bind_dn: "uid=ldap-svc,ou=people,dc={{ base_domain.split('.') | join(',dc=') }}"
 #   bind_password: "{{ vault_ldap_bind_password }}"
 #   ca_cert: ""
