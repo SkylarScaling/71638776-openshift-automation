@@ -75,6 +75,7 @@
   gather_facts: false
   tags: ['hub']
   vars:
+    hub_kubeconfig: "{{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig"
     mirror_base_path: "{{ disconnected.mirror_base_path | default('ocp4') }}"
     mirror_registry_dir: "{{ working_dir }}/mirror-registry"
     oc_mirror_workspace: "{{ working_dir }}/oc-mirror-workspace"
