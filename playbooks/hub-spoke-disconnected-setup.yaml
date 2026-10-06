@@ -290,6 +290,7 @@
       vars:
         target_kubeconfig: "{{ hub_kubeconfig }}"
       when: rbac_bindings | default([]) | length > 0 or argocd_rbac | default({}) | length > 0
+      tags: ['argocd_rbac']
 
     - name: Configure LDAP Group Sync on Hub
       ansible.builtin.include_role:
