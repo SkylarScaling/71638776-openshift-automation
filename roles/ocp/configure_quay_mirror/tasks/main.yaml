@@ -232,6 +232,25 @@
       }}
   no_log: true
 
+# Re-fetch the robot token via the Quay REST API. The Python model approach
+# above reads from an encrypted DB field which may not decode correctly when
+# the robot already exists on a re-run. The API always returns plaintext.
+- name: Re-fetch robot token from Quay API (authoritative source, avoids encrypted DB field)
+  ansible.builtin.uri:
+    url: "https://{{ quay_registry_url }}/api/v1/organization/{{ quay_mirror_org }}/robots/{{ quay_mirror_robot_account }}"
+    headers:
+      Authorization: "Basic {{ (quay_mirror_admin_user ~ ':' ~ quay_mirror_admin_password) | b64encode }}"
+    validate_certs: false
+    method: GET
+    status_code: [200]
+  register: _quay_robot_api
+  no_log: true
+
+- name: Override robot token with API value
+  ansible.builtin.set_fact:
+    quay_robot_token: "{{ _quay_robot_api.json.token }}"
+  no_log: true
+
 - name: Check if Quay robot credentials already exist in global pull secret
   ansible.builtin.shell: |
     set -e
