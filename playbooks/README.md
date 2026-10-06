@@ -324,13 +324,14 @@ The disconnected playbook deploys the same Hub+Spoke architecture in an environm
 
 ### Workflow
 
-The playbook has five phases, controlled via tags:
+The playbook has six phases, controlled via tags:
 
-1. **`jumphost`** — Installs tools (`oc-mirror`, `mirror-registry`), stands up a local Quay-based mirror registry, and mirrors OCP release images + operator catalogs. Run once.
-2. **`hub`** — Provisions the ACM Hub cluster via IPI using mirrored images, applies disconnected cluster configuration (IDMS, CatalogSource, pull secret), installs Day 2 operators via ArgoCD, and configures ACM for disconnected spoke provisioning.
-3. **`spokes`** — Provisions managed clusters via ACM/Hive with disconnected settings. Each spoke receives mirror configuration via ManifestWork.
+1. **`jumphost`** — Installs tools (`oc-mirror`, `mirror-registry`), stands up a local Quay-based mirror registry, mirrors OCP release images + operator catalogs, and deploys the 389 DS LDAP test server as a podman container on the jumphost. Run once before any cluster work. The `ldap` tag is a sub-tag of `jumphost` that targets only the LDAP setup step.
+2. **`hub`** — Provisions the ACM Hub cluster via IPI using mirrored images, applies disconnected cluster configuration (IDMS, CatalogSource, pull secret), installs Day 2 operators via ArgoCD, and applies all Day 2 configuration (NTP, LDAP authentication, RBAC, ArgoCD RBAC, GroupSync, MetalLB, SSL).
+3. **`spokes`** — Provisions managed clusters via ACM/Hive with disconnected settings. Each spoke receives mirror configuration and full Day 2 configuration matching the hub.
 4. **`migrate_mirror`** — After Quay is running on the hub, migrates all mirrored content from the jumphost mirror registry to Quay, updates IDMS on the hub and all spokes, and enables jumphost decommission. Skip with `--skip-tags migrate_mirror` if you intend to keep the jumphost as the permanent mirror registry.
-5. **`summary`** — Prints connection info for all clusters.
+5. **`verify`** — Runs post-deployment verification checks (NTP, mirror health, LDAP auth, group sync). Runs automatically at the end; re-run standalone with `--tags verify`.
+6. **`argocd_rbac`** — Standalone tag to apply (or re-apply) ArgoCD RBAC without running any other hub tasks.
 
 ### Prerequisites
 
@@ -384,7 +385,7 @@ ansible-playbook hub-spoke-disconnected-setup.yaml -i inventory-disconnected.yam
 Runs automatically as part of the full playbook. To run standalone after the fact:
 
 ```bash
-ansible-playbook migrate-mirror-to-quay.yaml -i inventory-disconnected.yaml
+ansible-playbook hub-spoke-disconnected-setup.yaml -i inventory-disconnected.yaml --tags migrate_mirror
 ```
 
 To skip migration and keep the jumphost as the permanent mirror registry:
@@ -407,7 +408,7 @@ all:
     force_update: true
     base_domain: "example.com"
     automation_repo_branch: "main"        # branch of 71638776-openshift-automation to clone on jumphost
-    jumphost_private_ip: ""               # set after running install-ldap-server.yaml
+    jumphost_private_ip: ""               # private IP of jumphost within the VPC; used as LDAP server address so cluster pods can reach it without internet
     ssh_key: "{{ lookup('file', '~/.ssh/id_ed25519.pub') }}"
     pull_secret: "{{ lookup('file', '~/pull-secret.json') | from_json }}"
     aws:
@@ -518,14 +519,38 @@ all:
       - 169.254.169.123        # AWS time sync service (link-local, available in all regions)
       - 0.rhel.pool.ntp.org    # fallback public NTP pool
 
+    # 389 DS test LDAP server — deployed as a podman container on the jumphost
+    # during the jumphost phase (before any cluster is built). The jumphost_private_ip
+    # is used so cluster pods (OAuth controller, GroupSync) can reach LDAP within
+    # the VPC without internet access. Omit these variables to skip LDAP setup.
+    ds389_root_password: "<directory_manager_password>"
+    ds389_ldap_service_account:
+      username: "ldap-svc"
+      cn: "LDAP Service Account"
+      sn: "ServiceAccount"
+      password: "<service_account_password>"
+    ds389_ocp_users:
+      - username: ocp-admin
+        cn: "OCP Admin"
+        sn: "Admin"
+        password: "<user_password>"
+        groups: [openshift-admins]
+      - username: ocp-dev
+        cn: "OCP Developer"
+        sn: "Developer"
+        password: "<user_password>"
+        groups: [openshift-developers]
+
     # LDAP / Active Directory identity provider
+    # For the jumphost-hosted 389 DS test server, use jumphost_private_ip and port 389.
+    # For a customer's real AD/LDAP, set the appropriate hostname/port/baseDN here.
     ldap:
       name: "ldap"             # Label shown on the OCP login screen
-      url: "ldaps://<ldap-host>:636/ou=users,dc=example,dc=com?uid"  # baseDN + attribute in URL
-      bind_dn: "cn=serviceaccount,ou=serviceaccounts,dc=example,dc=com"
+      url: "ldap://{{ jumphost_private_ip }}:389/ou=people,dc=example,dc=com?uid"
+      bind_dn: "uid=ldap-svc,ou=people,dc=example,dc=com"
       bind_password: "<ldap_bind_password>"   # use ansible-vault to encrypt
-      insecure: false          # set true only for plain LDAP (not recommended)
-      ca_cert: ""              # PEM content of LDAP CA cert; leave empty if using a public CA
+      insecure: true           # set false and provide ca_cert for LDAPS
+      ca_cert: ""              # PEM content of LDAP CA cert; leave empty for plain LDAP
       attributes:
         id: ["dn"]
         email: ["mail"]
@@ -543,15 +568,17 @@ all:
 
     # GroupSync: deploys a CronJob using the built-in 'oc adm groups sync' command.
     # No additional operator required — uses the cli ImageStream already in the cluster.
+    # Initial sync runs automatically during the hub/spokes phase (no port-forward needed
+    # since LDAP is on the jumphost where the playbook runs).
     groupsync:
       schedule: "0 * * * *"   # cron — every hour
-      ldap_url: "ldaps://<ldap-host>:636"
-      bind_dn: "cn=serviceaccount,ou=serviceaccounts,dc=example,dc=com"
+      ldap_url: "ldap://{{ jumphost_private_ip }}:389"
+      bind_dn: "uid=ldap-svc,ou=people,dc=example,dc=com"
       bind_password: "<ldap_bind_password>"   # use ansible-vault to encrypt
-      ca_cert: ""              # PEM content of LDAP CA cert; leave empty if using a public CA
+      ca_cert: ""              # PEM content of LDAP CA cert; leave empty for plain LDAP
       groups_base_dn: "ou=groups,dc=example,dc=com"
-      groups_filter: "(&(objectClass=group)(cn=openshift-*))"
-      users_base_dn: "ou=users,dc=example,dc=com"
+      groups_filter: "(&(objectClass=groupOfNames)(cn=openshift-*))"
+      users_base_dn: "ou=people,dc=example,dc=com"
       group_uid_attribute: "dn"
       group_name_attributes: ["cn"]
       group_membership_attributes: ["member"]
@@ -559,6 +586,13 @@ all:
       user_name_attributes: ["uid"]
       tolerate_member_not_found: true
       tolerate_member_out_of_scope: true
+
+    # ArgoCD RBAC: maps OCP groups to ArgoCD roles in the openshift-gitops instance.
+    # Auto-derived from rbac_bindings if not set (cluster-admin → role:admin, others → role:readonly).
+    # Re-run with --tags argocd_rbac to update without running the full hub play.
+    # argocd_rbac:
+    #   admin_groups: [openshift-admins]
+    #   readonly_groups: [openshift-developers, openshift-viewers]
 
     # MetalLB: installs MetalLB and configures IP address pools.
     # Requires metallb-operator in disconnected.operators above.
