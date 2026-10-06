@@ -143,10 +143,10 @@
         mode: '0600'
       no_log: true
 
-    - name: Write local sync config (replace k8s secret path with temp file)
+    - name: Write local sync config (raw LDAPSyncConfig — no ConfigMap wrapper)
       ansible.builtin.copy:
         content: >-
-          {{ lookup('template', 'ldap-sync-config.yaml.j2')
+          {{ lookup('template', 'ldap-sync-config-raw.yaml.j2')
              | replace('file: /etc/secrets/bindPassword',
                        'file: /tmp/ldap-sync-bindpw-' + (inventory_hostname | regex_replace('[^a-z0-9]', '-'))) }}
         dest: "/tmp/ldap-sync-init-{{ inventory_hostname | regex_replace('[^a-z0-9]', '-') }}.yaml"
