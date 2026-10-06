@@ -1,0 +1,44 @@
+---
+# Derive admin/readonly groups from rbac_bindings if not explicitly configured.
+# Groups bound to cluster-admin or admin → ArgoCD role:admin.
+# All other bound groups → ArgoCD role:readonly.
+- name: Derive ArgoCD admin groups
+  ansible.builtin.set_fact:
+    _argocd_admin_groups: >-
+      {{ argocd_rbac.admin_groups
+         | default(
+             (rbac_bindings | default([]) | selectattr('cluster_role', 'equalto', 'cluster-admin') | map(attribute='group') | list) +
+             (rbac_bindings | default([]) | selectattr('cluster_role', 'equalto', 'admin') | map(attribute='group') | list)
+           ) }}
+
+- name: Derive ArgoCD readonly groups
+  ansible.builtin.set_fact:
+    _argocd_readonly_groups: >-
+      {{ argocd_rbac.readonly_groups
+         | default(
+             rbac_bindings | default([])
+             | rejectattr('cluster_role', 'equalto', 'cluster-admin')
+             | rejectattr('cluster_role', 'equalto', 'admin')
+             | map(attribute='group') | list
+           ) }}
+
+- name: Apply ArgoCD RBAC ConfigMap
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: "{{ lookup('template', 'argocd-rbac-cm.yaml.j2') }}"
+  changed_when: true
+
+- name: Restart ArgoCD server to pick up RBAC change
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc rollout restart deployment/openshift-gitops-server
+    -n {{ argocd_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+  changed_when: true
+
+- name: Wait for ArgoCD server rollout to complete
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc rollout status deployment/openshift-gitops-server
+    -n {{ argocd_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+    --timeout=120s
+  changed_when: false

@@ -283,6 +283,13 @@
         target_kubeconfig: "{{ hub_kubeconfig }}"
       when: rbac_bindings | default([]) | length > 0
 
+    - name: Configure ArgoCD RBAC on Hub
+      ansible.builtin.include_role:
+        name: ocp/configure_argocd_rbac
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+      when: rbac_bindings | default([]) | length > 0 or argocd_rbac | default({}) | length > 0
+
     - name: Configure LDAP Group Sync on Hub
       ansible.builtin.include_role:
         name: ocp/configure_ldap_group_sync

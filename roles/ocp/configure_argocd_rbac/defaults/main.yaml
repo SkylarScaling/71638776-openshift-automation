@@ -1,0 +1,10 @@
+---
+argocd_namespace: "openshift-gitops"
+
+# argocd_rbac:
+#   admin_groups: [openshift-admins]
+#   readonly_groups: [openshift-developers, openshift-viewers]
+#
+# If not set, admin_groups is derived from rbac_bindings entries with
+# cluster_role: cluster-admin or admin; readonly_groups from the rest.
+argocd_rbac: {}
