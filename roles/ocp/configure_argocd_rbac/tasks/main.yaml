@@ -1,8 +1,13 @@
 ---
-# Derive admin/readonly groups from rbac_bindings if not explicitly configured.
-# Groups bound to cluster-admin or admin → ArgoCD role:admin.
-# All other bound groups → ArgoCD role:readonly.
-- name: Derive ArgoCD admin groups
+# ArgoCD RBAC is managed through the ArgoCD CR (spec.rbac), not by patching
+# argocd-rbac-cm directly. The ArgoCD operator owns that ConfigMap and reverts
+# any direct edits. Patching the CR causes the operator to reconcile and
+# update the ConfigMap, then ArgoCD hot-reloads the policy without a restart.
+#
+# For groups to appear in the JWT, the user must log out and back in after
+# this change — old tokens don't carry the new group claim.
+
+- name: Derive ArgoCD admin groups from rbac_bindings
   ansible.builtin.set_fact:
     _argocd_admin_groups: >-
       {{ argocd_rbac.admin_groups
@@ -11,7 +16,7 @@
              (rbac_bindings | default([]) | selectattr('cluster_role', 'equalto', 'admin') | map(attribute='group') | list)
            ) }}
 
-- name: Derive ArgoCD readonly groups
+- name: Derive ArgoCD readonly groups from rbac_bindings
   ansible.builtin.set_fact:
     _argocd_readonly_groups: >-
       {{ argocd_rbac.readonly_groups
@@ -22,23 +27,39 @@
              | map(attribute='group') | list
            ) }}
 
-- name: Apply ArgoCD RBAC ConfigMap
+- name: Build ArgoCD policy lines
+  ansible.builtin.set_fact:
+    _argocd_policy_lines: >-
+      {{
+        (_argocd_admin_groups | map('regex_replace', '^(.*)$', 'g, \1, role:admin') | list) +
+        (_argocd_readonly_groups | map('regex_replace', '^(.*)$', 'g, \1, role:readonly') | list)
+      }}
+
+- name: Patch ArgoCD CR spec.rbac (operator propagates to argocd-rbac-cm)
   ansible.builtin.shell:
     cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
-    stdin: "{{ lookup('template', 'argocd-rbac-cm.yaml.j2') }}"
+    stdin: |
+      apiVersion: argoproj.io/v1alpha1
+      kind: ArgoCD
+      metadata:
+        name: openshift-gitops
+        namespace: {{ argocd_namespace }}
+      spec:
+        rbac:
+          defaultPolicy: 'role:readonly'
+          policy: "{{ _argocd_policy_lines | join('\n') }}"
+          scopes: '[groups]'
   changed_when: true
 
-- name: Restart ArgoCD server to pick up RBAC change
+- name: Wait for ArgoCD operator to reconcile RBAC ConfigMap
   ansible.builtin.shell: >
-    {{ bin_dir }}/oc rollout restart deployment/openshift-gitops-server
+    {{ bin_dir }}/oc get configmap argocd-rbac-cm
     -n {{ argocd_namespace }}
     --kubeconfig {{ target_kubeconfig }}
-  changed_when: true
-
-- name: Wait for ArgoCD server rollout to complete
-  ansible.builtin.shell: >
-    {{ bin_dir }}/oc rollout status deployment/openshift-gitops-server
-    -n {{ argocd_namespace }}
-    --kubeconfig {{ target_kubeconfig }}
-    --timeout=120s
+    -o jsonpath='{.data.policy\.csv}'
+  register: _rbac_cm_check
+  until: _argocd_admin_groups | first in _rbac_cm_check.stdout
+  retries: 12
+  delay: 10
   changed_when: false
+  when: _argocd_admin_groups | length > 0
