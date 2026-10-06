@@ -334,13 +334,57 @@
   ansible.builtin.set_fact:
     _quay_needs_clean_retry: "{{ _quay_cs_files.files | default([]) | length == 0 }}"
 
-- name: Wipe Quay oc-mirror working-dir for clean retry
+# Wipe the ENTIRE workspace (not just working-dir) so oc-mirror starts with
+# zero state. oc-mirror v2 may store cache/metadata at the workspace root
+# that causes subsequent runs to treat content as already-published and skip
+# catalog index generation even though it was never pushed to Quay.
+- name: Wipe ENTIRE Quay oc-mirror workspace for clean retry
   ansible.builtin.file:
     state: absent
-    path: "{{ quay_mirror_workspace }}/working-dir"
+    path: "{{ quay_mirror_workspace }}"
   when: _quay_needs_clean_retry | bool
 
-- name: Run oc-mirror to Quay (clean retry — catalog index push failed on first attempt)
+- name: Re-create Quay oc-mirror workspace directory
+  ansible.builtin.file:
+    state: directory
+    path: "{{ quay_mirror_workspace }}"
+    mode: '0755'
+  when: _quay_needs_clean_retry | bool
+
+- name: Re-copy ImageSetConfiguration for clean retry
+  ansible.builtin.copy:
+    src: "{{ initial_mirror_workspace }}/imageset-config.yaml"
+    dest: "{{ quay_mirror_workspace }}/imageset-config.yaml"
+    mode: '0644'
+  when: _quay_needs_clean_retry | bool
+
+- name: Re-create auth directory for clean retry
+  ansible.builtin.file:
+    state: directory
+    path: "{{ quay_mirror_workspace }}/containers"
+    mode: '0700'
+  when: _quay_needs_clean_retry | bool
+
+- name: Rebuild combined auth.json for clean retry
+  ansible.builtin.shell: |
+    set -e
+    cp "{{ initial_mirror_workspace }}/containers/auth.json" \
+       "{{ quay_mirror_workspace }}/containers/auth.json"
+    jq -c \
+      --arg host "{{ quay_registry_url }}" \
+      --arg auth "{{ (quay_robot_username ~ ':' ~ quay_robot_token) | b64encode }}" \
+      '.auths[$host] = {"auth": $auth, "email": ""}' \
+      "{{ quay_mirror_workspace }}/containers/auth.json" \
+      > "{{ quay_mirror_workspace }}/containers/auth.json.tmp" \
+      && mv "{{ quay_mirror_workspace }}/containers/auth.json.tmp" \
+            "{{ quay_mirror_workspace }}/containers/auth.json"
+  args:
+    executable: /bin/bash
+  changed_when: true
+  no_log: true
+  when: _quay_needs_clean_retry | bool
+
+- name: Run oc-mirror to Quay (clean retry — fresh workspace, no prior state)
   ansible.builtin.command: >
     {{ bin_dir }}/oc-mirror
     --v2
