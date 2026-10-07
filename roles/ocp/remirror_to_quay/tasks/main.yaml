@@ -422,6 +422,33 @@
   register: _quay_clean_retry_cs
   when: _quay_needs_clean_retry | bool
 
+- name: Find IDMS files after clean retry
+  ansible.builtin.find:
+    paths: "{{ quay_mirror_workspace }}/working-dir/cluster-resources"
+    patterns:
+      - "idms-*.yaml"
+      - "imageDigestMirrorSet*.yaml"
+      - "imageContentSourcePolicy*.yaml"
+    file_type: file
+  register: _quay_clean_retry_idms
+  when: _quay_needs_clean_retry | bool
+
+# _quay_cs_files and _quay_idms_files were found BEFORE the clean retry wipe.
+# Update them so the read tasks downstream use the freshly generated files.
+- name: Update CatalogSource file list with clean retry results
+  ansible.builtin.set_fact:
+    _quay_cs_files: "{{ _quay_clean_retry_cs }}"
+  when:
+    - _quay_needs_clean_retry | bool
+    - _quay_clean_retry_cs.files | default([]) | length > 0
+
+- name: Update IDMS file list with clean retry results
+  ansible.builtin.set_fact:
+    _quay_idms_files: "{{ _quay_clean_retry_idms }}"
+  when:
+    - _quay_needs_clean_retry | bool
+    - _quay_clean_retry_idms.files | default([]) | length > 0
+
 - name: Fail if CatalogSource still missing after clean retry
   ansible.builtin.fail:
     msg: >-
