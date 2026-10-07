@@ -161,6 +161,11 @@
     -b '{{ ds389_suffix }}' -s base dn
   register: _suffix_check
   changed_when: false
+  # 389 DS can briefly drop connections while initialising the suffix backend
+  # after the root DSE is already answering. Retry on rc=255 (connection refused).
+  until: _suffix_check.rc in [0, 32]
+  retries: 12
+  delay: 5
   failed_when: _suffix_check.rc not in [0, 32]
   become: true
 
