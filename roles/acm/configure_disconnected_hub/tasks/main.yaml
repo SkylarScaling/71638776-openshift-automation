@@ -16,18 +16,29 @@
   retries: 5
   delay: 5
 
-- name: Create ConfigMap with mirror registry CA for spoke provisioning
+# Hive provisioner pods pull the installer image from the mirror registry.
+# Without trusting the mirror CA here, the pull fails silently and Hive reports
+# "Cluster install failed but installer log was not captured" (UnknownError).
+- name: Create mirror registry CA Secret for Hive (hive namespace)
   ansible.builtin.shell:
     cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
     stdin: |
       apiVersion: v1
-      kind: ConfigMap
+      kind: Secret
       metadata:
-        name: mirror-registry-ca-bundle
-        namespace: open-cluster-management
+        name: mirror-registry-ca
+        namespace: hive
       data:
-        ca-bundle.crt: |
-          {{ mirror_registry_ca_bundle | indent(10) }}
+        ca.crt: "{{ mirror_registry_ca_bundle | b64encode }}"
+  changed_when: true
+  no_log: true
+
+- name: Patch HiveConfig to trust mirror registry CA
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc patch hiveconfig hive
+    --kubeconfig {{ target_kubeconfig }}
+    --type=merge
+    -p '{"spec":{"additionalCertificateAuthorities":[{"name":"mirror-registry-ca"}]}}'
   changed_when: true
 
 - name: Display disconnected hub configuration summary
