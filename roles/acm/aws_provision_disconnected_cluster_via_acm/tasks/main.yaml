@@ -83,9 +83,14 @@
     -o jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}' 2>/dev/null || true
   register: _cd_conditions
   changed_when: false
+  # ProvisionFailed=True is per-attempt and gets reset when a retry starts — using it
+  # as the exit condition causes a race: Ansible exits between attempt N failing and
+  # Hive resetting the condition before attempt N+1 starts.
+  # ProvisionStopped=True is only set after all retry attempts are exhausted (or
+  # installAttemptsLimit is reached), making it the correct final-failure signal.
   until: >
     ('Provisioned=True' in _cd_conditions.stdout) or
-    ('ProvisionFailed=True' in _cd_conditions.stdout)
+    ('ProvisionStopped=True' in _cd_conditions.stdout)
   retries: 90
   delay: 60
 
@@ -98,7 +103,7 @@
     2>/dev/null || true
   register: _cd_fail_details
   changed_when: false
-  when: "'ProvisionFailed=True' in _cd_conditions.stdout"
+  when: "'ProvisionStopped=True' in _cd_conditions.stdout"
 
 - name: Collect ClusterProvision object details
   ansible.builtin.shell: >
@@ -110,13 +115,13 @@
     2>/dev/null || true
   register: _cp_details
   changed_when: false
-  when: "'ProvisionFailed=True' in _cd_conditions.stdout"
+  when: "'ProvisionStopped=True' in _cd_conditions.stdout"
 
 - name: Display ClusterProvision details
   ansible.builtin.debug:
     msg: "{{ _cp_details.stdout_lines }}"
   when:
-    - "'ProvisionFailed=True' in _cd_conditions.stdout"
+    - "'ProvisionStopped=True' in _cd_conditions.stdout"
     - _cp_details.stdout | default('') != ''
 
 - name: Get provisioner pod name for failed ClusterProvision
@@ -128,7 +133,7 @@
     -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null || true
   register: _prov_pod_name
   changed_when: false
-  when: "'ProvisionFailed=True' in _cd_conditions.stdout"
+  when: "'ProvisionStopped=True' in _cd_conditions.stdout"
 
 - name: Collect provisioner pod logs
   ansible.builtin.shell: >
@@ -139,14 +144,14 @@
   register: _prov_pod_logs
   changed_when: false
   when:
-    - "'ProvisionFailed=True' in _cd_conditions.stdout"
+    - "'ProvisionStopped=True' in _cd_conditions.stdout"
     - _prov_pod_name.stdout | default('') != ''
 
 - name: Display provisioner pod logs
   ansible.builtin.debug:
     msg: "{{ _prov_pod_logs.stdout_lines | default(['(no logs)']) }}"
   when:
-    - "'ProvisionFailed=True' in _cd_conditions.stdout"
+    - "'ProvisionStopped=True' in _cd_conditions.stdout"
     - _prov_pod_name.stdout | default('') != ''
 
 - name: Collect provisioner pod events
@@ -160,20 +165,20 @@
   register: _prov_pod_events
   changed_when: false
   when:
-    - "'ProvisionFailed=True' in _cd_conditions.stdout"
+    - "'ProvisionStopped=True' in _cd_conditions.stdout"
     - _prov_pod_name.stdout | default('') != ''
 
 - name: Display provisioner pod events
   ansible.builtin.debug:
     msg: "{{ _prov_pod_events.stdout_lines | default(['(no events)']) }}"
   when:
-    - "'ProvisionFailed=True' in _cd_conditions.stdout"
+    - "'ProvisionStopped=True' in _cd_conditions.stdout"
     - _prov_pod_name.stdout | default('') != ''
 
 - name: Fail immediately if provisioning errored out
   ansible.builtin.fail:
     msg: "Provisioning for {{ ocp_cluster.name }} failed!\n{{ _cd_fail_details.stdout | default('No details available.') }}"
-  when: "'ProvisionFailed=True' in _cd_conditions.stdout"
+  when: "'ProvisionStopped=True' in _cd_conditions.stdout"
 
 - name: Ensure Observability Namespace exists on the Spoke via ManifestWork
   ansible.builtin.shell:

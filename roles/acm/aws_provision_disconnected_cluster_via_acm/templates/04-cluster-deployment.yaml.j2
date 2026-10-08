@@ -8,6 +8,10 @@ metadata:
 spec:
   baseDomain: {{ base_domain }}
   clusterName: {{ ocp_cluster.name }}
+  # Single attempt — ProvisionStopped=True is set immediately on failure so the
+  # Ansible wait task can use it as the definitive stop signal. Re-run the playbook
+  # to retry (it will delete and recreate the ClusterDeployment).
+  installAttemptsLimit: 1
   platform:
     aws:
       credentialsSecretRef:
