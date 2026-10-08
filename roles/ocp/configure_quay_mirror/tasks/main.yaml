@@ -102,10 +102,13 @@
     os.chdir('/quay-registry')
     from app import app
     with app.app_context():
-        if app.config.get('FEATURE_EXTENDED_REPOSITORY_NAMES', False):
+        ext = app.config.get('FEATURE_EXTENDED_REPOSITORY_NAMES', False)
+        auto_create = app.config.get('CREATE_PRIVATE_REPO_ON_PUSH', False)
+        if ext and auto_create:
             print('confirmed')
         else:
-            print('missing')
+            print('missing: FEATURE_EXTENDED_REPOSITORY_NAMES=' + str(ext) +
+                  ' CREATE_PRIVATE_REPO_ON_PUSH=' + str(auto_create))
     PYEOF
   args:
     executable: /bin/bash

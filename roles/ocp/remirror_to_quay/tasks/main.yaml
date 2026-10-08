@@ -449,6 +449,25 @@
     - _quay_needs_clean_retry | bool
     - _quay_clean_retry_idms.files | default([]) | length > 0
 
+- name: Collect oc-mirror error log before final failure
+  ansible.builtin.shell: >
+    find {{ quay_mirror_workspace }}/working-dir/logs
+    -name "mirroring_errors_*.txt"
+    -exec cat {} \; 2>/dev/null | tail -80 || echo "(no error log found)"
+  register: _quay_clean_retry_error_log
+  changed_when: false
+  failed_when: false
+  when:
+    - _quay_needs_clean_retry | bool
+    - _quay_clean_retry_cs.files | default([]) | length == 0
+
+- name: Display oc-mirror error log
+  ansible.builtin.debug:
+    msg: "{{ _quay_clean_retry_error_log.stdout_lines | default(['(no error log)']) }}"
+  when:
+    - _quay_needs_clean_retry | bool
+    - _quay_clean_retry_cs.files | default([]) | length == 0
+
 - name: Fail if CatalogSource still missing after clean retry
   ansible.builtin.fail:
     msg: >-
