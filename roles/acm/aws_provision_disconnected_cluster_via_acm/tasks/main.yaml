@@ -100,6 +100,76 @@
   changed_when: false
   when: "'ProvisionFailed=True' in _cd_conditions.stdout"
 
+- name: Collect ClusterProvision object details
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get clusterprovision
+    -n {{ ocp_cluster.name }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{range .items[*]}name={.metadata.name} stage={.spec.stage} attempt={.spec.attempt}
+    installerImage={.spec.installerImage}{"\n"}conditions={range .status.conditions[*]}{.type}={.status}({.reason}): {.message}{"\n"}{end}{"\n"}{end}'
+    2>/dev/null || true
+  register: _cp_details
+  changed_when: false
+  when: "'ProvisionFailed=True' in _cd_conditions.stdout"
+
+- name: Display ClusterProvision details
+  ansible.builtin.debug:
+    msg: "{{ _cp_details.stdout_lines }}"
+  when:
+    - "'ProvisionFailed=True' in _cd_conditions.stdout"
+    - _cp_details.stdout | default('') != ''
+
+- name: Get provisioner pod name for failed ClusterProvision
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get pod
+    -n {{ ocp_cluster.name }}
+    --kubeconfig {{ target_kubeconfig }}
+    -l hive.openshift.io/cluster-deployment-name={{ ocp_cluster.name }}
+    -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null || true
+  register: _prov_pod_name
+  changed_when: false
+  when: "'ProvisionFailed=True' in _cd_conditions.stdout"
+
+- name: Collect provisioner pod logs
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc logs {{ _prov_pod_name.stdout }}
+    -n {{ ocp_cluster.name }}
+    --kubeconfig {{ target_kubeconfig }}
+    --all-containers --tail=100 2>&1 || true
+  register: _prov_pod_logs
+  changed_when: false
+  when:
+    - "'ProvisionFailed=True' in _cd_conditions.stdout"
+    - _prov_pod_name.stdout | default('') != ''
+
+- name: Display provisioner pod logs
+  ansible.builtin.debug:
+    msg: "{{ _prov_pod_logs.stdout_lines | default(['(no logs)']) }}"
+  when:
+    - "'ProvisionFailed=True' in _cd_conditions.stdout"
+    - _prov_pod_name.stdout | default('') != ''
+
+- name: Collect provisioner pod events
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get events
+    -n {{ ocp_cluster.name }}
+    --kubeconfig {{ target_kubeconfig }}
+    --sort-by='.lastTimestamp'
+    --field-selector "involvedObject.name={{ _prov_pod_name.stdout }}"
+    2>/dev/null | tail -20 || true
+  register: _prov_pod_events
+  changed_when: false
+  when:
+    - "'ProvisionFailed=True' in _cd_conditions.stdout"
+    - _prov_pod_name.stdout | default('') != ''
+
+- name: Display provisioner pod events
+  ansible.builtin.debug:
+    msg: "{{ _prov_pod_events.stdout_lines | default(['(no events)']) }}"
+  when:
+    - "'ProvisionFailed=True' in _cd_conditions.stdout"
+    - _prov_pod_name.stdout | default('') != ''
+
 - name: Fail immediately if provisioning errored out
   ansible.builtin.fail:
     msg: "Provisioning for {{ ocp_cluster.name }} failed!\n{{ _cd_fail_details.stdout | default('No details available.') }}"

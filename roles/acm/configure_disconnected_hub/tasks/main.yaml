@@ -19,6 +19,7 @@
 # Hive provisioner pods pull the installer image from the mirror registry.
 # Without trusting the mirror CA here, the pull fails silently and Hive reports
 # "Cluster install failed but installer log was not captured" (UnknownError).
+# Use stringData so Kubernetes handles base64 encoding — avoids double-encode risk.
 - name: Create mirror registry CA Secret for Hive (hive namespace)
   ansible.builtin.shell:
     cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
@@ -28,8 +29,9 @@
       metadata:
         name: mirror-registry-ca
         namespace: hive
-      data:
-        ca.crt: "{{ mirror_registry_ca_bundle | b64encode }}"
+      stringData:
+        ca.crt: |
+          {{ mirror_registry_ca_bundle | indent(10) }}
   changed_when: true
   no_log: true
 
@@ -40,6 +42,18 @@
     --type=merge
     -p '{"spec":{"additionalCertificateAuthorities":[{"name":"mirror-registry-ca"}]}}'
   changed_when: true
+
+- name: Wait for Hive to reconcile HiveConfig CA change
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get secret mirror-registry-ca
+    -n hive
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null || true
+  register: _hive_ca_secret_rv
+  changed_when: false
+  until: _hive_ca_secret_rv.stdout != ""
+  retries: 12
+  delay: 10
 
 - name: Display disconnected hub configuration summary
   ansible.builtin.debug:
