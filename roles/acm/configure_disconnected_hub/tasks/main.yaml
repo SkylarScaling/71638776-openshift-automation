@@ -96,20 +96,14 @@
   changed_when: false
   when: _hc_ca_mounted.stdout == ""
 
-- name: Verify hive-controllers pod is running after CA mount
+- name: Verify hive-controllers deployment has available replicas after CA mount
   ansible.builtin.shell: >
-    {{ bin_dir }}/oc get pods -n hive
+    {{ bin_dir }}/oc get deployment hive-controllers -n hive
     --kubeconfig {{ target_kubeconfig }}
-    -l control-plane=hive-controller
-    -o jsonpath='{range .items[*]}{.metadata.name}={.status.phase}({.status.containerStatuses[0].state.waiting.reason}){"\n"}{end}'
-    2>/dev/null || true
+    -o jsonpath='{.status.availableReplicas}' 2>/dev/null || echo 0
   register: _hc_health
   changed_when: false
-  until: >
-    _hc_health.stdout != "" and
-    'Running' in _hc_health.stdout and
-    'CrashLoopBackOff' not in _hc_health.stdout and
-    'ImagePullBackOff' not in _hc_health.stdout
+  until: (_hc_health.stdout | int) >= 1
   retries: 12
   delay: 15
 
