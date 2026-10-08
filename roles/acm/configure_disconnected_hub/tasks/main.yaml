@@ -55,6 +55,47 @@
   retries: 12
   delay: 10
 
+# HiveConfig additionalCertificateAuthorities relies on the Hive operator to reconcile
+# and rebuild the hive-controllers pod template. In MCE 2.11.x the operator cannot
+# reconcile HiveConfig (broken OpenAPI schema), so the CA is never applied.
+#
+# Direct fix: mount the CA cert file into hive-controllers' /etc/pki/tls/certs/ via
+# subPath so only that one file is added (the rest of the directory is untouched).
+# Go's crypto/x509 on Linux reads all files from certDirectories including that path,
+# so hive-controllers will trust the mirror registry when pulling release manifests.
+- name: Get hive-controllers main container name
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get deployment hive-controllers -n hive
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.spec.template.spec.containers[0].name}' 2>/dev/null || true
+  register: _hc_container_name
+  changed_when: false
+
+- name: Check if mirror CA already mounted in hive-controllers
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get deployment hive-controllers -n hive
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.spec.template.spec.volumes[?(@.name=="mirror-registry-ca")].name}' 2>/dev/null || true
+  register: _hc_ca_mounted
+  changed_when: false
+
+- name: Mount mirror registry CA into hive-controllers pod trust store
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc patch deployment hive-controllers -n hive
+    --kubeconfig {{ target_kubeconfig }}
+    --type=strategic
+    -p '{"spec":{"template":{"spec":{"volumes":[{"name":"mirror-registry-ca","secret":{"secretName":"mirror-registry-ca","items":[{"key":"ca.crt","path":"mirror-registry-ca.crt"}]}}],"containers":[{"name":"{{ _hc_container_name.stdout }}","volumeMounts":[{"name":"mirror-registry-ca","mountPath":"/etc/pki/tls/certs/mirror-registry-ca.crt","subPath":"mirror-registry-ca.crt","readOnly":true}]}]}}}}'
+  changed_when: true
+  when: _hc_ca_mounted.stdout == ""
+
+- name: Wait for hive-controllers rollout after CA mount
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc rollout status deployment/hive-controllers -n hive
+    --kubeconfig {{ target_kubeconfig }}
+    --timeout=5m
+  changed_when: false
+  when: _hc_ca_mounted.stdout == ""
+
 - name: Display disconnected hub configuration summary
   ansible.builtin.debug:
     msg:
