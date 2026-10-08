@@ -72,8 +72,61 @@
   register: _cd_provision_ref
   changed_when: false
   until: _cd_provision_ref.stdout != ""
-  retries: 30
+  retries: 60
   delay: 10
+
+- name: Collect diagnostics when Hive never started provisioning
+  when: _cd_provision_ref.stdout == ""
+  block:
+    - name: Show ClusterDeployment conditions (why Hive might not start)
+      ansible.builtin.shell: >
+        {{ bin_dir }}/oc get clusterdeployment {{ ocp_cluster.name }}
+        -n {{ ocp_cluster.name }}
+        --kubeconfig {{ target_kubeconfig }}
+        -o jsonpath='{range .status.conditions[*]}{.type}={.status} ({.reason}): {.message}{"\n"}{end}'
+        2>/dev/null || echo "(ClusterDeployment not found)"
+      register: _cd_no_prov_conditions
+      changed_when: false
+
+    - name: Display ClusterDeployment conditions
+      ansible.builtin.debug:
+        msg: "{{ _cd_no_prov_conditions.stdout_lines }}"
+
+    - name: Show hive-controllers pod status
+      ansible.builtin.shell: >
+        {{ bin_dir }}/oc get pods -n hive
+        --kubeconfig {{ target_kubeconfig }}
+        -l control-plane=hive-controller
+        -o wide 2>/dev/null || true
+      register: _hive_ctrl_pods
+      changed_when: false
+
+    - name: Display hive-controllers pod status
+      ansible.builtin.debug:
+        msg: "{{ _hive_ctrl_pods.stdout_lines }}"
+
+    - name: Show recent hive-controllers logs
+      ansible.builtin.shell: >
+        {{ bin_dir }}/oc logs -n hive
+        --kubeconfig {{ target_kubeconfig }}
+        -l control-plane=hive-controller
+        --tail=50 2>/dev/null | grep -i "error\|warn\|clusterdeployment\|provision" || echo "(no relevant logs)"
+      register: _hive_ctrl_logs
+      changed_when: false
+      failed_when: false
+
+    - name: Display hive-controllers logs
+      ansible.builtin.debug:
+        msg: "{{ _hive_ctrl_logs.stdout_lines }}"
+
+    - name: Fail — Hive never started provisioning for {{ ocp_cluster.name }}
+      ansible.builtin.fail:
+        msg: >-
+          hive-controllers did not create a ClusterProvision for {{ ocp_cluster.name }}
+          within 10 minutes. Check ClusterDeployment conditions and hive-controllers
+          pod status above. Common causes: hive-controllers pod not running,
+          ClusterDeployment validation error, or installAttemptsLimit already reached
+          from a previous failed run (delete and recreate the ClusterDeployment).
 
 - name: Wait for OpenShift cluster installation to complete or fail (Takes 35-45+ minutes)
   ansible.builtin.shell: >
