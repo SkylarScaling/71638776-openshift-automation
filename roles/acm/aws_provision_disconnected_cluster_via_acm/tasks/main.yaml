@@ -51,6 +51,29 @@
   changed_when: true
   no_log: true
 
+# installAttemptsLimit: 1 means Hive sets ProvisionStopped=True after the single
+# attempt fails. oc apply leaves the ClusterDeployment in-place on re-runs, so
+# Hive sees the limit already exhausted and never creates a new ClusterProvision.
+# Delete the stopped ClusterDeployment before applying so Hive starts fresh.
+- name: Check if ClusterDeployment is already ProvisionStopped
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get clusterdeployment {{ ocp_cluster.name }}
+    -n {{ ocp_cluster.name }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.conditions[?(@.type=="ProvisionStopped")].status}'
+    2>/dev/null || true
+  register: _cd_stopped_check
+  changed_when: false
+
+- name: Delete stopped ClusterDeployment so Hive can provision fresh
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc delete clusterdeployment {{ ocp_cluster.name }}
+    -n {{ ocp_cluster.name }}
+    --kubeconfig {{ target_kubeconfig }}
+    --wait=true --timeout=5m
+  changed_when: true
+  when: _cd_stopped_check.stdout == "True"
+
 - name: Create ClusterDeployment object
   ansible.builtin.shell:
     cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
@@ -74,6 +97,8 @@
   until: _cd_provision_ref.stdout != ""
   retries: 60
   delay: 10
+  # ignore_errors so the diagnostics block below runs on exhaustion
+  ignore_errors: true
 
 - name: Collect diagnostics when Hive never started provisioning
   when: _cd_provision_ref.stdout == ""
