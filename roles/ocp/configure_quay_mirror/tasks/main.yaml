@@ -48,6 +48,13 @@
     --overwrite
   changed_when: true
 
+# HAProxy reloads asynchronously after a route annotation change. Without a
+# short wait, oc-mirror can start before the reload and still hit the old 30 s
+# timeout, resulting in EOF on large blob uploads.
+- name: Wait for HAProxy to reload the new route timeout
+  ansible.builtin.pause:
+    seconds: 15
+
 - name: Set Quay registry URL facts
   ansible.builtin.set_fact:
     quay_registry_url: "{{ _quay_route_raw.stdout | trim }}"
@@ -97,7 +104,12 @@
   register: _quay_config_patch
   changed_when: "'changed:' in _quay_config_patch.stdout"
 
-- name: Wait for Quay Operator to apply new config to running pods
+# Run unconditionally — the Quay Operator can reset the configBundleSecret
+# between runs, silently disabling CREATE_PRIVATE_REPO_ON_PUSH. If it is off,
+# oc-mirror gets 'unauthorized' when trying to push operator images to repos
+# that don't exist yet (release repos succeed because they were created on
+# a prior run). Re-patch if missing, then wait for both settings to be live.
+- name: Verify CREATE_PRIVATE_REPO_ON_PUSH and FEATURE_EXTENDED_REPOSITORY_NAMES are live
   ansible.builtin.shell: |
     POD=$({{ bin_dir }}/oc get pod -n {{ quay_mirror_namespace }} \
       --kubeconfig {{ target_kubeconfig }} \
@@ -129,19 +141,7 @@
   until: "'confirmed' in _quay_feature_verify.stdout"
   retries: 24
   delay: 15
-  when: _quay_config_patch is changed
   changed_when: false
-
-# After FEATURE_EXTENDED_REPOSITORY_NAMES is confirmed live, allow Quay time
-# to fully propagate CREATE_PRIVATE_REPO_ON_PUSH through its internal
-# subsystems. Without this pause, oc-mirror starts immediately and its first
-# attempt to push the catalog index fails silently (rc=0, no CatalogSource
-# generated) because Quay cannot yet auto-create the repository.
-- name: Allow Quay to fully stabilise after config change before oc-mirror starts
-  ansible.builtin.pause:
-    seconds: 60
-    prompt: "Waiting 60s for Quay to fully apply CREATE_PRIVATE_REPO_ON_PUSH..."
-  when: _quay_config_patch is changed
 
 - name: Get Quay app pod name
   ansible.builtin.shell: >
