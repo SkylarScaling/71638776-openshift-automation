@@ -35,6 +35,19 @@
   delay: 10
   until: _quay_route_raw.stdout != ""
 
+# OCP's default HAProxy route timeout is 30 s. Large blob uploads (operator
+# catalog index images are often 3-5 GB) take longer and the ingress drops
+# the connection mid-upload, producing an EOF error and no CatalogSource.
+- name: Increase Quay route timeout for large blob uploads
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc annotate route
+    -n {{ quay_mirror_namespace }}
+    -l "quay-component=quay-app-route,quay-operator/quayregistry={{ quay_mirror_registry_name }}"
+    --kubeconfig {{ target_kubeconfig }}
+    haproxy.router.openshift.io/timeout=1800s
+    --overwrite
+  changed_when: true
+
 - name: Set Quay registry URL facts
   ansible.builtin.set_fact:
     quay_registry_url: "{{ _quay_route_raw.stdout | trim }}"
