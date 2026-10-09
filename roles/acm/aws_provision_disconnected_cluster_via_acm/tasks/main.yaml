@@ -121,7 +121,7 @@
       ansible.builtin.shell: >
         {{ bin_dir }}/oc get pods -n hive
         --kubeconfig {{ target_kubeconfig }}
-        -l control-plane=hive-controller
+        -l app=hive-controllers
         -o wide 2>/dev/null || true
       register: _hive_ctrl_pods
       changed_when: false
@@ -134,7 +134,7 @@
       ansible.builtin.shell: >
         {{ bin_dir }}/oc logs -n hive
         --kubeconfig {{ target_kubeconfig }}
-        -l control-plane=hive-controller
+        -l app=hive-controllers
         --tail=50 2>/dev/null | grep -i "error\|warn\|clusterdeployment\|provision" || echo "(no relevant logs)"
       register: _hive_ctrl_logs
       changed_when: false
@@ -188,8 +188,7 @@
     {{ bin_dir }}/oc get clusterprovision
     -n {{ ocp_cluster.name }}
     --kubeconfig {{ target_kubeconfig }}
-    -o jsonpath='{range .items[*]}name={.metadata.name} stage={.spec.stage} attempt={.spec.attempt}
-    installerImage={.spec.installerImage}{"\n"}conditions={range .status.conditions[*]}{.type}={.status}({.reason}): {.message}{"\n"}{end}{"\n"}{end}'
+    -o jsonpath='{range .items[*]}name={.metadata.name} stage={.spec.stage} attempt={.spec.attempt}{"\n"}conditions={range .status.conditions[*]}{.type}={.status}({.reason}): {.message}{"\n"}{end}installLog={.spec.installLog}{"\n\n"}{end}'
     2>/dev/null || true
   register: _cp_details
   changed_when: false
@@ -201,6 +200,26 @@
   when:
     - "'ProvisionStopped=True' in _cd_conditions.stdout"
     - _cp_details.stdout | default('') != ''
+
+- name: Collect provisioner Job status (persists after pods are deleted)
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get job
+    -n {{ ocp_cluster.name }}
+    --kubeconfig {{ target_kubeconfig }}
+    -l hive.openshift.io/cluster-deployment-name={{ ocp_cluster.name }}
+    -o jsonpath='{range .items[-1:]}{.metadata.name}: active={.status.active} succeeded={.status.succeeded} failed={.status.failed}
+    image={.spec.template.spec.initContainers[0].image}{"\n"}{end}'
+    2>/dev/null || echo "(no provisioner Job found)"
+  register: _prov_job
+  changed_when: false
+  when: "'ProvisionStopped=True' in _cd_conditions.stdout"
+
+- name: Display provisioner Job status
+  ansible.builtin.debug:
+    msg: "{{ _prov_job.stdout_lines }}"
+  when:
+    - "'ProvisionStopped=True' in _cd_conditions.stdout"
+    - _prov_job.stdout | default('') != ''
 
 - name: Get provisioner pod name for failed ClusterProvision
   ansible.builtin.shell: >
