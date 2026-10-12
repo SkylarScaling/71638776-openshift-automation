@@ -305,6 +305,13 @@
     - _quay_regen_result.finished
     - _quay_regen_result.rc not in [0, 4, 12, 14]
 
+- name: Converge Quay repo-creation races after initial oc-mirror run
+  ansible.builtin.include_tasks: converge_unauthorized.yml
+  loop: [1, 2]
+  loop_control:
+    loop_var: _converge_pass
+  when: not _quay_mirror_complete
+
 # Read generated manifests from Quay workspace
 - name: Find IDMS files in Quay oc-mirror output
   ansible.builtin.find:
@@ -414,6 +421,13 @@
     - _quay_retry_result.finished
     - _quay_retry_result.rc not in [0, 4, 12, 14]
 
+- name: Converge Quay repo-creation races after clean retry
+  ansible.builtin.include_tasks: converge_unauthorized.yml
+  loop: [1, 2]
+  loop_control:
+    loop_var: _converge_pass
+  when: _quay_needs_clean_retry | bool
+
 - name: Find CatalogSource files after clean retry
   ansible.builtin.find:
     paths: "{{ quay_mirror_workspace }}/working-dir/cluster-resources"
@@ -472,9 +486,9 @@
   ansible.builtin.fail:
     msg: >-
       oc-mirror still did not generate CatalogSource manifests after a
-      clean workspace retry. Check oc-mirror logs at
-      {{ quay_mirror_workspace }}/working-dir/logs/ and verify
-      CREATE_PRIVATE_REPO_ON_PUSH is enabled on the Quay instance.
+      clean workspace retry and two convergence passes. Check oc-mirror
+      logs at {{ quay_mirror_workspace }}/working-dir/logs/ for
+      'unauthorized' (Quay repo-creation push-token race) or other errors.
   when:
     - _quay_needs_clean_retry | bool
     - _quay_clean_retry_cs.files | default([]) | length == 0
@@ -515,8 +529,8 @@
       oc-mirror generated CatalogSource manifests but none reference
       'redhat-operator-index'. The operator catalog index image was not
       successfully pushed to Quay. Check the oc-mirror error log at
-      {{ quay_mirror_workspace }}/working-dir/logs/ and verify
-      CREATE_PRIVATE_REPO_ON_PUSH is enabled on the Quay instance.
+      {{ quay_mirror_workspace }}/working-dir/logs/ for 'unauthorized'
+      (Quay repo-creation push-token race) or other errors.
   when: _quay_cs_catalog_entries | length == 0
 
 - name: Extract Quay catalog image from CatalogSource manifest
