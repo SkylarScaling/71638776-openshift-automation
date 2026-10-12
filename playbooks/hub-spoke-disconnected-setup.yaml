@@ -383,6 +383,36 @@
         hub_kubeconfig: "{{ install_dir }}/{{ hostvars[groups['hub_cluster'][0]]['ocp_cluster']['name'] }}/auth/kubeconfig"
 
     # ------------------------------------------------------------------
+    # Guard: a hub Day 2 role (e.g. configure_ntp) may have just applied a
+    # MachineConfig. If the hub's MCPs are mid-roll (or about to start one)
+    # when Hive schedules the spoke's installer pod, the MCO can drain that
+    # pod's node mid-install — killing it and producing a generic
+    # "UnknownError: installer log was not captured" that looks unrelated
+    # to MachineConfigs entirely. Block here until the hub is fully settled.
+    # ------------------------------------------------------------------
+    - name: Wait for hub master MachineConfigPool to be settled before spoke provisioning
+      ansible.builtin.shell: >
+        {{ bin_dir }}/oc get mcp master
+        --kubeconfig {{ hub_kubeconfig }}
+        -o jsonpath='{.status.conditions[?(@.type=="Updated")].status}={.status.conditions[?(@.type=="Updating")].status}'
+      register: _hub_master_mcp_settled
+      until: _hub_master_mcp_settled.stdout == "True=False"
+      retries: 90
+      delay: 30
+      changed_when: false
+
+    - name: Wait for hub worker MachineConfigPool to be settled before spoke provisioning
+      ansible.builtin.shell: >
+        {{ bin_dir }}/oc get mcp worker
+        --kubeconfig {{ hub_kubeconfig }}
+        -o jsonpath='{.status.conditions[?(@.type=="Updated")].status}={.status.conditions[?(@.type=="Updating")].status}'
+      register: _hub_worker_mcp_settled
+      until: _hub_worker_mcp_settled.stdout == "True=False"
+      retries: 90
+      delay: 30
+      changed_when: false
+
+    # ------------------------------------------------------------------
     # Load disconnected facts — prefer in-memory hostvars from the Hub
     # play; fall back to disk so --tags spokes works standalone.
     # ------------------------------------------------------------------

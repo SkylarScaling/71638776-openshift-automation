@@ -107,6 +107,85 @@
   retries: 12
   delay: 15
 
+# The installer writes additionalTrustBundle into openshift-config/user-ca-bundle
+# automatically, but proxy/cluster .spec.trustedCA.name is NOT pointed at it unless
+# an HTTP(S) proxy was also configured. Without this, the CNO never merges the
+# mirror CA into the cluster-wide trust bundle (hive-trusted-cabundle, node trust
+# stores, etc.) — so spoke installer pods have no mirror CA even though Hive's own
+# controllers do (via the hive-controllers mount above). In a genuinely airgapped
+# environment this causes the installer to fail x509 against the mirror registry.
+- name: Check if proxy/cluster already trusts user-ca-bundle
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get proxy cluster
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.spec.trustedCA.name}' 2>/dev/null || true
+  register: _proxy_trusted_ca
+  changed_when: false
+
+- name: Patch proxy/cluster to trust user-ca-bundle (mirror CA)
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc patch proxy/cluster
+    --kubeconfig {{ target_kubeconfig }}
+    --type=merge
+    -p '{"spec":{"trustedCA":{"name":"user-ca-bundle"}}}'
+  changed_when: true
+  when: _proxy_trusted_ca.stdout != "user-ca-bundle"
+
+# Setting proxy/cluster trustedCA triggers a MachineConfig roll to inject the CA
+# into node trust stores — wait for it fully, using the MCO detection window
+# pattern, before returning control to the playbook (spoke provisioning is also
+# gated on hub MCP health, but settle here too so any other hub Day 2 step that
+# runs next does not race this roll).
+- name: Wait for hub master MCP to begin updating after trustedCA change (MCO detection window)
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get mcp master
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.conditions[?(@.type=="Updating")].status}'
+  register: _trustca_master_updating
+  until: _trustca_master_updating.stdout == "True"
+  retries: 12
+  delay: 15
+  changed_when: false
+  failed_when: false
+  when: _proxy_trusted_ca.stdout != "user-ca-bundle"
+
+- name: Wait for hub master MCP to finish updating after trustedCA change
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get mcp master
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.conditions[?(@.type=="Updated")].status}'
+  register: _trustca_master_updated
+  until: _trustca_master_updated.stdout == "True"
+  retries: 60
+  delay: 30
+  changed_when: false
+  when: _proxy_trusted_ca.stdout != "user-ca-bundle"
+
+- name: Wait for hub worker MCP to begin updating after trustedCA change (MCO detection window)
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get mcp worker
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.conditions[?(@.type=="Updating")].status}'
+  register: _trustca_worker_updating
+  until: _trustca_worker_updating.stdout == "True"
+  retries: 12
+  delay: 15
+  changed_when: false
+  failed_when: false
+  when: _proxy_trusted_ca.stdout != "user-ca-bundle"
+
+- name: Wait for hub worker MCP to finish updating after trustedCA change
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get mcp worker
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.conditions[?(@.type=="Updated")].status}'
+  register: _trustca_worker_updated
+  until: _trustca_worker_updated.stdout == "True"
+  retries: 90
+  delay: 30
+  changed_when: false
+  when: _proxy_trusted_ca.stdout != "user-ca-bundle"
+
 - name: Display disconnected hub configuration summary
   ansible.builtin.debug:
     msg:
