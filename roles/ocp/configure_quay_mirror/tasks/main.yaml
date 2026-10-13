@@ -71,16 +71,29 @@
 # status (and from there to the ELB attribute) rather than blindly pausing —
 # a blind pause is the same mistake that made the route annotation look
 # "fixed" when it was never actually taking effect.
-- name: Wait for IngressController to report the new idle timeout
-  ansible.builtin.shell: >
-    {{ bin_dir }}/oc get ingresscontroller default
-    -n openshift-ingress-operator
-    --kubeconfig {{ target_kubeconfig }}
-    -o jsonpath='{.status.endpointPublishingStrategy.loadBalancer.providerParameters.aws.classicLoadBalancer.connectionIdleTimeout}'
-    2>/dev/null || true
+# Kubernetes round-trips the duration through Go's time.Duration and reports
+# it back in Go's canonical String() format (e.g. requesting "30m" reports
+# back as "30m0s") — comparing the raw strings for equality never matches.
+# Parse both sides into seconds and compare numerically instead.
+- name: Wait for IngressController to report an idle timeout of at least the desired value
+  ansible.builtin.shell: |
+    CURRENT=$({{ bin_dir }}/oc get ingresscontroller default \
+      -n openshift-ingress-operator \
+      --kubeconfig {{ target_kubeconfig }} \
+      -o jsonpath='{.status.endpointPublishingStrategy.loadBalancer.providerParameters.aws.classicLoadBalancer.connectionIdleTimeout}' 2>/dev/null || true)
+    python3 -c "
+    import re
+    def to_seconds(s):
+        return sum(int(n) * {'h': 3600, 'm': 60, 's': 1}[u] for n, u in re.findall(r'(\d+)([hms])', s))
+    current = '''$CURRENT'''
+    desired = '{{ quay_mirror_ingress_idle_timeout }}'
+    print('confirmed:' + current if current and to_seconds(current) >= to_seconds(desired) else 'pending:' + current)
+    "
+  args:
+    executable: /bin/bash
   register: _ingress_idle_timeout_check
   changed_when: false
-  until: _ingress_idle_timeout_check.stdout == quay_mirror_ingress_idle_timeout
+  until: "'confirmed:' in _ingress_idle_timeout_check.stdout"
   retries: 12
   delay: 10
   when: _ingress_lb_type.stdout == "Classic"
