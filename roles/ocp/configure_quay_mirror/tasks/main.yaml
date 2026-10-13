@@ -35,25 +35,55 @@
   delay: 10
   until: _quay_route_raw.stdout != ""
 
-# OCP's default HAProxy route timeout is 30 s. Large blob uploads (operator
-# catalog index images are often 3-5 GB) take longer and the ingress drops
-# the connection mid-upload, producing an EOF error and no CatalogSource.
-- name: Increase Quay route timeout for large blob uploads
+# Large blob uploads (operator catalog index images are often multi-GB) can
+# sit silent for 80-115s while Quay commits them to NooBaa/MCG object storage
+# with no bytes flowing in either direction. On AWS, the Classic ELB in front
+# of the router has a 60s idle timeout by default and drops the connection
+# during that silent window, producing an EOF on the client side even though
+# Quay finishes the write and returns 202 into a now-dead socket.
+#
+# The HAProxy route-level timeout annotation does NOT fix this: the Quay
+# Operator owns the quay-app Route via server-side Apply and reverts any
+# hand-set haproxy.router.openshift.io/timeout annotation within ~1 minute
+# (confirmed via managedFields). The actual bottleneck sits one layer further
+# out, at the ELB — raise it via the IngressController API instead.
+- name: Check ingress LoadBalancer provider type
   ansible.builtin.shell: >
-    {{ bin_dir }}/oc annotate route
-    -n {{ quay_mirror_namespace }}
-    -l "quay-component=quay-app-route,quay-operator/quayregistry={{ quay_mirror_registry_name }}"
+    {{ bin_dir }}/oc get ingresscontroller default
+    -n openshift-ingress-operator
     --kubeconfig {{ target_kubeconfig }}
-    haproxy.router.openshift.io/timeout=1800s
-    --overwrite
-  changed_when: true
+    -o jsonpath='{.status.endpointPublishingStrategy.loadBalancer.providerParameters.aws.type}'
+    2>/dev/null || true
+  register: _ingress_lb_type
+  changed_when: false
 
-# HAProxy reloads asynchronously after a route annotation change. Without a
-# short wait, oc-mirror can start before the reload and still hit the old 30 s
-# timeout, resulting in EOF on large blob uploads.
-- name: Wait for HAProxy to reload the new route timeout
-  ansible.builtin.pause:
-    seconds: 15
+- name: Raise Classic ELB idle timeout for large blob uploads
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc patch ingresscontroller/default
+    -n openshift-ingress-operator
+    --kubeconfig {{ target_kubeconfig }}
+    --type=merge
+    --patch '{"spec":{"endpointPublishingStrategy":{"type":"LoadBalancerService","loadBalancer":{"scope":"External","dnsManagementPolicy":"Managed","providerParameters":{"type":"AWS","aws":{"type":"Classic","classicLoadBalancer":{"connectionIdleTimeout":"{{ quay_mirror_ingress_idle_timeout }}"}}}}}}}'
+  changed_when: true
+  when: _ingress_lb_type.stdout == "Classic"
+
+# Verify the operator actually pushed the new value to the IngressController
+# status (and from there to the ELB attribute) rather than blindly pausing —
+# a blind pause is the same mistake that made the route annotation look
+# "fixed" when it was never actually taking effect.
+- name: Wait for IngressController to report the new idle timeout
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get ingresscontroller default
+    -n openshift-ingress-operator
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.endpointPublishingStrategy.loadBalancer.providerParameters.aws.classicLoadBalancer.connectionIdleTimeout}'
+    2>/dev/null || true
+  register: _ingress_idle_timeout_check
+  changed_when: false
+  until: _ingress_idle_timeout_check.stdout == quay_mirror_ingress_idle_timeout
+  retries: 12
+  delay: 10
+  when: _ingress_lb_type.stdout == "Classic"
 
 - name: Set Quay registry URL facts
   ansible.builtin.set_fact:
