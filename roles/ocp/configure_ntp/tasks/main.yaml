@@ -71,8 +71,9 @@
 # MachineConfig was applied) can pass the completion check immediately, before
 # the controller has even noticed the new chrony config — letting Ansible move
 # on to spoke provisioning while the real roll (and node drains/reboots) is
-# still ahead. See ISSUES.md — this race let the MCO drain a spoke provisioner
-# pod's node mid-install, producing an unrelated-looking UnknownError.
+# still ahead. This race previously let the MCO drain a spoke provisioner
+# pod's node mid-install, producing an unrelated-looking "UnknownError:
+# installer log was not captured" from Hive.
 - name: Wait for master MachineConfigPool to begin updating (MCO detection window)
   ansible.builtin.shell: >
     {{ bin_dir }}/oc get mcp master

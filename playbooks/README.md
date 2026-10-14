@@ -498,6 +498,7 @@ all:
         robot_account: "mirror"                   # Robot account name for oc-mirror push/pull
         admin_user: "quayadmin"                   # Quay admin username
         admin_password: "<quay_admin_password>"   # Quay admin password
+        # ingress_idle_timeout: "30m"              # Optional: AWS Classic ELB idle timeout (default shown)
     smtp:
       host: "smtp.gmail.com"
       port: "587"
@@ -727,6 +728,7 @@ all:
 | `disconnected.quay_mirror.robot_account` | No | `mirror` | Robot account name used by oc-mirror for push/pull |
 | `disconnected.quay_mirror.admin_user` | No | `quayadmin` | Quay admin username (used to create org and robot account) |
 | `disconnected.quay_mirror.admin_password` | Yes (migrate_mirror phase) | — | Quay admin password |
+| `disconnected.quay_mirror.ingress_idle_timeout` | No | `30m` | AWS Classic ELB idle timeout, raised to survive large blob uploads that go silent during Quay's object-storage commit. AWS caps Classic ELB idle timeout at 1h. No-op on Nutanix or AWS NLB (not configurable there). |
 
 ---
 
