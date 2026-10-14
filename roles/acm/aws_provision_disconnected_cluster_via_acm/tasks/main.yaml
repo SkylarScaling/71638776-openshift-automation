@@ -51,6 +51,29 @@
   changed_when: true
   no_log: true
 
+# installAttemptsLimit: 1 means Hive sets ProvisionStopped=True after the single
+# attempt fails. oc apply leaves the ClusterDeployment in-place on re-runs, so
+# Hive sees the limit already exhausted and never creates a new ClusterProvision.
+# Delete the stopped ClusterDeployment before applying so Hive starts fresh.
+- name: Check if ClusterDeployment is already ProvisionStopped
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get clusterdeployment {{ ocp_cluster.name }}
+    -n {{ ocp_cluster.name }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.conditions[?(@.type=="ProvisionStopped")].status}'
+    2>/dev/null || true
+  register: _cd_stopped_check
+  changed_when: false
+
+- name: Delete stopped ClusterDeployment so Hive can provision fresh
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc delete clusterdeployment {{ ocp_cluster.name }}
+    -n {{ ocp_cluster.name }}
+    --kubeconfig {{ target_kubeconfig }}
+    --wait=true --timeout=5m
+  changed_when: true
+  when: _cd_stopped_check.stdout == "True"
+
 - name: Create ClusterDeployment object
   ansible.builtin.shell:
     cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
@@ -72,8 +95,63 @@
   register: _cd_provision_ref
   changed_when: false
   until: _cd_provision_ref.stdout != ""
-  retries: 30
+  retries: 60
   delay: 10
+  # ignore_errors so the diagnostics block below runs on exhaustion
+  ignore_errors: true
+
+- name: Collect diagnostics when Hive never started provisioning
+  when: _cd_provision_ref.stdout == ""
+  block:
+    - name: Show ClusterDeployment conditions (why Hive might not start)
+      ansible.builtin.shell: >
+        {{ bin_dir }}/oc get clusterdeployment {{ ocp_cluster.name }}
+        -n {{ ocp_cluster.name }}
+        --kubeconfig {{ target_kubeconfig }}
+        -o jsonpath='{range .status.conditions[*]}{.type}={.status} ({.reason}): {.message}{"\n"}{end}'
+        2>/dev/null || echo "(ClusterDeployment not found)"
+      register: _cd_no_prov_conditions
+      changed_when: false
+
+    - name: Display ClusterDeployment conditions
+      ansible.builtin.debug:
+        msg: "{{ _cd_no_prov_conditions.stdout_lines }}"
+
+    - name: Show hive-controllers pod status
+      ansible.builtin.shell: >
+        {{ bin_dir }}/oc get pods -n hive
+        --kubeconfig {{ target_kubeconfig }}
+        -l app=hive-controllers
+        -o wide 2>/dev/null || true
+      register: _hive_ctrl_pods
+      changed_when: false
+
+    - name: Display hive-controllers pod status
+      ansible.builtin.debug:
+        msg: "{{ _hive_ctrl_pods.stdout_lines }}"
+
+    - name: Show recent hive-controllers logs
+      ansible.builtin.shell: >
+        {{ bin_dir }}/oc logs -n hive
+        --kubeconfig {{ target_kubeconfig }}
+        -l app=hive-controllers
+        --tail=50 2>/dev/null | grep -i "error\|warn\|clusterdeployment\|provision" || echo "(no relevant logs)"
+      register: _hive_ctrl_logs
+      changed_when: false
+      failed_when: false
+
+    - name: Display hive-controllers logs
+      ansible.builtin.debug:
+        msg: "{{ _hive_ctrl_logs.stdout_lines }}"
+
+    - name: Fail — Hive never started provisioning for {{ ocp_cluster.name }}
+      ansible.builtin.fail:
+        msg: >-
+          hive-controllers did not create a ClusterProvision for {{ ocp_cluster.name }}
+          within 10 minutes. Check ClusterDeployment conditions and hive-controllers
+          pod status above. Common causes: hive-controllers pod not running,
+          ClusterDeployment validation error, or installAttemptsLimit already reached
+          from a previous failed run (delete and recreate the ClusterDeployment).
 
 - name: Wait for OpenShift cluster installation to complete or fail (Takes 35-45+ minutes)
   ansible.builtin.shell: >
@@ -83,9 +161,14 @@
     -o jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}' 2>/dev/null || true
   register: _cd_conditions
   changed_when: false
+  # ProvisionFailed=True is per-attempt and gets reset when a retry starts — using it
+  # as the exit condition causes a race: Ansible exits between attempt N failing and
+  # Hive resetting the condition before attempt N+1 starts.
+  # ProvisionStopped=True is only set after all retry attempts are exhausted (or
+  # installAttemptsLimit is reached), making it the correct final-failure signal.
   until: >
     ('Provisioned=True' in _cd_conditions.stdout) or
-    ('ProvisionFailed=True' in _cd_conditions.stdout)
+    ('ProvisionStopped=True' in _cd_conditions.stdout)
   retries: 90
   delay: 60
 
@@ -98,12 +181,101 @@
     2>/dev/null || true
   register: _cd_fail_details
   changed_when: false
-  when: "'ProvisionFailed=True' in _cd_conditions.stdout"
+  when: "'ProvisionStopped=True' in _cd_conditions.stdout"
+
+- name: Collect ClusterProvision object details
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get clusterprovision
+    -n {{ ocp_cluster.name }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{range .items[*]}name={.metadata.name} stage={.spec.stage} attempt={.spec.attempt}{"\n"}conditions={range .status.conditions[*]}{.type}={.status}({.reason}): {.message}{"\n"}{end}installLog={.spec.installLog}{"\n\n"}{end}'
+    2>/dev/null || true
+  register: _cp_details
+  changed_when: false
+  when: "'ProvisionStopped=True' in _cd_conditions.stdout"
+
+- name: Display ClusterProvision details
+  ansible.builtin.debug:
+    msg: "{{ _cp_details.stdout_lines }}"
+  when:
+    - "'ProvisionStopped=True' in _cd_conditions.stdout"
+    - _cp_details.stdout | default('') != ''
+
+- name: Collect provisioner Job status (persists after pods are deleted)
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get job
+    -n {{ ocp_cluster.name }}
+    --kubeconfig {{ target_kubeconfig }}
+    -l hive.openshift.io/cluster-deployment-name={{ ocp_cluster.name }}
+    -o jsonpath='{range .items[-1:]}{.metadata.name}: active={.status.active} succeeded={.status.succeeded} failed={.status.failed}
+    image={.spec.template.spec.initContainers[0].image}{"\n"}{end}'
+    2>/dev/null || echo "(no provisioner Job found)"
+  register: _prov_job
+  changed_when: false
+  when: "'ProvisionStopped=True' in _cd_conditions.stdout"
+
+- name: Display provisioner Job status
+  ansible.builtin.debug:
+    msg: "{{ _prov_job.stdout_lines }}"
+  when:
+    - "'ProvisionStopped=True' in _cd_conditions.stdout"
+    - _prov_job.stdout | default('') != ''
+
+- name: Get provisioner pod name for failed ClusterProvision
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get pod
+    -n {{ ocp_cluster.name }}
+    --kubeconfig {{ target_kubeconfig }}
+    -l hive.openshift.io/cluster-deployment-name={{ ocp_cluster.name }}
+    -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null || true
+  register: _prov_pod_name
+  changed_when: false
+  when: "'ProvisionStopped=True' in _cd_conditions.stdout"
+
+- name: Collect provisioner pod logs
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc logs {{ _prov_pod_name.stdout }}
+    -n {{ ocp_cluster.name }}
+    --kubeconfig {{ target_kubeconfig }}
+    --all-containers --tail=100 2>&1 || true
+  register: _prov_pod_logs
+  changed_when: false
+  when:
+    - "'ProvisionStopped=True' in _cd_conditions.stdout"
+    - _prov_pod_name.stdout | default('') != ''
+
+- name: Display provisioner pod logs
+  ansible.builtin.debug:
+    msg: "{{ _prov_pod_logs.stdout_lines | default(['(no logs)']) }}"
+  when:
+    - "'ProvisionStopped=True' in _cd_conditions.stdout"
+    - _prov_pod_name.stdout | default('') != ''
+
+- name: Collect provisioner pod events
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get events
+    -n {{ ocp_cluster.name }}
+    --kubeconfig {{ target_kubeconfig }}
+    --sort-by='.lastTimestamp'
+    --field-selector "involvedObject.name={{ _prov_pod_name.stdout }}"
+    2>/dev/null | tail -20 || true
+  register: _prov_pod_events
+  changed_when: false
+  when:
+    - "'ProvisionStopped=True' in _cd_conditions.stdout"
+    - _prov_pod_name.stdout | default('') != ''
+
+- name: Display provisioner pod events
+  ansible.builtin.debug:
+    msg: "{{ _prov_pod_events.stdout_lines | default(['(no events)']) }}"
+  when:
+    - "'ProvisionStopped=True' in _cd_conditions.stdout"
+    - _prov_pod_name.stdout | default('') != ''
 
 - name: Fail immediately if provisioning errored out
   ansible.builtin.fail:
     msg: "Provisioning for {{ ocp_cluster.name }} failed!\n{{ _cd_fail_details.stdout | default('No details available.') }}"
-  when: "'ProvisionFailed=True' in _cd_conditions.stdout"
+  when: "'ProvisionStopped=True' in _cd_conditions.stdout"
 
 - name: Ensure Observability Namespace exists on the Spoke via ManifestWork
   ansible.builtin.shell:

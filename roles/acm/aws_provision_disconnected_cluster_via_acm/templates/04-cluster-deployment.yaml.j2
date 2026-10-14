@@ -8,6 +8,12 @@ metadata:
 spec:
   baseDomain: {{ base_domain }}
   clusterName: {{ ocp_cluster.name }}
+  # 2 attempts — gives one retry for a transient infrastructure blip (e.g. the
+  # installer pod's node being drained by an unrelated hub MachineConfig roll)
+  # without masking a genuinely broken install behind endless retries.
+  # ProvisionStopped=True is set once attempts are exhausted; the Ansible wait
+  # task uses that as the definitive stop signal.
+  installAttemptsLimit: 2
   platform:
     aws:
       credentialsSecretRef:

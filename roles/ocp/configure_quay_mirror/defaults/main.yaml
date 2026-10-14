@@ -5,3 +5,8 @@ quay_mirror_org: "{{ disconnected.quay_mirror.org | default(disconnected.mirror_
 quay_mirror_robot_account: "{{ disconnected.quay_mirror.robot_account | default('mirror') }}"
 quay_mirror_admin_user: "{{ disconnected.quay_mirror.admin_user | default('quayadmin') }}"
 quay_mirror_admin_password: "{{ disconnected.quay_mirror.admin_password | default('RedHat123!') }}"
+
+# AWS Classic ELB default idle timeout (60s) is too short for large blob
+# uploads that go silent during Quay's object-storage commit. AWS caps
+# Classic ELB idle timeout at 3600s.
+quay_mirror_ingress_idle_timeout: "{{ disconnected.quay_mirror.ingress_idle_timeout | default('30m') }}"

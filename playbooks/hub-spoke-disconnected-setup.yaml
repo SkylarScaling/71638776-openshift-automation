@@ -41,6 +41,32 @@
           - "=================================================================="
 
 # ==============================================================================
+# JUMPHOST-LDAP: Deploy 389 DS on Jumphost (independent of cluster lifecycle)
+# ==============================================================================
+# LDAP runs on the jumphost BEFORE any cluster is built so that:
+# - OAuth and GroupSync config can reference a stable, pre-existing LDAP server
+# - Day 2 cluster config has no build-time dependency on LDAP provisioning
+# - Re-running cluster Day 2 (--tags hub,spokes) never touches LDAP state
+#
+# Cluster pods reach LDAP at the mirror registry hostname (same VPC path used
+# for image pulls). Use the jumphost private IP in ldap.url / groupsync.ldap_url
+# to avoid public DNS resolution inside disconnected cluster pods.
+#
+# Tagged 'jumphost' so --tags jumphost runs the full pre-cluster phase,
+# and --tags ldap runs just LDAP setup independently.
+# ==============================================================================
+- name: Jumphost - Setup LDAP Server (389 DS)
+  hosts: hub_cluster
+  connection: local
+  gather_facts: false
+  tags: ['ldap', 'jumphost']
+  tasks:
+    - name: Setup 389 DS LDAP server on jumphost
+      ansible.builtin.include_role:
+        name: aws/setup_ldap_on_jumphost
+      when: ldap is defined or groupsync is defined
+
+# ==============================================================================
 # HUB: Provision Disconnected ACM Hub (IPI)
 # ==============================================================================
 - name: Hub - Provision Disconnected ACM Hub
@@ -49,6 +75,7 @@
   gather_facts: false
   tags: ['hub']
   vars:
+    hub_kubeconfig: "{{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig"
     mirror_base_path: "{{ disconnected.mirror_base_path | default('ocp4') }}"
     mirror_registry_dir: "{{ working_dir }}/mirror-registry"
     oc_mirror_workspace: "{{ working_dir }}/oc-mirror-workspace"
@@ -257,6 +284,14 @@
         target_kubeconfig: "{{ hub_kubeconfig }}"
       when: rbac_bindings | default([]) | length > 0
 
+    - name: Configure ArgoCD RBAC on Hub
+      ansible.builtin.include_role:
+        name: ocp/configure_argocd_rbac
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+      when: rbac_bindings | default([]) | length > 0 or argocd_rbac | default({}) | length > 0
+      tags: ['argocd_rbac']
+
     - name: Configure LDAP Group Sync on Hub
       ansible.builtin.include_role:
         name: ocp/configure_ldap_group_sync
@@ -346,6 +381,36 @@
     - name: Set Hub Kubeconfig
       ansible.builtin.set_fact:
         hub_kubeconfig: "{{ install_dir }}/{{ hostvars[groups['hub_cluster'][0]]['ocp_cluster']['name'] }}/auth/kubeconfig"
+
+    # ------------------------------------------------------------------
+    # Guard: a hub Day 2 role (e.g. configure_ntp) may have just applied a
+    # MachineConfig. If the hub's MCPs are mid-roll (or about to start one)
+    # when Hive schedules the spoke's installer pod, the MCO can drain that
+    # pod's node mid-install — killing it and producing a generic
+    # "UnknownError: installer log was not captured" that looks unrelated
+    # to MachineConfigs entirely. Block here until the hub is fully settled.
+    # ------------------------------------------------------------------
+    - name: Wait for hub master MachineConfigPool to be settled before spoke provisioning
+      ansible.builtin.shell: >
+        {{ bin_dir }}/oc get mcp master
+        --kubeconfig {{ hub_kubeconfig }}
+        -o jsonpath='{.status.conditions[?(@.type=="Updated")].status}={.status.conditions[?(@.type=="Updating")].status}'
+      register: _hub_master_mcp_settled
+      until: _hub_master_mcp_settled.stdout == "True=False"
+      retries: 90
+      delay: 30
+      changed_when: false
+
+    - name: Wait for hub worker MachineConfigPool to be settled before spoke provisioning
+      ansible.builtin.shell: >
+        {{ bin_dir }}/oc get mcp worker
+        --kubeconfig {{ hub_kubeconfig }}
+        -o jsonpath='{.status.conditions[?(@.type=="Updated")].status}={.status.conditions[?(@.type=="Updating")].status}'
+      register: _hub_worker_mcp_settled
+      until: _hub_worker_mcp_settled.stdout == "True=False"
+      retries: 90
+      delay: 30
+      changed_when: false
 
     # ------------------------------------------------------------------
     # Load disconnected facts — prefer in-memory hostvars from the Hub
@@ -535,47 +600,6 @@
 # ==============================================================================
 # SUMMARY: Final Environment Handoff
 # ==============================================================================
-- name: Deployment Summary
-  hosts: hub_cluster
-  connection: local
-  gather_facts: false
-  tags: ['summary']
-  tasks:
-    - name: Build per-cluster connection info
-      ansible.builtin.set_fact:
-        _summary_lines: "{{ _summary_lines | default([]) + _entry }}"
-      vars:
-        _name: "{{ hostvars[item]['ocp_cluster']['name'] }}"
-        _role: >-
-          {%- if item in groups['hub_cluster'] -%}Hub
-          {%- else -%}Managed Cluster{%- endif -%}
-        _pwd: "{{ lookup('file', install_dir + '/' + _name + '/auth/kubeadmin-password') }}"
-        _entry:
-          - ""
-          - "{{ _role }}:  {{ _name }}"
-          - "  Console:    https://console-openshift-console.apps.{{ _name }}.{{ base_domain }}/"
-          - "  Username:   kubeadmin"
-          - "  Password:   {{ _pwd }}"
-          - "  Kubeconfig: {{ install_dir }}/{{ _name }}/auth/kubeconfig"
-      loop: >-
-        {{
-          groups['hub_cluster'] +
-          (groups['managed_clusters'] | default([]))
-        }}
-
-    - name: Print Full Deployment Summary
-      ansible.builtin.debug:
-        msg: >-
-          {{
-            ['==================================================================',
-             'Disconnected ACM Hub+Spoke Deployment Complete!',
-             '==================================================================',
-             'Mirror Registry: ' ~ (mirror_registry_url | default(disconnected.mirror_registry.hostname ~ ':' ~ (disconnected.mirror_registry.port | default(8443)))),
-             'Internal Gitea:  https://gitea.gitea.' ~ base_domain ~ ' (in-cluster: http://gitea.gitea.svc.cluster.local:3000)'] +
-            _summary_lines +
-            ['', '==================================================================']
-          }}
-
 # ==============================================================================
 # VERIFY: Day 2 Configuration
 # Runs automatically after deployment. Skip with --skip-tags verify.
@@ -671,7 +695,7 @@
       ansible.builtin.assert:
         that: >-
           {{
-            groups['hub_cluster'] + (groups['managed_clusters'] | default([]))
+            (groups['hub_cluster'] + (groups['managed_clusters'] | default([])))
             | map('extract', hostvars, 'verified_ntp_servers')
             | select('defined') | list | unique | length <= 1
           }}
@@ -687,3 +711,44 @@
           - "  Auth:    LDAP IDP configured, GroupSync running, groups/RBAC present"
           - "  NTP:     MachineConfigs applied, MCPs Updated, servers consistent"
           - "=================================================================="
+
+- name: Deployment Summary
+  hosts: hub_cluster
+  connection: local
+  gather_facts: false
+  tags: ['verify']
+  tasks:
+    - name: Build per-cluster connection info
+      ansible.builtin.set_fact:
+        _summary_lines: "{{ _summary_lines | default([]) + _entry }}"
+      vars:
+        _name: "{{ hostvars[item]['ocp_cluster']['name'] }}"
+        _role: >-
+          {%- if item in groups['hub_cluster'] -%}Hub
+          {%- else -%}Managed Cluster{%- endif -%}
+        _pwd: "{{ lookup('file', install_dir + '/' + _name + '/auth/kubeadmin-password') }}"
+        _entry:
+          - ""
+          - "{{ _role }}:  {{ _name }}"
+          - "  Console:    https://console-openshift-console.apps.{{ _name }}.{{ base_domain }}/"
+          - "  Username:   kubeadmin"
+          - "  Password:   {{ _pwd }}"
+          - "  Kubeconfig: {{ install_dir }}/{{ _name }}/auth/kubeconfig"
+      loop: >-
+        {{
+          groups['hub_cluster'] +
+          (groups['managed_clusters'] | default([]))
+        }}
+
+    - name: Print Full Deployment Summary
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            ['==================================================================',
+             'Disconnected ACM Hub+Spoke Deployment Complete!',
+             '==================================================================',
+             'Mirror Registry: ' ~ (mirror_registry_url | default(disconnected.mirror_registry.hostname ~ ':' ~ (disconnected.mirror_registry.port | default(8443)))),
+             'Internal Gitea:  https://gitea.gitea.' ~ base_domain ~ ' (in-cluster: http://gitea.gitea.svc.cluster.local:3000)'] +
+            _summary_lines +
+            ['', '==================================================================']
+          }}

@@ -18,10 +18,14 @@ enable_uwm: false
 
 # ldap:
 #   name: "ldap"
-#   url: "ldaps://ldap.example.com:636/ou=users,dc=example,dc=com?uid"
-#   bind_dn: "cn=serviceaccount,dc=example,dc=com"
+#   # Use the mirror registry hostname (jumphost private IP within the VPC).
+#   # OCP cluster pods (OAuth controller) reach LDAP via the same VPC path as
+#   # image pulls — no internet access required. Using a private IP avoids
+#   # external DNS resolution failures in disconnected cluster pods.
+#   url: "ldap://{{ disconnected.mirror_registry.hostname }}:389/ou=people,dc={{ base_domain.split('.') | join(',dc=') }}?uid"
+#   bind_dn: "uid=ldap-svc,ou=people,dc={{ base_domain.split('.') | join(',dc=') }}"
 #   bind_password: "{{ vault_ldap_bind_password }}"
-#   insecure: false
+#   insecure: true
 #   ca_cert: ""
 #   attributes:
 #     id: ["dn"]
@@ -37,13 +41,14 @@ enable_uwm: false
 
 # groupsync:          # Uses built-in 'oc adm groups sync' — no additional operator required
 #   schedule: "0 * * * *"
-#   ldap_url: "ldaps://ldap.example.com:636"
-#   bind_dn: "cn=serviceaccount,dc=example,dc=com"
+#   ldap_url: "ldap://{{ disconnected.mirror_registry.hostname }}:389"
+#   bind_dn: "uid=ldap-svc,ou=people,dc={{ base_domain.split('.') | join(',dc=') }}"
 #   bind_password: "{{ vault_ldap_bind_password }}"
 #   ca_cert: ""
-#   groups_base_dn: "ou=groups,dc=example,dc=com"
-#   groups_filter: "(&(objectClass=group)(cn=openshift-*))"
-#   users_base_dn: "ou=users,dc=example,dc=com"
+#   insecure: true
+#   groups_base_dn: "ou=groups,dc={{ base_domain.split('.') | join(',dc=') }}"
+#   groups_filter: "(&(objectClass=groupOfNames)(cn=openshift-*))"
+#   users_base_dn: "ou=people,dc={{ base_domain.split('.') | join(',dc=') }}"
 
 # metallb:
 #   ip_address_pools:

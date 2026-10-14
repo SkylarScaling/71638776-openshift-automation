@@ -158,3 +158,16 @@
     name: sshd
     state: reloaded
   become: true
+
+# ==============================================================================
+# PODMAN AUTO-RESTART
+# Enable podman-restart.service so containers with --restart-policy=always
+# (mirror registry, 389 DS) are started automatically after instance reboot.
+# ==============================================================================
+- name: Enable podman-restart service for container auto-start on boot
+  ansible.builtin.service:
+    name: podman-restart
+    enabled: true
+    state: started
+  become: true
+  failed_when: false

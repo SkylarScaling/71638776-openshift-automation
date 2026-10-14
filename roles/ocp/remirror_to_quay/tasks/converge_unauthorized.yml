@@ -1,0 +1,57 @@
+---
+# Included multiple times (via loop, loop_var _converge_pass) after an
+# oc-mirror run that may have left some pushes failed. Root cause: Quay's
+# repository auto-create path has a concurrency race — when two oc-mirror
+# worker threads request a push token for the same brand-new repo at the
+# same instant, the loser of the race silently gets a pull-only token with
+# HTTP 200, and its subsequent blob-upload POST fails with 401 unauthorized.
+# This is NOT a CREATE_PRIVATE_REPO_ON_PUSH config issue.
+#
+# By the time a repo has failed once, it already exists in Quay — so the
+# very next push attempt for that repo gets a full pull,push token and
+# succeeds immediately. Re-running oc-mirror on the SAME, unwiped workspace
+# converges quickly because existing blobs are skipped and only the
+# previously-raced repos still need their content pushed.
+#
+# Do NOT wipe the workspace before this re-run — wiping makes every repo
+# "first touch" again and reintroduces the race for all of them, not just
+# the ones that lost it last time.
+
+- name: "Check oc-mirror error log for unauthorized repo-creation races (pass {{ _converge_pass }})"
+  ansible.builtin.shell: >
+    find {{ quay_mirror_workspace }}/working-dir/logs
+    -name "mirroring_errors_*.txt"
+    -exec grep -l unauthorized {} \; 2>/dev/null | tail -1
+  register: _quay_converge_unauth_check
+  changed_when: false
+  failed_when: false
+
+- name: "Re-run oc-mirror on same workspace to converge repo-creation races (pass {{ _converge_pass }})"
+  ansible.builtin.command: >
+    {{ bin_dir }}/oc-mirror
+    --v2
+    --config {{ quay_mirror_workspace }}/imageset-config.yaml
+    --workspace file://{{ quay_mirror_workspace }}
+    docker://{{ quay_registry_url }}/{{ quay_mirror_org }}
+  environment:
+    XDG_RUNTIME_DIR: "{{ quay_mirror_workspace }}"
+  args:
+    chdir: "{{ quay_mirror_workspace }}"
+  async: 7200
+  poll: 0
+  register: _quay_converge_job
+  when: _quay_converge_unauth_check.stdout | default('') != ''
+
+- name: "Wait for converge pass {{ _converge_pass }} to complete"
+  ansible.builtin.async_status:
+    jid: "{{ _quay_converge_job.ansible_job_id }}"
+  register: _quay_converge_result
+  until: _quay_converge_result.finished
+  retries: 240
+  delay: 30
+  when:
+    - _quay_converge_job is defined
+    - _quay_converge_job.ansible_job_id is defined
+  failed_when:
+    - _quay_converge_result.finished
+    - _quay_converge_result.rc not in [0, 4, 12, 14]

@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-rbac-cm
+  namespace: {{ argocd_namespace }}
+data:
+  policy.default: "role:readonly"
+  policy.csv: |
+{% for group in _argocd_admin_groups %}
+    g, {{ group }}, role:admin
+{% endfor %}
+{% for group in _argocd_readonly_groups %}
+    g, {{ group }}, role:readonly
+{% endfor %}
+  scopes: '[groups]'

@@ -1,0 +1,34 @@
+---
+ds389_source_image: "quay.io/389ds/dirsrv:latest"
+ds389_container_port: 3389
+ds389_root_dn: "cn=Directory Manager"
+ds389_root_password: "ChangeMe123!"
+ds389_suffix: ""  # derived from base_domain if empty
+
+ds389_ldap_service_account:
+  username: "ldap-svc"
+  cn: "LDAP Service Account"
+  sn: "ServiceAccount"
+  password: "ChangeMe123!"
+
+ds389_ocp_groups:
+  - openshift-admins
+  - openshift-developers
+  - openshift-viewers
+
+ds389_ocp_users:
+  - username: ocp-admin
+    cn: "OCP Admin"
+    sn: "Admin"
+    password: "ChangeMe123!"
+    groups: [openshift-admins]
+  - username: ocp-dev
+    cn: "OCP Developer"
+    sn: "Developer"
+    password: "ChangeMe123!"
+    groups: [openshift-developers]
+  - username: ocp-viewer
+    cn: "OCP Viewer"
+    sn: "Viewer"
+    password: "ChangeMe123!"
+    groups: [openshift-viewers]
