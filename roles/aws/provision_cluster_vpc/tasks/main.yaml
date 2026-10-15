@@ -1,0 +1,217 @@
+---
+# ==============================================================================
+# PROVISION ISOLATED CLUSTER VPC
+#
+# Creates a second VPC, separate from the jumphost's, with no Internet Gateway
+# or NAT Gateway ever attached — the hub and every spoke live here, in private
+# subnets only. Peered to the jumphost VPC (discovered by tag, same convention
+# aws_provision_jumphost uses) so cluster nodes reach the mirror/LDAP over
+# private AWS networking instead of the public internet.
+#
+# Idempotent: discovers by tag first, only creates what's missing. Safe to
+# run once (jumphost phase) and have every later phase just read the facts.
+# ==============================================================================
+
+- name: Set AWS environment for all tasks
+  ansible.builtin.set_fact:
+    _aws_env:
+      AWS_ACCESS_KEY_ID: "{{ aws.aws_access_key_id }}"
+      AWS_SECRET_ACCESS_KEY: "{{ aws.aws_secret_access_key }}"
+      AWS_SESSION_TOKEN: ""
+
+# ------------------------------------------------------------------------------
+# CLUSTER VPC
+# ------------------------------------------------------------------------------
+- name: Find existing Cluster VPC
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-vpcs
+    --filters Name=tag:Name,Values={{ network_lockdown_vpc_name }}
+    --query 'Vpcs[0].VpcId'
+    --output text
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  register: _nl_vpc_check
+  changed_when: false
+
+- name: Create Cluster VPC (isolated — no Internet Gateway, no NAT)
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 create-vpc
+    --cidr-block {{ network_lockdown_vpc_cidr }}
+    --tag-specifications "ResourceType=vpc,Tags=[{Key=Name,Value={{ network_lockdown_vpc_name }}}]"
+    --query 'Vpc.VpcId'
+    --output text
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  register: _nl_vpc_create
+  when: _nl_vpc_check.stdout | trim in ['None', '']
+  changed_when: true
+
+- name: Set Cluster VPC ID fact
+  ansible.builtin.set_fact:
+    network_lockdown_vpc_id: >-
+      {{ _nl_vpc_create.stdout | trim if _nl_vpc_create is changed else _nl_vpc_check.stdout | trim }}
+
+- name: Enable DNS support on Cluster VPC
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 modify-vpc-attribute
+    --vpc-id {{ network_lockdown_vpc_id }}
+    --enable-dns-support
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  changed_when: true
+
+- name: Enable DNS hostnames on Cluster VPC
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 modify-vpc-attribute
+    --vpc-id {{ network_lockdown_vpc_id }}
+    --enable-dns-hostnames
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  changed_when: true
+
+# ------------------------------------------------------------------------------
+# SHARED PRIVATE ROUTE TABLE — every cluster's private subnets associate here.
+# All subnets in this VPC are equally isolated, so one route table is enough.
+# ------------------------------------------------------------------------------
+- name: Find existing shared private route table
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-route-tables
+    --filters Name=tag:Name,Values={{ network_lockdown_vpc_name }}-private-rt
+    --query 'RouteTables[0].RouteTableId'
+    --output text
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  register: _nl_rt_check
+  changed_when: false
+
+- name: Create shared private route table
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 create-route-table
+    --vpc-id {{ network_lockdown_vpc_id }}
+    --tag-specifications "ResourceType=route-table,Tags=[{Key=Name,Value={{ network_lockdown_vpc_name }}-private-rt}]"
+    --query 'RouteTable.RouteTableId'
+    --output text
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  register: _nl_rt_create
+  when: _nl_rt_check.stdout | trim in ['None', '']
+  changed_when: true
+
+- name: Set shared private route table ID fact
+  ansible.builtin.set_fact:
+    network_lockdown_route_table_id: >-
+      {{ _nl_rt_create.stdout | trim if _nl_rt_create is changed else _nl_rt_check.stdout | trim }}
+
+# ------------------------------------------------------------------------------
+# PEERING TO THE JUMPHOST VPC
+# ------------------------------------------------------------------------------
+- name: Find jumphost VPC (created by aws_provision_jumphost)
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-vpcs
+    --filters Name=tag:Name,Values={{ jumphost_name | default('disconnected-jumphost') }}-vpc
+    --query 'Vpcs[0].[VpcId,CidrBlock]'
+    --output text
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  register: _nl_jumphost_vpc
+
+- name: Fail if jumphost VPC was not found
+  ansible.builtin.fail:
+    msg: >-
+      Could not find a VPC tagged '{{ jumphost_name | default('disconnected-jumphost') }}-vpc'.
+      Run provision-jumphost.yaml before enabling disconnected.network_lockdown.
+  when: _nl_jumphost_vpc.stdout | trim == '' or 'None' in _nl_jumphost_vpc.stdout
+
+- name: Set jumphost VPC facts
+  ansible.builtin.set_fact:
+    network_lockdown_jumphost_vpc_id: "{{ _nl_jumphost_vpc.stdout.split()[0] }}"
+    network_lockdown_jumphost_vpc_cidr: "{{ _nl_jumphost_vpc.stdout.split()[1] }}"
+
+- name: Find existing VPC peering connection
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-vpc-peering-connections
+    --filters
+      Name=requester-vpc-info.vpc-id,Values={{ network_lockdown_vpc_id }}
+      Name=accepter-vpc-info.vpc-id,Values={{ network_lockdown_jumphost_vpc_id }}
+      Name=status-code,Values=active,pending-acceptance
+    --query 'VpcPeeringConnections[0].VpcPeeringConnectionId'
+    --output text
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  register: _nl_peering_check
+  changed_when: false
+
+- name: Create VPC peering connection to jumphost VPC
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 create-vpc-peering-connection
+    --vpc-id {{ network_lockdown_vpc_id }}
+    --peer-vpc-id {{ network_lockdown_jumphost_vpc_id }}
+    --tag-specifications "ResourceType=vpc-peering-connection,Tags=[{Key=Name,Value={{ network_lockdown_vpc_name }}-to-jumphost}]"
+    --query 'VpcPeeringConnection.VpcPeeringConnectionId'
+    --output text
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  register: _nl_peering_create
+  when: _nl_peering_check.stdout | trim in ['None', '']
+  changed_when: true
+
+- name: Set VPC peering connection ID fact
+  ansible.builtin.set_fact:
+    network_lockdown_peering_id: >-
+      {{ _nl_peering_create.stdout | trim if _nl_peering_create is changed else _nl_peering_check.stdout | trim }}
+
+- name: Accept VPC peering connection (same account/region, auto-acceptable)
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 accept-vpc-peering-connection
+    --vpc-peering-connection-id {{ network_lockdown_peering_id }}
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  when: _nl_peering_create is changed
+  changed_when: true
+
+- name: Add route to jumphost VPC from the shared private route table
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 create-route
+    --route-table-id {{ network_lockdown_route_table_id }}
+    --destination-cidr-block {{ network_lockdown_jumphost_vpc_cidr }}
+    --vpc-peering-connection-id {{ network_lockdown_peering_id }}
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  register: _nl_route_to_jumphost
+  failed_when:
+    - _nl_route_to_jumphost.rc != 0
+    - "'RouteAlreadyExists' not in _nl_route_to_jumphost.stderr"
+  changed_when: _nl_route_to_jumphost.rc == 0
+
+- name: Find route tables associated with the jumphost VPC
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-route-tables
+    --filters Name=vpc-id,Values={{ network_lockdown_jumphost_vpc_id }}
+    --query 'RouteTables[].RouteTableId'
+    --output text
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  register: _nl_jumphost_route_tables
+  changed_when: false
+
+- name: Add route to Cluster VPC from each jumphost route table
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 create-route
+    --route-table-id {{ item }}
+    --destination-cidr-block {{ network_lockdown_vpc_cidr }}
+    --vpc-peering-connection-id {{ network_lockdown_peering_id }}
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  loop: "{{ _nl_jumphost_route_tables.stdout.split() }}"
+  register: _nl_route_from_jumphost
+  failed_when:
+    - _nl_route_from_jumphost.rc != 0
+    - "'RouteAlreadyExists' not in _nl_route_from_jumphost.stderr"
+  changed_when: _nl_route_from_jumphost.rc == 0
+
+- name: Display Cluster VPC summary
+  ansible.builtin.debug:
+    msg:
+      - "Cluster VPC ready: {{ network_lockdown_vpc_id }} ({{ network_lockdown_vpc_cidr }})"
+      - "Shared private route table: {{ network_lockdown_route_table_id }}"
+      - "Peered to jumphost VPC: {{ network_lockdown_jumphost_vpc_id }} ({{ network_lockdown_jumphost_vpc_cidr }}) via {{ network_lockdown_peering_id }}"

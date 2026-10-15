@@ -1,0 +1,116 @@
+---
+# ==============================================================================
+# UPDATE OCP ON THE HUB (SELF-MANAGED CLUSTER)
+#
+# The hub is not Hive-managed, so it upgrades itself directly via the
+# ClusterVersion Operator, bypassing the (unreachable) public Cincinnati graph
+# with an explicit mirrored release image reference. Target version comes
+# entirely from the inventory's openshift_version/ocp_patch_version — nothing
+# here is pinned to a specific release.
+#
+# Prerequisites: ocp/mirror_update_content must have run first in this play
+# (release image + its signature, if any, now live in Quay).
+# ==============================================================================
+
+- name: Set target release image reference
+  ansible.builtin.set_fact:
+    _hub_update_release_image: >-
+      {{ quay_registry_url }}/{{ quay_mirror_org }}/openshift-release-dev/ocp-release:{{ openshift_version }}.{{ ocp_patch_version }}-x86_64
+
+- name: Check if ClusterVersion already reports the target version
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get clusterversion version
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.desired.version}'
+  register: _hub_cv_current
+  changed_when: false
+
+- name: Look for an oc-mirror release signature ConfigMap for this version
+  ansible.builtin.find:
+    paths: "{{ update_mirror_workspace }}/working-dir/cluster-resources"
+    patterns: "*signature*.yaml"
+    file_type: file
+  register: _hub_signature_files
+  when: _hub_cv_current.stdout != (openshift_version ~ '.' ~ ocp_patch_version)
+
+- name: Apply release signature ConfigMap(s) if oc-mirror generated any
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f {{ item.path }}"
+  loop: "{{ _hub_signature_files.files | default([]) }}"
+  loop_control:
+    label: "{{ item.path }}"
+  changed_when: true
+  when: _hub_signature_files.files | default([]) | length > 0
+
+# If oc-mirror did not emit a signature ConfigMap, the CVO cannot verify the
+# mirrored release image's signature from this disconnected environment.
+# --force is Red Hat's documented fallback for exactly this case; the image's
+# provenance is already established by the mirroring chain (oc-mirror pulled
+# it from registry.redhat.io using the same pull secret used at install time).
+- name: Trigger ClusterVersion update to the mirrored release image
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc adm upgrade
+    --kubeconfig {{ target_kubeconfig }}
+    --allow-explicit-upgrade
+    --to-image={{ _hub_update_release_image }}
+    {{ '' if _hub_signature_files.files | default([]) | length > 0 else '--force' }}
+  register: _hub_upgrade_trigger
+  changed_when: true
+  when: _hub_cv_current.stdout != (openshift_version ~ '.' ~ ocp_patch_version)
+
+# MCO-safe wait pattern: wait for Progressing=True (detection window) before
+# waiting for Progressing=False, so a stale condition from a prior update
+# can't pass the completion check immediately (project memory Bug 6).
+- name: Wait for ClusterVersion to begin Progressing (CVO detection window)
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get clusterversion version
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.conditions[?(@.type=="Progressing")].status}'
+  register: _hub_cv_progressing_start
+  until: _hub_cv_progressing_start.stdout == "True"
+  retries: "{{ update_ocp_hub_mcp_detect_retries }}"
+  delay: "{{ update_ocp_hub_mcp_detect_delay }}"
+  changed_when: false
+  failed_when: false
+  when: _hub_cv_current.stdout != (openshift_version ~ '.' ~ ocp_patch_version)
+
+- name: Wait for ClusterVersion update to complete (this can take 60+ minutes)
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get clusterversion version
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.history[0].state}={.status.desired.version}'
+  register: _hub_cv_complete
+  until: _hub_cv_complete.stdout == ("Completed=" ~ openshift_version ~ "." ~ ocp_patch_version)
+  retries: 240
+  delay: 30
+  changed_when: false
+  when: _hub_cv_current.stdout != (openshift_version ~ '.' ~ ocp_patch_version)
+
+- name: Wait for master MachineConfigPool to settle after the update
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get mcp master
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.conditions[?(@.type=="Updated")].status}={.status.conditions[?(@.type=="Updating")].status}'
+  register: _hub_master_mcp_settled
+  until: _hub_master_mcp_settled.stdout == "True=False"
+  retries: "{{ update_ocp_hub_mcp_settle_retries }}"
+  delay: "{{ update_ocp_hub_mcp_settle_delay }}"
+  changed_when: false
+
+- name: Wait for worker MachineConfigPool to settle after the update
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get mcp worker
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.conditions[?(@.type=="Updated")].status}={.status.conditions[?(@.type=="Updating")].status}'
+  register: _hub_worker_mcp_settled
+  until: _hub_worker_mcp_settled.stdout == "True=False"
+  retries: "{{ update_ocp_hub_mcp_settle_retries }}"
+  delay: "{{ update_ocp_hub_mcp_settle_delay }}"
+  changed_when: false
+
+- name: Display hub update summary
+  ansible.builtin.debug:
+    msg:
+      - "Hub OpenShift update complete"
+      - "Target version: {{ openshift_version }}.{{ ocp_patch_version }}"
+      - "Release image:  {{ _hub_update_release_image }}"

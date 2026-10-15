@@ -17,6 +17,7 @@
 |---|---|---|
 | `provision-jumphost.yaml` | Jumphost provisioning only | N/A |
 | `hub-spoke-disconnected-setup.yaml` | Two-tier Hub+Spoke (Disconnected) | Spokes via ACM/Hive on AWS |
+| `disconnected-update.yaml` | Day 2 OpenShift + operator updates (Disconnected) | Hub direct, Spokes via ACM ClusterCurator |
 
 ### Nutanix AHV Playbooks
 
@@ -729,6 +730,57 @@ all:
 | `disconnected.quay_mirror.admin_user` | No | `quayadmin` | Quay admin username (used to create org and robot account) |
 | `disconnected.quay_mirror.admin_password` | Yes (migrate_mirror phase) | — | Quay admin password |
 | `disconnected.quay_mirror.ingress_idle_timeout` | No | `30m` | AWS Classic ELB idle timeout, raised to survive large blob uploads that go silent during Quay's object-storage commit. AWS caps Classic ELB idle timeout at 1h. No-op on Nutanix or AWS NLB (not configurable there). |
+
+### Network Lockdown (AWS only)
+
+By default, the disconnected playbook only controls where images come from —
+it does not stop the cluster's network path from reaching the internet (the
+installer creates its own VPC with public subnets, an Internet Gateway, and
+NAT Gateways). See [`DISCONNECTED-NETWORK-LOCKDOWN.md`](DISCONNECTED-NETWORK-LOCKDOWN.md)
+for the full design. Enable it with:
+
+```yaml
+disconnected:
+  network_lockdown:
+    enabled: true
+    vpc_name: "ocp-cluster-vpc"   # optional, default shown
+    vpc_cidr: "10.90.0.0/16"      # must not overlap the jumphost VPC CIDR (10.0.0.0/16 by default)
+```
+
+...and, per cluster (`hub_cluster` and every `managed_clusters` host), explicit
+private subnet CIDRs matching the zones already used for `install_config`:
+
+```yaml
+install_config:
+  network_lockdown_subnets:
+    - zone: us-east-1a
+      cidr: 10.90.1.0/24
+    - zone: us-east-1b
+      cidr: 10.90.2.0/24
+    - zone: us-east-1c
+      cidr: 10.90.3.0/24
+```
+
+When enabled, the hub and every spoke are provisioned into private-only
+subnets in a dedicated, isolated VPC (no Internet Gateway/NAT, ever) peered to
+the jumphost VPC, with VPC Endpoints for required AWS APIs, node security
+groups locked down to deny `0.0.0.0/0` egress, and Telemetry/Insights
+disabled. The jumphost-peering egress is revoked entirely once
+`migrate_mirror` runs. Re-run with `--tags verify` at any time to confirm
+isolation is actually in effect.
+
+### Day 2 Updates (OpenShift + Operators)
+
+Once `migrate_mirror` has run (Quay on the hub is the live mirror), use
+`disconnected-update.yaml` to apply OpenShift minor/patch updates and
+operator/catalog updates. See [`DISCONNECTED-UPDATES.md`](DISCONNECTED-UPDATES.md)
+for the full process — in short: bump `openshift_version` / `ocp_patch_version`
+and/or `disconnected.operators[].channels` in the same inventory file used for
+initial deployment, then:
+
+```bash
+ansible-playbook disconnected-update.yaml -i inventory-disconnected.yaml
+```
 
 ---
 

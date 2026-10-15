@@ -1,0 +1,134 @@
+---
+# ==============================================================================
+# CREATE PRIVATE SUBNETS FOR A CLUSTER
+#
+# Carves this cluster's private subnets out of the isolated Cluster VPC, from
+# the explicit zone/cidr pairs in install_config.network_lockdown_subnets.
+# Associates each with the shared private route table (no route to an
+# Internet Gateway/NAT Gateway — isolation comes from that absence).
+#
+# Self-contained: (re)discovers the Cluster VPC and route table by tag rather
+# than depending on facts set by aws/provision_cluster_vpc in an earlier play,
+# so this works whether hub and spokes run in the same invocation or not.
+#
+# Prerequisites: aws/provision_cluster_vpc must have run once already (any
+# earlier invocation — this only discovers, never creates the VPC itself).
+# ==============================================================================
+
+- name: Set AWS environment for all tasks
+  ansible.builtin.set_fact:
+    _aws_env:
+      AWS_ACCESS_KEY_ID: "{{ aws.aws_access_key_id }}"
+      AWS_SECRET_ACCESS_KEY: "{{ aws.aws_secret_access_key }}"
+      AWS_SESSION_TOKEN: ""
+
+- name: Assert this cluster defines network_lockdown_subnets
+  ansible.builtin.assert:
+    that: install_config.network_lockdown_subnets | default([]) | length > 0
+    fail_msg: >-
+      disconnected.network_lockdown.enabled is true but
+      install_config.network_lockdown_subnets is not set for {{ ocp_cluster.name }}.
+
+- name: Find the Cluster VPC
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-vpcs
+    --filters Name=tag:Name,Values={{ network_lockdown_vpc_name }}
+    --query 'Vpcs[0].VpcId'
+    --output text
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  register: _nl_vpc_lookup
+  changed_when: false
+
+- name: Fail if the Cluster VPC does not exist yet
+  ansible.builtin.fail:
+    msg: "Cluster VPC '{{ network_lockdown_vpc_name }}' not found — run aws/provision_cluster_vpc first."
+  when: _nl_vpc_lookup.stdout | trim in ['None', '']
+
+- name: Set Cluster VPC ID fact
+  ansible.builtin.set_fact:
+    network_lockdown_vpc_id: "{{ _nl_vpc_lookup.stdout | trim }}"
+
+- name: Find the shared private route table
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-route-tables
+    --filters Name=tag:Name,Values={{ network_lockdown_vpc_name }}-private-rt
+    --query 'RouteTables[0].RouteTableId'
+    --output text
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  register: _nl_rt_lookup
+  changed_when: false
+
+- name: Set shared private route table ID fact
+  ansible.builtin.set_fact:
+    network_lockdown_route_table_id: "{{ _nl_rt_lookup.stdout | trim }}"
+
+- name: Check if each private subnet already exists
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-subnets
+    --filters
+      Name=vpc-id,Values={{ network_lockdown_vpc_id }}
+      Name=tag:Name,Values={{ ocp_cluster.name }}-{{ item.zone }}
+    --query 'Subnets[0].SubnetId'
+    --output text
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  loop: "{{ install_config.network_lockdown_subnets }}"
+  loop_control:
+    label: "{{ ocp_cluster.name }}-{{ item.zone }}"
+  register: _nl_subnet_check
+  changed_when: false
+
+- name: Create missing private subnets
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 create-subnet
+    --vpc-id {{ network_lockdown_vpc_id }}
+    --availability-zone {{ item.item.zone }}
+    --cidr-block {{ item.item.cidr }}
+    --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value={{ ocp_cluster.name }}-{{ item.item.zone }}}]"
+    --query 'Subnet.SubnetId'
+    --output text
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  loop: "{{ _nl_subnet_check.results }}"
+  loop_control:
+    label: "{{ ocp_cluster.name }}-{{ item.item.zone }}"
+  register: _nl_subnet_create
+  when: item.stdout | trim in ['None', '']
+  changed_when: true
+
+- name: Associate newly created subnets with the shared private route table
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 associate-route-table
+    --route-table-id {{ network_lockdown_route_table_id }}
+    --subnet-id {{ item.stdout | trim }}
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  loop: "{{ _nl_subnet_create.results | default([]) }}"
+  loop_control:
+    label: "{{ item.stdout | default('skipped') }}"
+  when: item.stdout is defined
+  changed_when: true
+
+- name: Re-read subnet IDs for this cluster (existing + newly created)
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-subnets
+    --filters
+      Name=vpc-id,Values={{ network_lockdown_vpc_id }}
+      Name=tag:Name,Values={{ ocp_cluster.name }}-*
+    --query 'Subnets[].SubnetId'
+    --output text
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  register: _nl_final_subnets
+  changed_when: false
+
+- name: Set network_lockdown_subnet_ids fact for this cluster
+  ansible.builtin.set_fact:
+    network_lockdown_subnet_ids: "{{ _nl_final_subnets.stdout.split() }}"
+
+- name: Display private subnet summary
+  ansible.builtin.debug:
+    msg:
+      - "Private subnets for {{ ocp_cluster.name }}: {{ network_lockdown_subnet_ids }}"

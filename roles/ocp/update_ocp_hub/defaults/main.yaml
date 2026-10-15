@@ -1,0 +1,6 @@
+---
+quay_mirror_org: "{{ disconnected.quay_mirror.org | default(disconnected.mirror_base_path | default('ocp4')) }}"
+update_ocp_hub_mcp_detect_retries: 12
+update_ocp_hub_mcp_detect_delay: 15
+update_ocp_hub_mcp_settle_retries: 120
+update_ocp_hub_mcp_settle_delay: 30

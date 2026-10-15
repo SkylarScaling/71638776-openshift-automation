@@ -1,0 +1,10 @@
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: ClusterCurator
+metadata:
+  name: {{ ocp_cluster.name }}
+  namespace: {{ ocp_cluster.name }}
+spec:
+  desiredCuration: upgrade
+  upgrade:
+    desiredUpdate: "{{ openshift_version }}.{{ ocp_patch_version }}"
+    monitorTimeout: {{ update_ocp_spoke_curator_timeout_minutes }}

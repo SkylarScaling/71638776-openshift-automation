@@ -1,0 +1,152 @@
+---
+# ==============================================================================
+# CREATE VPC ENDPOINTS FOR THE ISOLATED CLUSTER VPC
+#
+# Without these, the AWS cloud-provider, ELB/EBS CSI controllers, and the
+# ingress operator's Route53 DNS management would need internet egress to
+# reach AWS APIs — defeating the point of removing the Internet Gateway/NAT.
+#
+# Run once (hub phase, after the hub's private subnets exist) — endpoints
+# serve the whole Cluster VPC, not just the hub.
+#
+# Prerequisites: aws/provision_cluster_vpc and aws/create_private_subnets
+# (for at least one cluster) must have run first in this play.
+# ==============================================================================
+
+- name: Set AWS environment for all tasks
+  ansible.builtin.set_fact:
+    _aws_env:
+      AWS_ACCESS_KEY_ID: "{{ aws.aws_access_key_id }}"
+      AWS_SECRET_ACCESS_KEY: "{{ aws.aws_secret_access_key }}"
+      AWS_SESSION_TOKEN: ""
+
+- name: Get Cluster VPC CIDR block
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-vpcs
+    --vpc-ids {{ network_lockdown_vpc_id }}
+    --query 'Vpcs[0].CidrBlock'
+    --output text
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  register: _nl_vpc_cidr_lookup
+  changed_when: false
+
+# ------------------------------------------------------------------------------
+# SECURITY GROUP for interface endpoint ENIs — HTTPS from inside the VPC only.
+# ------------------------------------------------------------------------------
+- name: Check if the VPC endpoints security group already exists
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-security-groups
+    --filters
+      Name=group-name,Values={{ network_lockdown_vpc_name }}-endpoints-sg
+      Name=vpc-id,Values={{ network_lockdown_vpc_id }}
+    --query 'SecurityGroups[0].GroupId'
+    --output text
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  register: _nl_endpoints_sg_check
+  changed_when: false
+
+- name: Create the VPC endpoints security group
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 create-security-group
+    --group-name {{ network_lockdown_vpc_name }}-endpoints-sg
+    --description "HTTPS to VPC interface endpoints from inside the Cluster VPC only"
+    --vpc-id {{ network_lockdown_vpc_id }}
+    --query 'GroupId'
+    --output text
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  register: _nl_endpoints_sg_create
+  when: _nl_endpoints_sg_check.stdout | trim in ['None', '']
+  changed_when: true
+
+- name: Set VPC endpoints security group ID fact
+  ansible.builtin.set_fact:
+    _nl_endpoints_sg_id: >-
+      {{ _nl_endpoints_sg_create.stdout | trim if _nl_endpoints_sg_create is changed else _nl_endpoints_sg_check.stdout | trim }}
+
+- name: Allow HTTPS from the Cluster VPC CIDR to the endpoints security group
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 authorize-security-group-ingress
+    --group-id {{ _nl_endpoints_sg_id }}
+    --protocol tcp
+    --port 443
+    --cidr {{ _nl_vpc_cidr_lookup.stdout | trim }}
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  register: _nl_endpoints_sg_rule
+  failed_when:
+    - _nl_endpoints_sg_rule.rc != 0
+    - "'InvalidPermission.Duplicate' not in _nl_endpoints_sg_rule.stderr"
+  changed_when: _nl_endpoints_sg_rule.rc == 0
+
+# ------------------------------------------------------------------------------
+# S3 GATEWAY ENDPOINT — associates with the shared private route table.
+# ------------------------------------------------------------------------------
+- name: Check if the S3 gateway endpoint already exists
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-vpc-endpoints
+    --filters
+      Name=vpc-id,Values={{ network_lockdown_vpc_id }}
+      Name=service-name,Values=com.amazonaws.{{ network_lockdown_region }}.s3
+    --query 'VpcEndpoints[0].VpcEndpointId'
+    --output text
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  register: _nl_s3_endpoint_check
+  changed_when: false
+
+- name: Create the S3 gateway endpoint
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 create-vpc-endpoint
+    --vpc-id {{ network_lockdown_vpc_id }}
+    --service-name com.amazonaws.{{ network_lockdown_region }}.s3
+    --vpc-endpoint-type Gateway
+    --route-table-ids {{ network_lockdown_route_table_id }}
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  when: _nl_s3_endpoint_check.stdout | trim in ['None', '']
+  changed_when: true
+
+# ------------------------------------------------------------------------------
+# INTERFACE ENDPOINTS — EC2, ELB, STS, Route53. Placed in the subnets passed
+# in via network_lockdown_subnet_ids (the hub's, at role-call time).
+# ------------------------------------------------------------------------------
+- name: Check if each interface endpoint already exists
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-vpc-endpoints
+    --filters
+      Name=vpc-id,Values={{ network_lockdown_vpc_id }}
+      Name=service-name,Values=com.amazonaws.{{ network_lockdown_region }}.{{ item }}
+    --query 'VpcEndpoints[0].VpcEndpointId'
+    --output text
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  loop: "{{ network_lockdown_interface_endpoint_services }}"
+  register: _nl_iface_endpoint_check
+  changed_when: false
+
+- name: Create missing interface endpoints
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 create-vpc-endpoint
+    --vpc-id {{ network_lockdown_vpc_id }}
+    --service-name com.amazonaws.{{ network_lockdown_region }}.{{ item.item }}
+    --vpc-endpoint-type Interface
+    --subnet-ids {{ network_lockdown_subnet_ids | join(' ') }}
+    --security-group-ids {{ _nl_endpoints_sg_id }}
+    --private-dns-enabled
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  loop: "{{ _nl_iface_endpoint_check.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: item.stdout | trim in ['None', '']
+  changed_when: true
+
+- name: Display VPC endpoints summary
+  ansible.builtin.debug:
+    msg:
+      - "S3 gateway endpoint: ready on route table {{ network_lockdown_route_table_id }}"
+      - "Interface endpoints: {{ network_lockdown_interface_endpoint_services | join(', ') }}"
+      - "Endpoint subnets: {{ network_lockdown_subnet_ids }}"

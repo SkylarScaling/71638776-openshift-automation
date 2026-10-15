@@ -1,0 +1,136 @@
+---
+# ==============================================================================
+# LOCKDOWN CLUSTER SECURITY GROUPS
+#
+# The installer always creates node security groups with a broad 0.0.0.0/0,
+# all-protocols egress rule. This revokes that and replaces it with egress
+# scoped to the Cluster VPC (east-west + VPC endpoints) and, while
+# network_lockdown_allow_jumphost_egress is true, the jumphost VPC (mirror
+# registry/LDAP during install). Idempotent — safe to re-run in either mode;
+# re-running with allow_jumphost_egress: false is how migrate_mirror finally
+# cuts the clusters off from the jumphost entirely.
+#
+# Runs against target_kubeconfig to discover the cluster's infrastructure
+# name, which every AWS resource the installer created is tagged with
+# (kubernetes.io/cluster/<infraName>), regardless of whether the cluster was
+# provisioned via IPI or Hive/ACM.
+# ==============================================================================
+
+- name: Set AWS environment for all tasks
+  ansible.builtin.set_fact:
+    _aws_env:
+      AWS_ACCESS_KEY_ID: "{{ aws.aws_access_key_id }}"
+      AWS_SECRET_ACCESS_KEY: "{{ aws.aws_secret_access_key }}"
+      AWS_SESSION_TOKEN: ""
+
+- name: Get cluster infrastructure name
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get infrastructure cluster
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.infrastructureName}'
+  register: _nl_infra_name
+  changed_when: false
+
+- name: Find the Cluster VPC CIDR
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-vpcs
+    --filters Name=tag:Name,Values={{ network_lockdown_vpc_name }}
+    --query 'Vpcs[0].CidrBlock'
+    --output text
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  register: _nl_cluster_vpc_cidr
+  changed_when: false
+
+- name: Find the jumphost VPC CIDR
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-vpcs
+    --filters Name=tag:Name,Values={{ jumphost_name | default('disconnected-jumphost') }}-vpc
+    --query 'Vpcs[0].CidrBlock'
+    --output text
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  register: _nl_jumphost_vpc_cidr
+  changed_when: false
+
+- name: Find all security groups created for this cluster
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-security-groups
+    --filters Name=tag-key,Values=kubernetes.io/cluster/{{ _nl_infra_name.stdout | trim }}
+    --query 'SecurityGroups[].GroupId'
+    --output text
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  register: _nl_cluster_sgs
+  changed_when: false
+
+- name: Fail if no cluster-tagged security groups were found
+  ansible.builtin.fail:
+    msg: >-
+      No security groups tagged kubernetes.io/cluster/{{ _nl_infra_name.stdout | trim }}
+      were found — nothing to lock down.
+  when: _nl_cluster_sgs.stdout | trim == ''
+
+- name: Revoke the installer's default all-traffic egress-to-anywhere rule
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 revoke-security-group-egress
+    --group-id {{ item }}
+    --ip-permissions '[{"IpProtocol":"-1","IpRanges":[{"CidrIp":"0.0.0.0/0"}]}]'
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  loop: "{{ _nl_cluster_sgs.stdout.split() }}"
+  register: _nl_revoke_default
+  failed_when:
+    - _nl_revoke_default.rc != 0
+    - "'InvalidPermission.NotFound' not in _nl_revoke_default.stderr"
+  changed_when: _nl_revoke_default.rc == 0
+
+- name: Allow egress to the Cluster VPC (east-west + VPC endpoints)
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 authorize-security-group-egress
+    --group-id {{ item }}
+    --ip-permissions '[{"IpProtocol":"-1","IpRanges":[{"CidrIp":"{{ _nl_cluster_vpc_cidr.stdout | trim }}"}]}]'
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  loop: "{{ _nl_cluster_sgs.stdout.split() }}"
+  register: _nl_allow_cluster_cidr
+  failed_when:
+    - _nl_allow_cluster_cidr.rc != 0
+    - "'InvalidPermission.Duplicate' not in _nl_allow_cluster_cidr.stderr"
+  changed_when: _nl_allow_cluster_cidr.rc == 0
+
+- name: Allow egress to the jumphost VPC (mirror/LDAP, pre-migration only)
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 authorize-security-group-egress
+    --group-id {{ item }}
+    --ip-permissions '[{"IpProtocol":"-1","IpRanges":[{"CidrIp":"{{ _nl_jumphost_vpc_cidr.stdout | trim }}"}]}]'
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  loop: "{{ _nl_cluster_sgs.stdout.split() }}"
+  register: _nl_allow_jumphost_cidr
+  failed_when:
+    - _nl_allow_jumphost_cidr.rc != 0
+    - "'InvalidPermission.Duplicate' not in _nl_allow_jumphost_cidr.stderr"
+  changed_when: _nl_allow_jumphost_cidr.rc == 0
+  when: network_lockdown_allow_jumphost_egress | bool
+
+- name: Revoke egress to the jumphost VPC (final lockdown, post-migration)
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 revoke-security-group-egress
+    --group-id {{ item }}
+    --ip-permissions '[{"IpProtocol":"-1","IpRanges":[{"CidrIp":"{{ _nl_jumphost_vpc_cidr.stdout | trim }}"}]}]'
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  loop: "{{ _nl_cluster_sgs.stdout.split() }}"
+  register: _nl_revoke_jumphost_cidr
+  failed_when:
+    - _nl_revoke_jumphost_cidr.rc != 0
+    - "'InvalidPermission.NotFound' not in _nl_revoke_jumphost_cidr.stderr"
+  changed_when: _nl_revoke_jumphost_cidr.rc == 0
+  when: not (network_lockdown_allow_jumphost_egress | bool)
+
+- name: Display lockdown summary
+  ansible.builtin.debug:
+    msg:
+      - "Security groups locked down for {{ _nl_infra_name.stdout | trim }}: {{ _nl_cluster_sgs.stdout.split() }}"
+      - "Egress allowed: {{ _nl_cluster_vpc_cidr.stdout | trim }}{{ (' and ' ~ _nl_jumphost_vpc_cidr.stdout | trim) if network_lockdown_allow_jumphost_egress | bool else '' }}"

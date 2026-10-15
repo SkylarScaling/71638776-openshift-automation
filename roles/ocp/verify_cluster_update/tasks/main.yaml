@@ -1,0 +1,89 @@
+---
+# ==============================================================================
+# VERIFY CLUSTER UPDATE HEALTH
+#
+# Generic pre-flight / post-flight gate for OpenShift updates. Works against
+# whatever target_kubeconfig points at (hub or spoke). Set
+# verify_cluster_update_mode: preflight|postflight.
+#
+# preflight  — refuse to proceed if a ClusterOperator is Degraded or an MCP is
+#              mid-roll from some unrelated change (same MCO race class as
+#              project memory Bug 6 — never start an update on top of one).
+# postflight — confirm the update actually landed: ClusterVersion at the
+#              target version, ClusterOperators healthy, MCPs Updated.
+# ==============================================================================
+
+- name: "[Update] Check ClusterOperators are not Degraded"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get clusteroperators
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.conditions[?(@.type=="Degraded")].status}{"\n"}{end}'
+  register: _co_degraded_raw
+  changed_when: false
+
+- name: "[Update] Assert no ClusterOperator is Degraded"
+  ansible.builtin.assert:
+    that: _co_degraded_raw.stdout_lines | select('match', '.*\tTrue$') | list | length == 0
+    fail_msg: >-
+      Degraded ClusterOperator(s):
+      {{ _co_degraded_raw.stdout_lines | select('match', '.*\tTrue$') | list }}
+    success_msg: "No ClusterOperator is Degraded"
+
+- name: "[Update] Check MachineConfigPools are settled"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get mcp {{ item }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.conditions[?(@.type=="Updated")].status}={.status.conditions[?(@.type=="Updating")].status}'
+  register: _mcp_settled
+  changed_when: false
+  loop:
+    - master
+    - worker
+
+- name: "[Update] Assert MachineConfigPools are settled (Updated=True, Updating=False)"
+  ansible.builtin.assert:
+    that: item.stdout == "True=False"
+    fail_msg: "MachineConfigPool '{{ item.item }}' is not settled (status: {{ item.stdout }}) — wait for it before proceeding"
+    success_msg: "MachineConfigPool '{{ item.item }}' is settled"
+  loop: "{{ _mcp_settled.results }}"
+
+- name: "[Update] Postflight — check ClusterVersion reports the target version"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get clusterversion version
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.desired.version}'
+  register: _cv_version
+  changed_when: false
+  when: verify_cluster_update_mode | default('preflight') == 'postflight'
+
+- name: "[Update] Assert ClusterVersion matches the target version"
+  ansible.builtin.assert:
+    that: _cv_version.stdout == (openshift_version ~ '.' ~ ocp_patch_version)
+    fail_msg: >-
+      ClusterVersion reports {{ _cv_version.stdout }}, expected
+      {{ openshift_version }}.{{ ocp_patch_version }}
+    success_msg: "ClusterVersion is at the target version {{ _cv_version.stdout }}"
+  when: verify_cluster_update_mode | default('preflight') == 'postflight'
+
+- name: "[Update] Postflight — check ClusterVersion is not Progressing"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get clusterversion version
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.conditions[?(@.type=="Progressing")].status}'
+  register: _cv_progressing
+  changed_when: false
+  when: verify_cluster_update_mode | default('preflight') == 'postflight'
+
+- name: "[Update] Assert ClusterVersion is not Progressing"
+  ansible.builtin.assert:
+    that: _cv_progressing.stdout == "False"
+    fail_msg: "ClusterVersion is still Progressing"
+    success_msg: "ClusterVersion update complete, not Progressing"
+  when: verify_cluster_update_mode | default('preflight') == 'postflight'
+
+- name: "[Update] Display verification summary"
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'Pre-flight checks passed — safe to start update'
+         if verify_cluster_update_mode | default('preflight') == 'preflight'
+         else 'Post-flight checks passed — cluster is healthy at ' ~ _cv_version.stdout }}

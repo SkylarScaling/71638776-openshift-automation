@@ -1,0 +1,8 @@
+---
+network_lockdown_vpc_name: "{{ disconnected.network_lockdown.vpc_name | default('ocp-cluster-vpc') }}"
+network_lockdown_region: "{{ aws.aws_region }}"
+network_lockdown_interface_endpoint_services:
+  - ec2
+  - elasticloadbalancing
+  - sts
+  - route53

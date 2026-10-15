@@ -1,0 +1,7 @@
+---
+network_lockdown_vpc_name: "{{ disconnected.network_lockdown.vpc_name | default('ocp-cluster-vpc') }}"
+network_lockdown_region: "{{ aws.aws_region }}"
+# true during hub/spokes provisioning (image pulls still go via the jumphost
+# peering); set false in the migrate_mirror phase once Quay on the hub is the
+# live mirror and the jumphost is no longer needed.
+network_lockdown_allow_jumphost_egress: true

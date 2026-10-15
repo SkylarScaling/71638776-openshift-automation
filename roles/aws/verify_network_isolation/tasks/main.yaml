@@ -1,0 +1,113 @@
+---
+# ==============================================================================
+# VERIFY NETWORK ISOLATION
+#
+# Confirms the lockdown actually took: no 0.0.0.0/0 route to an Internet
+# Gateway/NAT Gateway on this cluster's subnets, no 0.0.0.0/0 egress on its
+# security groups, and (best-effort) a live node genuinely cannot reach the
+# public internet.
+# ==============================================================================
+
+- name: Set AWS environment for all tasks
+  ansible.builtin.set_fact:
+    _aws_env:
+      AWS_ACCESS_KEY_ID: "{{ aws.aws_access_key_id }}"
+      AWS_SECRET_ACCESS_KEY: "{{ aws.aws_secret_access_key }}"
+      AWS_SESSION_TOKEN: ""
+
+- name: Get cluster infrastructure name
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get infrastructure cluster
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.infrastructureName}'
+  register: _niv_infra_name
+  changed_when: false
+
+- name: "[NetIso] Find this cluster's subnets"
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-subnets
+    --filters Name=tag:Name,Values={{ ocp_cluster.name }}-*
+    --query 'Subnets[].SubnetId'
+    --output text
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  register: _niv_subnets
+  changed_when: false
+
+- name: "[NetIso] Get route tables for this cluster's subnets"
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-route-tables
+    --filters Name=association.subnet-id,Values={{ _niv_subnets.stdout.split() | join(',') }}
+    --query 'RouteTables[].Routes[]'
+    --output json
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  register: _niv_routes
+  changed_when: false
+
+- name: "[NetIso] Assert no route to an Internet Gateway or NAT Gateway"
+  ansible.builtin.assert:
+    that: >-
+      (_niv_routes.stdout | from_json
+        | selectattr('GatewayId', 'defined')
+        | selectattr('GatewayId', 'match', '^igw-')
+        | list | length == 0)
+      and
+      (_niv_routes.stdout | from_json
+        | selectattr('NatGatewayId', 'defined')
+        | list | length == 0)
+    fail_msg: "Cluster subnets have a route to an Internet Gateway or NAT Gateway — isolation is not in effect"
+    success_msg: "No route to an Internet Gateway or NAT Gateway on this cluster's subnets"
+
+- name: "[NetIso] Find this cluster's security groups"
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-security-groups
+    --filters Name=tag-key,Values=kubernetes.io/cluster/{{ _niv_infra_name.stdout | trim }}
+    --query 'SecurityGroups[].IpPermissionsEgress[]'
+    --output json
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  register: _niv_sg_egress
+  changed_when: false
+
+- name: "[NetIso] Assert no security group allows egress to 0.0.0.0/0"
+  ansible.builtin.assert:
+    that: >-
+      (_niv_sg_egress.stdout | from_json
+        | map(attribute='IpRanges') | flatten
+        | selectattr('CidrIp', 'defined')
+        | selectattr('CidrIp', 'equalto', '0.0.0.0/0')
+        | list | length == 0)
+    fail_msg: "A cluster security group still allows egress to 0.0.0.0/0 — run aws/lockdown_cluster_security_groups"
+    success_msg: "No cluster security group allows egress to 0.0.0.0/0"
+
+- name: "[NetIso] Best-effort live check — a master node should NOT reach the public internet"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get nodes
+    --kubeconfig {{ target_kubeconfig }}
+    -l node-role.kubernetes.io/master
+    -o jsonpath='{.items[0].metadata.name}'
+  register: _niv_master_node
+  changed_when: false
+  failed_when: false
+
+- name: "[NetIso] Attempt to curl a public IP from inside the cluster (expected to fail)"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc debug node/{{ _niv_master_node.stdout | trim }}
+    --kubeconfig {{ target_kubeconfig }}
+    -- chroot /host curl -m 5 -s -o /dev/null -w '%{http_code}' https://1.1.1.1
+  register: _niv_public_curl
+  changed_when: false
+  failed_when: false
+  when: _niv_master_node.stdout | default('') != ''
+
+- name: "[NetIso] Assert the public internet curl did not succeed"
+  ansible.builtin.assert:
+    that: _niv_public_curl.rc != 0 or _niv_public_curl.stdout | trim != "200"
+    fail_msg: "A cluster node successfully reached a public IP over the internet — isolation is not in effect"
+    success_msg: "Cluster node could not reach the public internet, as expected"
+  when: _niv_master_node.stdout | default('') != ''
+
+- name: "[NetIso] Display verification summary"
+  ansible.builtin.debug:
+    msg: "Network isolation verified for {{ ocp_cluster.name }} ({{ _niv_infra_name.stdout | trim }})"

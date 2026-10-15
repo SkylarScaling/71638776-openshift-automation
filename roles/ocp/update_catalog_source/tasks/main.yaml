@@ -1,0 +1,132 @@
+---
+# ==============================================================================
+# UPDATE CATALOG SOURCE — HUB + SPOKES
+#
+# Applies freshly mirrored IDMS manifests and repoints the redhat-operators
+# CatalogSource at the new catalog digest (hub directly, spokes via
+# ManifestWork). Reuses the exact ManifestWork names patch_cluster_idms
+# created during migrate_mirror, so repeated updates converge the same
+# steady-state objects instead of accumulating one per update.
+#
+# Prerequisites: ocp/mirror_update_content must have run first in this play
+# (sets update_idms_manifests, update_catalog_image).
+# ==============================================================================
+
+- name: Apply updated IDMS manifests to hub cluster
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: "{{ item }}"
+  loop: "{{ update_idms_manifests }}"
+  loop_control:
+    index_var: _idx
+    label: "Updated IDMS manifest {{ _idx + 1 }}"
+  changed_when: true
+
+- name: Disable default OperatorHub catalog sources on hub
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: config.openshift.io/v1
+      kind: OperatorHub
+      metadata:
+        name: cluster
+      spec:
+        disableAllDefaultSources: true
+  when: disable_default_catalog_sources | bool
+  changed_when: true
+
+- name: Update redhat-operators CatalogSource to the new catalog digest
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: operators.coreos.com/v1alpha1
+      kind: CatalogSource
+      metadata:
+        name: redhat-operators
+        namespace: openshift-marketplace
+      spec:
+        sourceType: grpc
+        image: "{{ update_catalog_image }}"
+        displayName: "Red Hat Operators (Quay Mirror)"
+        publisher: "Red Hat (Quay Mirror)"
+        updateStrategy:
+          registryPoll:
+            interval: 30m
+  changed_when: true
+
+- name: Wait for redhat-operators CatalogSource to be READY on hub
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get catalogsource redhat-operators -n openshift-marketplace
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.connectionState.lastObservedState}'
+  register: _hub_cs_status
+  until: _hub_cs_status.stdout == "READY"
+  retries: 20
+  delay: 30
+  changed_when: false
+
+# ------------------------------------------------------------------------------
+# SPOKE CLUSTERS: propagate via the same ManifestWork names patch_cluster_idms
+# created, so this always converges to one steady-state object per concern.
+# ------------------------------------------------------------------------------
+- name: Push updated IDMS to spokes via ManifestWork
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: work.open-cluster-management.io/v1
+      kind: ManifestWork
+      metadata:
+        name: "{{ hostvars[item].ocp_cluster.name }}-quay-idms"
+        namespace: "{{ hostvars[item].ocp_cluster.name }}"
+      spec:
+        workload:
+          manifests: {{ update_idms_manifests | map('from_yaml_all') | flatten | to_json }}
+  loop: "{{ groups['managed_clusters'] | default([]) }}"
+  loop_control:
+    label: "{{ hostvars[item].ocp_cluster.name }}"
+  changed_when: true
+
+- name: Push updated CatalogSource and OperatorHub config to spokes via ManifestWork
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: work.open-cluster-management.io/v1
+      kind: ManifestWork
+      metadata:
+        name: "{{ hostvars[item].ocp_cluster.name }}-quay-catalog"
+        namespace: "{{ hostvars[item].ocp_cluster.name }}"
+      spec:
+        workload:
+          manifests:
+            - apiVersion: config.openshift.io/v1
+              kind: OperatorHub
+              metadata:
+                name: cluster
+              spec:
+                disableAllDefaultSources: true
+            - apiVersion: operators.coreos.com/v1alpha1
+              kind: CatalogSource
+              metadata:
+                name: redhat-operators
+                namespace: openshift-marketplace
+              spec:
+                sourceType: grpc
+                image: "{{ update_catalog_image }}"
+                displayName: "Red Hat Operators (Quay Mirror)"
+                publisher: "Red Hat (Quay Mirror)"
+                updateStrategy:
+                  registryPoll:
+                    interval: 30m
+  loop: "{{ groups['managed_clusters'] | default([]) }}"
+  loop_control:
+    label: "{{ hostvars[item].ocp_cluster.name }}"
+  changed_when: true
+
+- name: Display catalog update summary
+  ansible.builtin.debug:
+    msg:
+      - "Catalog update applied"
+      - "Hub CatalogSource image: {{ update_catalog_image }}"
+      - "Spokes updated:          {{ groups['managed_clusters'] | default([]) | length }}"
+      - "Spoke CatalogSource/IDMS propagate asynchronously via ManifestWork —"
+      - "verify with: oc get catalogsource redhat-operators -n openshift-marketplace --kubeconfig <spoke-kubeconfig>"

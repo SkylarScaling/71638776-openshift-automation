@@ -1,0 +1,2 @@
+---
+network_lockdown_region: "{{ aws.aws_region }}"

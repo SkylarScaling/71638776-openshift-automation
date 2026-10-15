@@ -1,0 +1,3 @@
+---
+update_mirror_workspace: "{{ working_dir }}/oc-mirror-workspace-update"
+quay_mirror_org: "{{ disconnected.quay_mirror.org | default(disconnected.mirror_base_path | default('ocp4')) }}"

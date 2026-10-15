@@ -1,0 +1,94 @@
+---
+# ==============================================================================
+# DISABLE TELEMETRY / INSIGHTS
+#
+# Version-agnostic Day 2 lockdown: removes the cloud.openshift.com telemetry
+# upload credential from the pull secret (Red Hat's documented way to disable
+# Telemetry) and scales down the Insights Operator via a ClusterVersion
+# override. Works on any OCP version and on an already-installed cluster —
+# unlike excluding the 'Insights' cluster capability, which only applies at
+# install time and would require hardcoding a capability list that changes
+# across releases.
+# ==============================================================================
+
+- name: Check if cloud.openshift.com is present in the global pull secret
+  ansible.builtin.shell: |
+    set -e
+    {{ bin_dir }}/oc get secret pull-secret \
+      -n openshift-config \
+      --kubeconfig {{ target_kubeconfig }} \
+      -o jsonpath='{.data.\.dockerconfigjson}' | base64 -d \
+      | jq -e 'has("auths") and (.auths | has("cloud.openshift.com"))' >/dev/null \
+      && echo present || echo absent
+  args:
+    executable: /bin/bash
+  register: _telemetry_auth_check
+  changed_when: false
+
+- name: Remove cloud.openshift.com from the global pull secret
+  ansible.builtin.shell: |
+    set -e
+    UPDATED=$({{ bin_dir }}/oc get secret pull-secret \
+      -n openshift-config \
+      --kubeconfig {{ target_kubeconfig }} \
+      -o jsonpath='{.data.\.dockerconfigjson}' \
+      | base64 -d \
+      | jq -c 'del(.auths["cloud.openshift.com"])')
+    {{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f - <<EOF
+    apiVersion: v1
+    kind: Secret
+    metadata:
+      name: pull-secret
+      namespace: openshift-config
+    type: kubernetes.io/dockerconfigjson
+    data:
+      .dockerconfigjson: "$(echo -n "$UPDATED" | base64 -w 0)"
+    EOF
+  args:
+    executable: /bin/bash
+  changed_when: true
+  no_log: true
+  when: _telemetry_auth_check.stdout | trim == "present"
+
+- name: Check if the Insights Operator is already marked unmanaged
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get clusterversion version
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.spec.overrides[?(@.name=="insights-operator")].unmanaged}'
+  register: _insights_override_check
+  changed_when: false
+
+- name: Mark the Insights Operator Deployment as unmanaged on ClusterVersion
+  ansible.builtin.shell: |
+    set -e
+    CURRENT=$({{ bin_dir }}/oc get clusterversion version \
+      --kubeconfig {{ target_kubeconfig }} -o json)
+    UPDATED=$(echo "$CURRENT" | jq -c \
+      '.spec.overrides = ((.spec.overrides // []) + [{
+        "kind": "Deployment",
+        "group": "apps",
+        "name": "insights-operator",
+        "namespace": "openshift-insights",
+        "unmanaged": true
+      }])')
+    echo "$UPDATED" | {{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -
+  args:
+    executable: /bin/bash
+  changed_when: true
+  when: _insights_override_check.stdout | trim != "true"
+
+- name: Scale the Insights Operator Deployment to zero
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc scale deployment insights-operator
+    -n openshift-insights
+    --kubeconfig {{ target_kubeconfig }}
+    --replicas=0
+  register: _insights_scale
+  changed_when: "'scaled' in _insights_scale.stdout"
+  failed_when: false
+
+- name: Display telemetry lockdown summary
+  ansible.builtin.debug:
+    msg:
+      - "Telemetry disabled: cloud.openshift.com removed from pull secret"
+      - "Insights Operator: unmanaged + scaled to 0 replicas"

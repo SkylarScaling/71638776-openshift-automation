@@ -1,0 +1,5 @@
+---
+# Empty string = watch Subscriptions across all namespaces.
+approve_install_plans_namespace: ""
+approve_install_plans_retries: 40
+approve_install_plans_delay: 30

@@ -81,12 +81,21 @@ networking:
 {% else %}
   - 172.30.0.0/16
 {% endif %}
+{% if disconnected.network_lockdown is defined and disconnected.network_lockdown.enabled | default(false) %}
+publish: Internal
+{% endif %}
 platform:
   aws:
     region: {{ aws.aws_region }}
 {% if install_config.infra_tags is defined %}
     userTags:
       {{ install_config.infra_tags | to_nice_yaml | indent(6) }}
+{% endif %}
+{% if disconnected.network_lockdown is defined and disconnected.network_lockdown.enabled | default(false) %}
+    subnets:
+{% for subnet_id in network_lockdown_subnet_ids %}
+    - {{ subnet_id }}
+{% endfor %}
 {% endif %}
 pullSecret: '{{ disconnected_pull_secret | to_json }}'
 {% if ssh_key is defined %}

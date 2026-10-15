@@ -1,0 +1,317 @@
+---
+# ==============================================================================
+# DISCONNECTED DAY 2 UPDATE: OpenShift minor/patch + operator/catalog updates
+#
+# See DISCONNECTED-UPDATES.md for the full process description. Assumes
+# hub-spoke-disconnected-setup.yaml has already run through --tags
+# migrate_mirror (Quay on the hub is the live mirror registry).
+#
+# To update: bump openshift_version / ocp_patch_version and/or
+# disconnected.operators[].channels in the SAME inventory used for initial
+# deployment, then run this playbook against it.
+# ==============================================================================
+
+- name: Preflight - Verify Hub is healthy before updating
+  hosts: hub_cluster
+  connection: local
+  gather_facts: false
+  tags: ['preflight']
+  tasks:
+    - name: Set Hub Kubeconfig
+      ansible.builtin.set_fact:
+        hub_kubeconfig: "{{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig"
+        verify_cluster_update_mode: "preflight"
+
+    - name: Verify Hub cluster health
+      ansible.builtin.include_role:
+        name: ocp/verify_cluster_update
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+
+- name: Preflight - Verify Spokes are healthy before updating
+  hosts: managed_clusters
+  connection: local
+  gather_facts: false
+  tags: ['preflight']
+  tasks:
+    - name: Set Spoke Kubeconfig
+      ansible.builtin.set_fact:
+        spoke_kubeconfig: "{{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig"
+        verify_cluster_update_mode: "preflight"
+
+    - name: Verify Spoke cluster health
+      ansible.builtin.include_role:
+        name: ocp/verify_cluster_update
+      vars:
+        target_kubeconfig: "{{ spoke_kubeconfig }}"
+
+# ==============================================================================
+# MIRROR: Push updated OCP release + operator catalogs to Quay on the hub
+# ==============================================================================
+- name: Mirror - Push updated content to Quay
+  hosts: hub_cluster
+  connection: local
+  gather_facts: false
+  tags: ['mirror']
+  vars:
+    hub_kubeconfig: "{{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig"
+  tasks:
+    - name: Configure Quay as mirror target (derive route + robot credentials)
+      ansible.builtin.include_role:
+        name: ocp/configure_quay_mirror
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+
+    - name: Mirror updated content directly to Quay
+      ansible.builtin.include_role:
+        name: ocp/mirror_update_content
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+
+# ==============================================================================
+# CATALOG: Repoint the redhat-operators CatalogSource at the new content
+# ==============================================================================
+- name: Catalog - Update CatalogSource on Hub and Spokes
+  hosts: hub_cluster
+  connection: local
+  gather_facts: false
+  tags: ['catalog']
+  vars:
+    hub_kubeconfig: "{{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig"
+    update_mirror_workspace: "{{ working_dir }}/oc-mirror-workspace-update"
+  tasks:
+    # Supports `--tags catalog` standalone (without `--tags mirror` in the same
+    # invocation) by reading the manifests mirror_update_content already wrote
+    # to disk, same pattern hub-spoke-disconnected-setup.yaml uses for the
+    # initial jumphost mirror.
+    - name: Load update manifests from disk if not already set in-memory
+      when: update_idms_manifests is not defined
+      block:
+        - name: Find IDMS files from the update mirror workspace
+          ansible.builtin.find:
+            paths: "{{ update_mirror_workspace }}/working-dir/cluster-resources"
+            patterns:
+              - "idms-*.yaml"
+              - "imageDigestMirrorSet*.yaml"
+              - "imageContentSourcePolicy*.yaml"
+          register: _catalog_idms_files
+
+        - name: Read IDMS files
+          ansible.builtin.slurp:
+            src: "{{ item.path }}"
+          loop: "{{ _catalog_idms_files.files }}"
+          register: _catalog_idms_raw
+
+        - name: Set update IDMS manifests fact from disk
+          ansible.builtin.set_fact:
+            update_idms_manifests: "{{ _catalog_idms_raw.results | map(attribute='content') | map('b64decode') | list }}"
+
+        - name: Find CatalogSource files from the update mirror workspace
+          ansible.builtin.find:
+            paths: "{{ update_mirror_workspace }}/working-dir/cluster-resources"
+            patterns: "cs-*.yaml"
+          register: _catalog_cs_files
+
+        - name: Read CatalogSource files
+          ansible.builtin.slurp:
+            src: "{{ item.path }}"
+          loop: "{{ _catalog_cs_files.files }}"
+          register: _catalog_cs_raw
+
+        - name: Set update catalog image fact from disk
+          ansible.builtin.set_fact:
+            update_catalog_image: >-
+              {{ (_catalog_cs_raw.results
+                  | map(attribute='content') | map('b64decode')
+                  | map('from_yaml_all') | flatten | select('mapping')
+                  | selectattr('kind', 'equalto', 'CatalogSource')
+                  | selectattr('spec.image', 'defined')
+                  | selectattr('spec.image', 'search', 'redhat-operator-index')
+                  | map(attribute='spec.image') | first) }}
+
+    - name: Update CatalogSource on Hub and propagate to Spokes
+      ansible.builtin.include_role:
+        name: ocp/update_catalog_source
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+
+    - name: Verify mirror/catalog health on Hub
+      ansible.builtin.include_role:
+        name: ocp/verify_mirror_health
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+
+- name: Catalog - Verify CatalogSource health on Spokes
+  hosts: managed_clusters
+  connection: local
+  gather_facts: false
+  tags: ['catalog']
+  tasks:
+    - name: Set Spoke Kubeconfig
+      ansible.builtin.set_fact:
+        spoke_kubeconfig: "{{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig"
+
+    - name: Verify mirror/catalog health on Spoke
+      ansible.builtin.include_role:
+        name: ocp/verify_mirror_health
+      vars:
+        target_kubeconfig: "{{ spoke_kubeconfig }}"
+
+# ==============================================================================
+# OPERATORS: Approve pending InstallPlans so operators land on the new catalog
+# ==============================================================================
+- name: Operators - Approve pending InstallPlans on Hub
+  hosts: hub_cluster
+  connection: local
+  gather_facts: false
+  tags: ['operators']
+  tasks:
+    - name: Set Hub Kubeconfig
+      ansible.builtin.set_fact:
+        hub_kubeconfig: "{{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig"
+
+    - name: Approve pending InstallPlans on Hub
+      ansible.builtin.include_role:
+        name: ocp/approve_install_plans
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+
+- name: Operators - Approve pending InstallPlans on Spokes
+  hosts: managed_clusters
+  connection: local
+  gather_facts: false
+  tags: ['operators']
+  tasks:
+    - name: Set Spoke Kubeconfig
+      ansible.builtin.set_fact:
+        spoke_kubeconfig: "{{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig"
+
+    - name: Approve pending InstallPlans on Spoke
+      ansible.builtin.include_role:
+        name: ocp/approve_install_plans
+      vars:
+        target_kubeconfig: "{{ spoke_kubeconfig }}"
+
+# ==============================================================================
+# OCP_HUB: Update the OpenShift platform version on the hub
+# ==============================================================================
+- name: OCP Update - Hub
+  hosts: hub_cluster
+  connection: local
+  gather_facts: false
+  tags: ['ocp_hub']
+  vars:
+    hub_kubeconfig: "{{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig"
+    update_mirror_workspace: "{{ working_dir }}/oc-mirror-workspace-update"
+  tasks:
+    # Supports `--tags ocp_hub` standalone — only the Quay route is needed
+    # here (the cluster's own pull secret already has robot credentials from
+    # the catalog phase), so re-derive it without regenerating robot creds.
+    - name: Derive Quay registry URL if not already set
+      ansible.builtin.shell: >
+        {{ bin_dir }}/oc get route
+        -n {{ disconnected.quay_mirror.namespace | default('local-quay') }}
+        -l "quay-component=quay-app-route,quay-operator/quayregistry={{ disconnected.quay_mirror.registry_name | default('quay-registry') }}"
+        --kubeconfig {{ hub_kubeconfig }}
+        -o jsonpath='{.items[0].spec.host}'
+      register: _ocp_hub_quay_route
+      changed_when: false
+      when: quay_registry_url is not defined
+
+    - name: Set Quay registry URL fact from Route
+      ansible.builtin.set_fact:
+        quay_registry_url: "{{ _ocp_hub_quay_route.stdout | trim }}"
+      when: quay_registry_url is not defined
+
+    - name: Update OCP on the Hub
+      ansible.builtin.include_role:
+        name: ocp/update_ocp_hub
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+
+    - name: Verify Hub cluster health after update
+      ansible.builtin.include_role:
+        name: ocp/verify_cluster_update
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+        verify_cluster_update_mode: "postflight"
+
+# ==============================================================================
+# OCP_SPOKES: Update the OpenShift platform version on each spoke
+# ==============================================================================
+- name: OCP Update - Spokes
+  hosts: managed_clusters
+  connection: local
+  gather_facts: false
+  tags: ['ocp_spokes']
+  tasks:
+    - name: Set Hub Kubeconfig
+      ansible.builtin.set_fact:
+        hub_kubeconfig: "{{ install_dir }}/{{ hostvars[groups['hub_cluster'][0]]['ocp_cluster']['name'] }}/auth/kubeconfig"
+        spoke_kubeconfig: "{{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig"
+
+    - name: Derive Quay registry URL if not already set
+      ansible.builtin.shell: >
+        {{ bin_dir }}/oc get route
+        -n {{ disconnected.quay_mirror.namespace | default('local-quay') }}
+        -l "quay-component=quay-app-route,quay-operator/quayregistry={{ disconnected.quay_mirror.registry_name | default('quay-registry') }}"
+        --kubeconfig {{ hub_kubeconfig }}
+        -o jsonpath='{.items[0].spec.host}'
+      register: _ocp_spoke_quay_route
+      changed_when: false
+      when: quay_registry_url is not defined
+
+    - name: Set Quay registry URL fact from Route
+      ansible.builtin.set_fact:
+        quay_registry_url: "{{ _ocp_spoke_quay_route.stdout | trim }}"
+      when: quay_registry_url is not defined
+
+    # Hub must already be on (or above) the target version before any spoke —
+    # ACM/MCE/Hive on the hub manages the spoke upgrade.
+    - name: Assert Hub is already at the target version
+      ansible.builtin.shell: >
+        {{ bin_dir }}/oc get clusterversion version
+        --kubeconfig {{ hub_kubeconfig }}
+        -o jsonpath='{.status.desired.version}'
+      register: _spokes_hub_version
+      changed_when: false
+
+    - name: Fail if Hub has not been updated yet
+      ansible.builtin.fail:
+        msg: >-
+          Hub is at {{ _spokes_hub_version.stdout }}, expected
+          {{ openshift_version }}.{{ ocp_patch_version }}. Run with
+          --tags ocp_hub first.
+      when: _spokes_hub_version.stdout != (openshift_version ~ '.' ~ ocp_patch_version)
+
+    - name: Update OCP on this Spoke
+      ansible.builtin.include_role:
+        name: acm/update_ocp_spoke
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+
+    - name: Verify Spoke cluster health after update
+      ansible.builtin.include_role:
+        name: ocp/verify_cluster_update
+      vars:
+        target_kubeconfig: "{{ spoke_kubeconfig }}"
+        verify_cluster_update_mode: "postflight"
+
+# ==============================================================================
+# VERIFY: Final confirmation across the environment
+# ==============================================================================
+- name: Verify - Update Summary
+  hosts: hub_cluster
+  connection: local
+  gather_facts: false
+  tags: ['verify']
+  tasks:
+    - name: Print update summary
+      ansible.builtin.debug:
+        msg:
+          - "=================================================================="
+          - "Disconnected Update Complete"
+          - "=================================================================="
+          - "Target OpenShift version: {{ openshift_version }}.{{ ocp_patch_version }}"
+          - "Re-run with --tags verify,preflight at any time to re-check health."
+          - "=================================================================="

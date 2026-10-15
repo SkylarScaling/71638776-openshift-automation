@@ -1,0 +1,69 @@
+---
+# ==============================================================================
+# APPROVE PENDING INSTALL PLANS
+#
+# Generic, version-agnostic: finds OLM Subscriptions sitting in UpgradePending
+# with installPlanApproval=Manual and approves their InstallPlan. Repeats in a
+# loop because approving one InstallPlan can surface another one hop later in
+# the same channel. Runs against whatever cluster target_kubeconfig points at
+# (hub or a spoke) — nothing here is tied to a specific operator or version.
+# ==============================================================================
+
+- name: Approve pending InstallPlans until none remain
+  ansible.builtin.shell: |
+    set -o pipefail
+    NS_FLAG="-A"
+    if [ -n "{{ approve_install_plans_namespace }}" ]; then
+      NS_FLAG="-n {{ approve_install_plans_namespace }}"
+    fi
+    approved_any=0
+    for sub in $({{ bin_dir }}/oc get subscription $NS_FLAG \
+        --kubeconfig {{ target_kubeconfig }} \
+        -o jsonpath='{range .items[?(@.status.state=="UpgradePending")]}{.metadata.namespace}{"/"}{.metadata.name}{"\n"}{end}' 2>/dev/null); do
+      sub_ns="${sub%%/*}"
+      sub_name="${sub##*/}"
+      approval=$({{ bin_dir }}/oc get subscription "$sub_name" -n "$sub_ns" \
+        --kubeconfig {{ target_kubeconfig }} \
+        -o jsonpath='{.spec.installPlanApproval}' 2>/dev/null)
+      [ "$approval" != "Manual" ] && continue
+      ip_name=$({{ bin_dir }}/oc get subscription "$sub_name" -n "$sub_ns" \
+        --kubeconfig {{ target_kubeconfig }} \
+        -o jsonpath='{.status.installplan.name}' 2>/dev/null)
+      [ -z "$ip_name" ] && continue
+      approved=$({{ bin_dir }}/oc get installplan "$ip_name" -n "$sub_ns" \
+        --kubeconfig {{ target_kubeconfig }} \
+        -o jsonpath='{.spec.approved}' 2>/dev/null)
+      if [ "$approved" != "true" ]; then
+        {{ bin_dir }}/oc patch installplan "$ip_name" -n "$sub_ns" \
+          --kubeconfig {{ target_kubeconfig }} \
+          --type=merge -p '{"spec":{"approved":true}}'
+        echo "approved $sub_ns/$ip_name (subscription $sub_name)"
+        approved_any=1
+      fi
+    done
+    echo "APPROVED_ANY=$approved_any"
+  args:
+    executable: /bin/bash
+  register: _approve_pass
+  until: "'APPROVED_ANY=0' in _approve_pass.stdout"
+  retries: "{{ approve_install_plans_retries }}"
+  delay: "{{ approve_install_plans_delay }}"
+  changed_when: "'approved ' in _approve_pass.stdout"
+
+- name: Check for Subscriptions stuck in a non-resolvable state
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get subscription -A
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{range .items[?(@.status.state=="UpgradeFailed")]}{.metadata.namespace}{"/"}{.metadata.name}{"\n"}{end}' 2>/dev/null
+  register: _failed_subs
+  changed_when: false
+
+- name: Assert no Subscriptions are in UpgradeFailed
+  ansible.builtin.assert:
+    that: _failed_subs.stdout | trim == ""
+    fail_msg: "Subscriptions stuck in UpgradeFailed: {{ _failed_subs.stdout_lines }}"
+    success_msg: "No Subscriptions in UpgradeFailed"
+
+- name: Display InstallPlan approval summary
+  ansible.builtin.debug:
+    msg: "InstallPlan approval converged — no Subscriptions remain in UpgradePending with an unapproved InstallPlan."

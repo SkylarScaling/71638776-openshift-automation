@@ -1,0 +1,205 @@
+---
+# ==============================================================================
+# MIRROR UPDATED CONTENT DIRECTLY TO QUAY
+#
+# Re-mirrors the OCP release + operator catalogs described by the CURRENT
+# inventory values (openshift_version, ocp_patch_version, disconnected.operators)
+# straight into the Quay instance already running on the hub. Used for Day 2
+# OpenShift/operator updates after migrate_mirror has made Quay the live mirror
+# — there is no jumphost involved here.
+#
+# Prerequisites: ocp/configure_quay_mirror must have run first in the same play
+# (sets quay_registry_url, quay_robot_username, quay_robot_token).
+# ==============================================================================
+
+- name: Assert Quay mirror facts are available
+  ansible.builtin.assert:
+    that:
+      - quay_registry_url is defined
+      - quay_robot_username is defined
+      - quay_robot_token is defined
+    fail_msg: >-
+      quay_registry_url/quay_robot_username/quay_robot_token are not set.
+      Run ocp/configure_quay_mirror earlier in this play to derive them.
+
+- name: Create update mirror workspace directory
+  ansible.builtin.file:
+    state: directory
+    path: "{{ update_mirror_workspace }}"
+    mode: '0755'
+
+- name: Create auth directory for update mirror workspace
+  ansible.builtin.file:
+    state: directory
+    path: "{{ update_mirror_workspace }}/containers"
+    mode: '0700'
+
+# Shares the ImageSetConfiguration template with ocp/mirror_ocp_content so the
+# set of mirrored content (release channel/version, operators, channels) is
+# defined in exactly one place and always reflects the current inventory.
+- name: Template ImageSetConfiguration from the shared mirror_ocp_content template
+  ansible.builtin.template:
+    src: "{{ role_path }}/../mirror_ocp_content/templates/imageset-config.yaml.j2"
+    dest: "{{ update_mirror_workspace }}/imageset-config.yaml"
+    mode: '0644'
+
+- name: Build auth.json with Red Hat and Quay credentials
+  ansible.builtin.copy:
+    content: >-
+      {{
+        pull_secret | combine({
+          'auths': pull_secret.auths | combine({
+            quay_registry_url: {
+              'auth': (quay_robot_username ~ ':' ~ quay_robot_token) | b64encode,
+              'email': ''
+            }
+          })
+        }) | to_nice_json
+      }}
+    dest: "{{ update_mirror_workspace }}/containers/auth.json"
+    mode: '0600'
+  no_log: true
+
+- name: Read mirror version sentinel if present
+  ansible.builtin.slurp:
+    src: "{{ update_mirror_workspace }}/.mirror-version"
+  register: _update_mirror_version
+  failed_when: false
+
+- name: Set update mirror completion flag
+  ansible.builtin.set_fact:
+    _update_mirror_complete: >-
+      {{ (_update_mirror_version.content | default('') | b64decode | trim)
+         == (openshift_version ~ '.' ~ ocp_patch_version) }}
+
+- name: Print log path for live monitoring
+  ansible.builtin.debug:
+    msg: >
+      Starting oc-mirror update to Quay. Monitor progress:
+      tail -f {{ update_mirror_workspace }}/.oc-mirror.log
+  when: not _update_mirror_complete
+
+- name: Run oc-mirror to push updated content to Quay
+  ansible.builtin.command: >
+    {{ bin_dir }}/oc-mirror
+    --v2
+    --config {{ update_mirror_workspace }}/imageset-config.yaml
+    --workspace file://{{ update_mirror_workspace }}
+    docker://{{ quay_registry_url }}/{{ quay_mirror_org }}
+  environment:
+    XDG_RUNTIME_DIR: "{{ update_mirror_workspace }}"
+  args:
+    chdir: "{{ update_mirror_workspace }}"
+  async: 7200
+  poll: 0
+  register: _update_mirror_job
+  when: not _update_mirror_complete
+
+- name: Wait for oc-mirror update to complete (up to 2 hours)
+  ansible.builtin.async_status:
+    jid: "{{ _update_mirror_job.ansible_job_id }}"
+  register: _update_mirror_result
+  until: _update_mirror_result.finished
+  retries: 240
+  delay: 30
+  when:
+    - _update_mirror_job is defined
+    - _update_mirror_job.ansible_job_id is defined
+  failed_when:
+    - _update_mirror_result.finished
+    - _update_mirror_result.rc not in [0, 4, 12, 14]
+
+# Same Quay repo-creation push-token race documented in
+# remirror_to_quay/tasks/converge_unauthorized.yml (see project memory Bug 7).
+# Reuse it directly rather than duplicating the fix — it only depends on
+# quay_mirror_workspace/quay_registry_url/quay_mirror_org, which we alias here.
+- name: Alias workspace fact for shared converge_unauthorized task file
+  ansible.builtin.set_fact:
+    quay_mirror_workspace: "{{ update_mirror_workspace }}"
+  when: not _update_mirror_complete
+
+- name: Converge Quay repo-creation races after update mirror run
+  ansible.builtin.include_tasks: "{{ role_path }}/../remirror_to_quay/tasks/converge_unauthorized.yml"
+  loop: [1, 2]
+  loop_control:
+    loop_var: _converge_pass
+  when: not _update_mirror_complete
+
+- name: Find IDMS files in update mirror output
+  ansible.builtin.find:
+    paths: "{{ update_mirror_workspace }}/working-dir/cluster-resources"
+    patterns:
+      - "idms-*.yaml"
+      - "imageDigestMirrorSet*.yaml"
+      - "imageContentSourcePolicy*.yaml"
+    file_type: file
+  register: _update_idms_files
+
+- name: Find CatalogSource files in update mirror output
+  ansible.builtin.find:
+    paths: "{{ update_mirror_workspace }}/working-dir/cluster-resources"
+    patterns: "cs-*.yaml"
+    file_type: file
+  register: _update_cs_files
+
+- name: Fail if no CatalogSource manifests were generated
+  ansible.builtin.fail:
+    msg: >-
+      oc-mirror did not generate a CatalogSource manifest for this update.
+      Check {{ update_mirror_workspace }}/working-dir/logs/mirroring_errors_*.txt
+  when: _update_cs_files.files | default([]) | length == 0
+
+- name: Read IDMS manifests
+  ansible.builtin.slurp:
+    src: "{{ item.path }}"
+  loop: "{{ _update_idms_files.files }}"
+  register: _update_idms_contents
+
+- name: Read CatalogSource manifests
+  ansible.builtin.slurp:
+    src: "{{ item.path }}"
+  loop: "{{ _update_cs_files.files }}"
+  register: _update_cs_contents
+
+- name: Set update IDMS manifests fact
+  ansible.builtin.set_fact:
+    update_idms_manifests: "{{ _update_idms_contents.results | map(attribute='content') | map('b64decode') | list }}"
+
+- name: Extract operator catalog index entries
+  ansible.builtin.set_fact:
+    _update_catalog_entries: >-
+      {{ _update_cs_contents.results
+          | map(attribute='content')
+          | map('b64decode')
+          | map('from_yaml_all')
+          | flatten
+          | select('mapping')
+          | selectattr('kind', 'equalto', 'CatalogSource')
+          | selectattr('spec.image', 'defined')
+          | selectattr('spec.image', 'search', 'redhat-operator-index')
+          | list }}
+
+- name: Fail if no CatalogSource references the operator catalog index
+  ansible.builtin.fail:
+    msg: >-
+      No CatalogSource manifest references 'redhat-operator-index' — the
+      operator catalog index image was not mirrored successfully.
+  when: _update_catalog_entries | length == 0
+
+- name: Set update catalog image fact
+  ansible.builtin.set_fact:
+    update_catalog_image: "{{ _update_catalog_entries | map(attribute='spec.image') | first }}"
+
+- name: Write mirror version sentinel
+  ansible.builtin.copy:
+    content: "{{ openshift_version }}.{{ ocp_patch_version }}"
+    dest: "{{ update_mirror_workspace }}/.mirror-version"
+    mode: '0644'
+
+- name: Display update mirror summary
+  ansible.builtin.debug:
+    msg:
+      - "Update mirror to Quay complete"
+      - "Target version:  {{ openshift_version }}.{{ ocp_patch_version }}"
+      - "Catalog image:   {{ update_catalog_image }}"
+      - "IDMS manifests:  {{ update_idms_manifests | length }}"
