@@ -215,8 +215,12 @@
   changed_when: false
   failed_when: false
 
+# Quay's blob-delete GC lock can collide with a concurrent upload of the same
+# shared digest (common base-image layers), returning a transient 503 after
+# ~3s. A single retry can land in the same lock window under high oc-mirror
+# parallelism, so retry a few times with a short backoff rather than once.
 - name: Retry failed images to Quay with oc image mirror (linux/amd64 only)
-  ansible.builtin.shell: >
+  ansible.builtin.command: >
     {{ bin_dir }}/oc image mirror
     --filter-by-os=linux/amd64
     --insecure=true
@@ -226,6 +230,10 @@
   loop: "{{ _quay_failed_images.stdout_lines | default([]) }}"
   loop_control:
     label: "{{ item | regex_replace('^docker://', '') | truncate(80, True, '...') }}"
+  register: _quay_image_retry
+  until: _quay_image_retry.rc == 0
+  retries: 5
+  delay: 10
   when:
     - _quay_failed_images is defined
     - _quay_failed_images.stdout_lines | default([]) | length > 0
@@ -244,8 +252,9 @@
   changed_when: false
   failed_when: false
 
+# See the lock-race comment above the non-bundle retry task — same rationale.
 - name: Retry failed bundle images to Quay with oc image mirror
-  ansible.builtin.shell: >
+  ansible.builtin.command: >
     {{ bin_dir }}/oc image mirror
     --insecure=true
     -a {{ quay_mirror_workspace }}/containers/auth.json
@@ -254,6 +263,10 @@
   loop: "{{ _quay_failed_bundles.stdout_lines | default([]) }}"
   loop_control:
     label: "{{ item | regex_replace('^docker://', '') | truncate(80, True, '...') }}"
+  register: _quay_bundle_retry
+  until: _quay_bundle_retry.rc == 0
+  retries: 5
+  delay: 10
   when:
     - _quay_failed_bundles is defined
     - _quay_failed_bundles.stdout_lines | default([]) | length > 0
