@@ -1,0 +1,79 @@
+---
+# Included once per zone (loop_var _nl_zone) by main.yaml. Re-queries AWS for
+# this zone/subnet rather than relying on facts from a prior iteration, so
+# each allocation sees the CIDRs any earlier iteration (or an earlier host —
+# e.g. the hub, if this is a spoke) already claimed.
+
+- name: "Check if the private subnet for {{ ocp_cluster.name }}-{{ _nl_zone }} already exists"
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-subnets
+    --filters
+      Name=vpc-id,Values={{ network_lockdown_vpc_id }}
+      Name=tag:Name,Values={{ ocp_cluster.name }}-{{ _nl_zone }}
+    --query 'Subnets[0].SubnetId'
+    --output text
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  register: _nl_subnet_check
+  changed_when: false
+
+- name: "Allocate and create private subnet for {{ ocp_cluster.name }}-{{ _nl_zone }}"
+  when: _nl_subnet_check.stdout | trim in ['None', '']
+  block:
+    - name: Find CIDRs already in use in the Cluster VPC
+      ansible.builtin.command: >
+        {{ bin_dir }}/aws ec2 describe-subnets
+        --filters Name=vpc-id,Values={{ network_lockdown_vpc_id }}
+        --query 'Subnets[].CidrBlock'
+        --output text
+        --region {{ network_lockdown_region }}
+      environment: "{{ _aws_env }}"
+      register: _nl_used_cidrs
+      changed_when: false
+
+    - name: Build the list of /24 CIDRs not already in use, in ascending order
+      ansible.builtin.set_fact:
+        _nl_free_cidrs_str: >-
+          {%- set used = _nl_used_cidrs.stdout.split() -%}
+          {%- set free = [] -%}
+          {%- for idx in range(0, 256) -%}
+            {%- set candidate = network_lockdown_vpc_cidr | ansible.utils.ipsubnet(24, idx) -%}
+            {%- if candidate not in used -%}
+              {%- set _ = free.append(candidate) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ free | join(' ') }}
+
+    - name: Fail if the Cluster VPC's address space is exhausted
+      ansible.builtin.fail:
+        msg: >-
+          No free /24 subnet remains in Cluster VPC CIDR
+          {{ network_lockdown_vpc_cidr }}. Widen disconnected.network_lockdown.vpc_cidr.
+      when: _nl_free_cidrs_str | trim == ''
+
+    - name: Pick the lowest-numbered free /24
+      ansible.builtin.set_fact:
+        _nl_next_cidr: "{{ _nl_free_cidrs_str.split() | first }}"
+
+    - name: "Create private subnet for {{ ocp_cluster.name }}-{{ _nl_zone }}"
+      ansible.builtin.command: >
+        {{ bin_dir }}/aws ec2 create-subnet
+        --vpc-id {{ network_lockdown_vpc_id }}
+        --availability-zone {{ _nl_zone }}
+        --cidr-block {{ _nl_next_cidr }}
+        --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value={{ ocp_cluster.name }}-{{ _nl_zone }}}]"
+        --query 'Subnet.SubnetId'
+        --output text
+        --region {{ network_lockdown_region }}
+      environment: "{{ _aws_env }}"
+      register: _nl_subnet_create
+      changed_when: true
+
+    - name: Associate the new subnet with the shared private route table
+      ansible.builtin.command: >
+        {{ bin_dir }}/aws ec2 associate-route-table
+        --route-table-id {{ network_lockdown_route_table_id }}
+        --subnet-id {{ _nl_subnet_create.stdout | trim }}
+        --region {{ network_lockdown_region }}
+      environment: "{{ _aws_env }}"
+      changed_when: true

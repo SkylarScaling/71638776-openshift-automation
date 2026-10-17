@@ -2,14 +2,22 @@
 # ==============================================================================
 # CREATE PRIVATE SUBNETS FOR A CLUSTER
 #
-# Carves this cluster's private subnets out of the isolated Cluster VPC, from
-# the explicit zone/cidr pairs in install_config.network_lockdown_subnets.
-# Associates each with the shared private route table (no route to an
-# Internet Gateway/NAT Gateway — isolation comes from that absence).
+# Carves this cluster's private subnets out of the isolated Cluster VPC — one
+# per availability zone the cluster actually uses (install_config.control_plane
+# /workers zones). CIDRs are allocated automatically: the Cluster VPC's /16 is
+# carved into /24s, and each zone gets the lowest-numbered /24 not already in
+# use anywhere in the VPC. No explicit per-cluster CIDR input required — the
+# role that creates the Cluster VPC is the same one carving it up, so there's
+# nothing for the user to keep in sync by hand. Associates each subnet with
+# the shared private route table (no route to an Internet Gateway/NAT Gateway
+# — isolation comes from that absence).
 #
 # Self-contained: (re)discovers the Cluster VPC and route table by tag rather
 # than depending on facts set by aws/provision_cluster_vpc in an earlier play,
 # so this works whether hub and spokes run in the same invocation or not.
+# Subnets are allocated one zone at a time, re-reading AWS state before each
+# allocation, so a spoke running after the hub naturally skips CIDRs the hub
+# already claimed — no coordination between hosts is needed.
 #
 # Prerequisites: aws/provision_cluster_vpc must have run once already (any
 # earlier invocation — this only discovers, never creates the VPC itself).
@@ -21,13 +29,6 @@
       AWS_ACCESS_KEY_ID: "{{ aws.aws_access_key_id }}"
       AWS_SECRET_ACCESS_KEY: "{{ aws.aws_secret_access_key }}"
       AWS_SESSION_TOKEN: ""
-
-- name: Assert this cluster defines network_lockdown_subnets
-  ansible.builtin.assert:
-    that: install_config.network_lockdown_subnets | default([]) | length > 0
-    fail_msg: >-
-      disconnected.network_lockdown.enabled is true but
-      install_config.network_lockdown_subnets is not set for {{ ocp_cluster.name }}.
 
 - name: Find the Cluster VPC
   ansible.builtin.command: >
@@ -64,52 +65,35 @@
   ansible.builtin.set_fact:
     network_lockdown_route_table_id: "{{ _nl_rt_lookup.stdout | trim }}"
 
-- name: Check if each private subnet already exists
-  ansible.builtin.command: >
-    {{ bin_dir }}/aws ec2 describe-subnets
-    --filters
-      Name=vpc-id,Values={{ network_lockdown_vpc_id }}
-      Name=tag:Name,Values={{ ocp_cluster.name }}-{{ item.zone }}
-    --query 'Subnets[0].SubnetId'
-    --output text
-    --region {{ network_lockdown_region }}
-  environment: "{{ _aws_env }}"
-  loop: "{{ install_config.network_lockdown_subnets }}"
-  loop_control:
-    label: "{{ ocp_cluster.name }}-{{ item.zone }}"
-  register: _nl_subnet_check
-  changed_when: false
+- name: Determine zones required for this cluster
+  ansible.builtin.set_fact:
+    _nl_zones: >-
+      {{ (install_config.control_plane.zones | default([])
+          + install_config.workers.zones | default([])) | unique }}
 
-- name: Create missing private subnets
-  ansible.builtin.command: >
-    {{ bin_dir }}/aws ec2 create-subnet
-    --vpc-id {{ network_lockdown_vpc_id }}
-    --availability-zone {{ item.item.zone }}
-    --cidr-block {{ item.item.cidr }}
-    --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value={{ ocp_cluster.name }}-{{ item.item.zone }}}]"
-    --query 'Subnet.SubnetId'
-    --output text
-    --region {{ network_lockdown_region }}
-  environment: "{{ _aws_env }}"
-  loop: "{{ _nl_subnet_check.results }}"
-  loop_control:
-    label: "{{ ocp_cluster.name }}-{{ item.item.zone }}"
-  register: _nl_subnet_create
-  when: item.stdout | trim in ['None', '']
-  changed_when: true
+- name: Discover a default availability zone when none are configured
+  when: _nl_zones | length == 0
+  block:
+    - name: Find an available zone in the target region
+      ansible.builtin.command: >
+        {{ bin_dir }}/aws ec2 describe-availability-zones
+        --filters Name=state,Values=available
+        --query 'AvailabilityZones[0].ZoneName'
+        --output text
+        --region {{ network_lockdown_region }}
+      environment: "{{ _aws_env }}"
+      register: _nl_default_az
+      changed_when: false
 
-- name: Associate newly created subnets with the shared private route table
-  ansible.builtin.command: >
-    {{ bin_dir }}/aws ec2 associate-route-table
-    --route-table-id {{ network_lockdown_route_table_id }}
-    --subnet-id {{ item.stdout | trim }}
-    --region {{ network_lockdown_region }}
-  environment: "{{ _aws_env }}"
-  loop: "{{ _nl_subnet_create.results | default([]) }}"
+    - name: Set default zone fact
+      ansible.builtin.set_fact:
+        _nl_zones: ["{{ _nl_default_az.stdout | trim }}"]
+
+- name: Allocate a private subnet for each required zone
+  ansible.builtin.include_tasks: allocate_subnet.yml
+  loop: "{{ _nl_zones }}"
   loop_control:
-    label: "{{ item.stdout | default('skipped') }}"
-  when: item.stdout is defined
-  changed_when: true
+    loop_var: _nl_zone
 
 - name: Re-read subnet IDs for this cluster (existing + newly created)
   ansible.builtin.command: >

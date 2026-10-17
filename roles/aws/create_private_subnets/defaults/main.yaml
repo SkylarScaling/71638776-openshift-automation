@@ -1,3 +1,4 @@
 ---
 network_lockdown_vpc_name: "{{ disconnected.network_lockdown.vpc_name | default('ocp-cluster-vpc') }}"
+network_lockdown_vpc_cidr: "{{ disconnected.network_lockdown.vpc_cidr | default('10.90.0.0/16') }}"
 network_lockdown_region: "{{ aws.aws_region }}"

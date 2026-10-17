@@ -8,10 +8,11 @@ jumphost's mirror registry over its public IP across the open internet. A
 cluster built this way can still reach the public internet for anything not
 covered by the mirror config (telemetry, Cincinnati, a missed image reference).
 
-This feature adds real network isolation as an **opt-in** layer
-(`disconnected.network_lockdown.enabled: true`) without changing the existing
-jumphost-mirrors-then-migrate-to-hub workflow. Deployments that don't set this
-flag are completely unaffected.
+This feature adds real network isolation, enabled **by default** for
+`hub-spoke-disconnected-setup.yaml` (a disconnected install should mean
+network-disconnected, not just image-source-disconnected) without changing
+the existing jumphost-mirrors-then-migrate-to-hub workflow. Set
+`disconnected.network_lockdown.enabled: false` to opt out.
 
 ## Architecture
 
@@ -43,7 +44,7 @@ flag are completely unaffected.
 | Role | Runs | Purpose |
 |---|---|---|
 | `aws/provision_cluster_vpc` | jumphost phase, once | Isolated Cluster VPC, one shared private route table, peering connection to the jumphost VPC (discovered by tag, same pattern as `aws_provision_jumphost`). |
-| `aws/create_private_subnets` | hub phase (hub) / spokes phase (each spoke) | Per-cluster private subnets in the Cluster VPC from explicit inventory CIDRs — same style as `install_config.machine_network`. |
+| `aws/create_private_subnets` | hub phase (hub) / spokes phase (each spoke) | Per-cluster private subnets in the Cluster VPC — one per zone in `install_config.control_plane`/`workers.zones` (or one auto-discovered AZ if zones aren't set). CIDRs are allocated automatically: the Cluster VPC's `/16` is carved into `/24`s, each zone getting the lowest-numbered `/24` not already claimed anywhere in the VPC (re-checked against live AWS state before every allocation, so a spoke run after the hub naturally skips what the hub already took — no cross-host coordination needed). |
 | `aws/create_vpc_endpoints` | hub phase, once (after hub's subnets exist) | S3 gateway + EC2/ELB/STS/Route53 interface endpoints. |
 | `aws/lockdown_cluster_security_groups` | hub/spokes phase (initial) and migrate_mirror phase (final) | Tightens node security group egress. `network_lockdown_allow_jumphost_egress` controls whether jumphost-VPC-CIDR egress is still allowed. |
 | `aws/verify_network_isolation` | verify phase | Asserts no `0.0.0.0/0` route/egress remains; live `oc debug node` curl-to-public-IP check expecting failure. |
@@ -51,32 +52,18 @@ flag are completely unaffected.
 
 ## Inventory
 
+Nothing is required — `enabled` defaults to `true` for this playbook, `vpc_name`
+and `vpc_cidr` both have defaults, and per-cluster subnets/CIDRs are allocated
+automatically from the zones already configured in `install_config`. To
+override or opt out:
+
 ```yaml
 disconnected:
   network_lockdown:
-    enabled: true
+    enabled: false                     # opt out entirely; defaults to true
     vpc_name: "ocp-cluster-vpc"        # optional, default shown
     vpc_cidr: "10.90.0.0/16"           # Cluster VPC CIDR — must not overlap the jumphost VPC CIDR (10.0.0.0/16 by default)
 ```
-
-Each cluster (`hub_cluster` and every `managed_clusters` host) needs explicit
-private subnet CIDRs carved from `vpc_cidr`, matching the zones already used
-for `install_config.control_plane`/`workers`:
-
-```yaml
-install_config:
-  network_lockdown_subnets:
-    - zone: us-east-1a
-      cidr: 10.90.1.0/24
-    - zone: us-east-1b
-      cidr: 10.90.2.0/24
-    - zone: us-east-1c
-      cidr: 10.90.3.0/24
-```
-
-Every cluster must use a disjoint set of CIDRs within `vpc_cidr` — there's no
-auto-IPAM here, same philosophy as the existing `machine_network`/
-`cluster_network` fields: explicit and simple rather than computed.
 
 ## What this does not do
 

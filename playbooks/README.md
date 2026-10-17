@@ -733,41 +733,31 @@ all:
 
 ### Network Lockdown (AWS only)
 
-By default, the disconnected playbook only controls where images come from —
-it does not stop the cluster's network path from reaching the internet (the
-installer creates its own VPC with public subnets, an Internet Gateway, and
-NAT Gateways). See [`DISCONNECTED-NETWORK-LOCKDOWN.md`](DISCONNECTED-NETWORK-LOCKDOWN.md)
-for the full design. Enable it with:
+`hub-spoke-disconnected-setup.yaml` provisions real network isolation **by
+default** — a dedicated, isolated Cluster VPC (no Internet Gateway/NAT, ever)
+peered to the jumphost VPC, VPC Endpoints for required AWS APIs, node
+security groups locked down to deny `0.0.0.0/0` egress, and Telemetry/Insights
+disabled. Private subnets are carved out of the Cluster VPC's CIDR
+automatically — one per availability zone your `install_config.control_plane`/
+`workers.zones` already use (or a single AZ, auto-discovered, if you don't set
+zones) — there is nothing to configure per cluster. See
+[`DISCONNECTED-NETWORK-LOCKDOWN.md`](DISCONNECTED-NETWORK-LOCKDOWN.md) for the
+full design.
+
+No inventory changes are required to get isolation — it's on by default for
+this playbook. Optional overrides:
 
 ```yaml
 disconnected:
   network_lockdown:
-    enabled: true
+    enabled: false                # opt out entirely; defaults to true
     vpc_name: "ocp-cluster-vpc"   # optional, default shown
     vpc_cidr: "10.90.0.0/16"      # must not overlap the jumphost VPC CIDR (10.0.0.0/16 by default)
 ```
 
-...and, per cluster (`hub_cluster` and every `managed_clusters` host), explicit
-private subnet CIDRs matching the zones already used for `install_config`:
-
-```yaml
-install_config:
-  network_lockdown_subnets:
-    - zone: us-east-1a
-      cidr: 10.90.1.0/24
-    - zone: us-east-1b
-      cidr: 10.90.2.0/24
-    - zone: us-east-1c
-      cidr: 10.90.3.0/24
-```
-
-When enabled, the hub and every spoke are provisioned into private-only
-subnets in a dedicated, isolated VPC (no Internet Gateway/NAT, ever) peered to
-the jumphost VPC, with VPC Endpoints for required AWS APIs, node security
-groups locked down to deny `0.0.0.0/0` egress, and Telemetry/Insights
-disabled. The jumphost-peering egress is revoked entirely once
-`migrate_mirror` runs. Re-run with `--tags verify` at any time to confirm
-isolation is actually in effect.
+The jumphost-peering egress is revoked entirely once `migrate_mirror` runs.
+Re-run with `--tags verify` at any time to confirm isolation is actually in
+effect.
 
 ### Day 2 Updates (OpenShift + Operators)
 

@@ -81,7 +81,7 @@ networking:
 {% else %}
   - 172.30.0.0/16
 {% endif %}
-{% if disconnected.network_lockdown is defined and disconnected.network_lockdown.enabled | default(false) %}
+{% if disconnected.network_lockdown.enabled | default(true) %}
 publish: Internal
 {% endif %}
 platform:
@@ -91,7 +91,7 @@ platform:
     userTags:
       {{ install_config.infra_tags | to_nice_yaml | indent(6) }}
 {% endif %}
-{% if disconnected.network_lockdown is defined and disconnected.network_lockdown.enabled | default(false) %}
+{% if disconnected.network_lockdown.enabled | default(true) %}
     subnets:
 {% for subnet_id in network_lockdown_subnet_ids %}
     - {{ subnet_id }}

@@ -30,7 +30,7 @@
     - name: Provision isolated Cluster VPC (network lockdown)
       ansible.builtin.include_role:
         name: aws/provision_cluster_vpc
-      when: disconnected.network_lockdown.enabled | default(false)
+      when: disconnected.network_lockdown.enabled | default(true)
 
     - name: Print jumphost preparation summary
       ansible.builtin.debug:
@@ -164,12 +164,12 @@
     - name: Create Hub private subnets in the isolated Cluster VPC (network lockdown)
       ansible.builtin.include_role:
         name: aws/create_private_subnets
-      when: disconnected.network_lockdown.enabled | default(false)
+      when: disconnected.network_lockdown.enabled | default(true)
 
     - name: Create VPC Endpoints for the isolated Cluster VPC (network lockdown)
       ansible.builtin.include_role:
         name: aws/create_vpc_endpoints
-      when: disconnected.network_lockdown.enabled | default(false)
+      when: disconnected.network_lockdown.enabled | default(true)
 
     - name: Provision Hub via Disconnected IPI
       ansible.builtin.include_role:
@@ -370,14 +370,14 @@
       vars:
         target_kubeconfig: "{{ hub_kubeconfig }}"
         network_lockdown_allow_jumphost_egress: true
-      when: disconnected.network_lockdown.enabled | default(false)
+      when: disconnected.network_lockdown.enabled | default(true)
 
     - name: Disable Telemetry/Insights on Hub
       ansible.builtin.include_role:
         name: ocp/disable_telemetry
       vars:
         target_kubeconfig: "{{ hub_kubeconfig }}"
-      when: disconnected.network_lockdown.enabled | default(false)
+      when: disconnected.network_lockdown.enabled | default(true)
 
     - name: Fetch Hub kubeadmin password
       ansible.builtin.slurp:
@@ -523,7 +523,7 @@
     - name: Create Spoke private subnets in the isolated Cluster VPC (network lockdown)
       ansible.builtin.include_role:
         name: aws/create_private_subnets
-      when: disconnected.network_lockdown.enabled | default(false)
+      when: disconnected.network_lockdown.enabled | default(true)
 
     - name: Apply Hive Provisioning Manifests to Hub (Disconnected)
       ansible.builtin.include_role:
@@ -604,14 +604,14 @@
       vars:
         target_kubeconfig: "{{ spoke_kubeconfig }}"
         network_lockdown_allow_jumphost_egress: true
-      when: disconnected.network_lockdown.enabled | default(false)
+      when: disconnected.network_lockdown.enabled | default(true)
 
     - name: Disable Telemetry/Insights on Spoke
       ansible.builtin.include_role:
         name: ocp/disable_telemetry
       vars:
         target_kubeconfig: "{{ spoke_kubeconfig }}"
-      when: disconnected.network_lockdown.enabled | default(false)
+      when: disconnected.network_lockdown.enabled | default(true)
 
 # ==============================================================================
 # MIGRATE MIRROR: Move Mirror Registry from Jumphost to Quay on Hub
@@ -656,7 +656,7 @@
       vars:
         target_kubeconfig: "{{ hub_kubeconfig }}"
         network_lockdown_allow_jumphost_egress: false
-      when: disconnected.network_lockdown.enabled | default(false)
+      when: disconnected.network_lockdown.enabled | default(true)
 
 - name: Migrate Mirror - Final network lockdown on Spokes
   hosts: managed_clusters
@@ -674,7 +674,7 @@
       vars:
         target_kubeconfig: "{{ spoke_kubeconfig }}"
         network_lockdown_allow_jumphost_egress: false
-      when: disconnected.network_lockdown.enabled | default(false)
+      when: disconnected.network_lockdown.enabled | default(true)
 
 # ==============================================================================
 # SUMMARY: Final Environment Handoff
@@ -779,7 +779,7 @@
         name: aws/verify_network_isolation
       vars:
         target_kubeconfig: "{{ hub_kubeconfig }}"
-      when: disconnected.network_lockdown.enabled | default(false)
+      when: disconnected.network_lockdown.enabled | default(true)
 
 - name: Verify Network Isolation (Spokes)
   hosts: managed_clusters
@@ -796,7 +796,7 @@
         name: aws/verify_network_isolation
       vars:
         target_kubeconfig: "{{ spoke_kubeconfig }}"
-      when: disconnected.network_lockdown.enabled | default(false)
+      when: disconnected.network_lockdown.enabled | default(true)
 
 - name: Verification Summary
   hosts: hub_cluster
