@@ -31,13 +31,18 @@
       register: _nl_used_cidrs
       changed_when: false
 
+    # Plain third-octet string math instead of ansible.utils.ipsubnet — that
+    # filter needs the netaddr Python library, which isn't installed on a
+    # fresh jumphost. vpc_cidr is asserted to be a /16 above, so the idx-th
+    # /24 is always "<first two octets>.<idx>.0/24"; no library needed.
     - name: Build the list of /24 CIDRs not already in use, in ascending order
       ansible.builtin.set_fact:
         _nl_free_cidrs_str: >-
           {%- set used = _nl_used_cidrs.stdout.split() -%}
+          {%- set base = network_lockdown_vpc_cidr.split('/')[0].split('.')[0:2] | join('.') -%}
           {%- set free = [] -%}
           {%- for idx in range(0, 256) -%}
-            {%- set candidate = network_lockdown_vpc_cidr | ansible.utils.ipsubnet(24, idx) -%}
+            {%- set candidate = base ~ '.' ~ idx ~ '.0/24' -%}
             {%- if candidate not in used -%}
               {%- set _ = free.append(candidate) -%}
             {%- endif -%}

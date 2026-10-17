@@ -62,7 +62,7 @@ disconnected:
   network_lockdown:
     enabled: false                     # opt out entirely; defaults to true
     vpc_name: "ocp-cluster-vpc"        # optional, default shown
-    vpc_cidr: "10.90.0.0/16"           # Cluster VPC CIDR — must not overlap the jumphost VPC CIDR (10.0.0.0/16 by default)
+    vpc_cidr: "10.90.0.0/16"           # Cluster VPC CIDR — must be a /16 (auto /24 allocation assumes it) and must not overlap the jumphost VPC CIDR (10.0.0.0/16 by default)
 ```
 
 ## What this does not do

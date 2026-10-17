@@ -27,6 +27,13 @@
   ansible.builtin.include_role:
     name: aws/ensure_aws_cli
 
+- name: Fail if the Cluster VPC CIDR is not a /16 (required for automatic /24 allocation)
+  ansible.builtin.fail:
+    msg: >-
+      disconnected.network_lockdown.vpc_cidr must be a /16 (e.g. 10.90.0.0/16)
+      for automatic per-zone /24 subnet allocation. Got {{ network_lockdown_vpc_cidr }}.
+  when: network_lockdown_vpc_cidr.split('/')[1] | int != 16
+
 - name: Set AWS environment for all tasks
   ansible.builtin.set_fact:
     _aws_env:
