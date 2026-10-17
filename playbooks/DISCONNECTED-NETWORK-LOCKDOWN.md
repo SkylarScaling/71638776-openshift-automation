@@ -70,6 +70,14 @@ disconnected:
     vpc_cidr: "10.90.0.0/16"           # Cluster VPC CIDR — must be a /16 (auto /24 allocation assumes it) and must not overlap the jumphost VPC CIDR (10.0.0.0/16 by default)
 ```
 
+The install-config `machineNetwork` must match whatever VPC the subnets
+actually belong to, or the installer rejects the config
+(`subnet's CIDR range ... is outside of the specified machine networks`). When
+enabled, both install-config templates (IPI and Hive-based) default
+`machineNetwork` to `vpc_cidr` instead of the old `10.0.0.0/16` jumphost-VPC
+default — set `install_config.machine_network.cidr` explicitly per cluster
+only if you need something other than the whole Cluster VPC CIDR.
+
 ## What this does not do
 
 - It does not touch the jumphost itself — it keeps its own small VPC and
