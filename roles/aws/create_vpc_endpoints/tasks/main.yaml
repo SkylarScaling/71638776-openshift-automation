@@ -13,6 +13,10 @@
 # (for at least one cluster) must have run first in this play.
 # ==============================================================================
 
+- name: Ensure AWS CLI is available
+  ansible.builtin.include_role:
+    name: aws/ensure_aws_cli
+
 - name: Set AWS environment for all tasks
   ansible.builtin.set_fact:
     _aws_env:

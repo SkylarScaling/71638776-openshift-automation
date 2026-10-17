@@ -8,6 +8,10 @@
 # public internet.
 # ==============================================================================
 
+- name: Ensure AWS CLI is available
+  ansible.builtin.include_role:
+    name: aws/ensure_aws_cli
+
 - name: Set AWS environment for all tasks
   ansible.builtin.set_fact:
     _aws_env:

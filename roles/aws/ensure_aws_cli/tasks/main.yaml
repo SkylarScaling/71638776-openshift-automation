@@ -1,0 +1,61 @@
+---
+# ==============================================================================
+# ENSURE AWS CLI IS AVAILABLE IN bin_dir
+#
+# The network-lockdown roles (provision_cluster_vpc, create_private_subnets,
+# create_vpc_endpoints, lockdown_cluster_security_groups,
+# verify_network_isolation) run directly on the jumphost and need the AWS CLI
+# at {{ bin_dir }}/aws, same as every other AWS role in this codebase. Nothing
+# else in the disconnected flow installs it there (setup_jumphost installs a
+# separate system-wide copy on the jumphost host itself during provisioning,
+# which is a different machine context than wherever this play actually
+# executes) — so each role that needs it includes this first, no-sudo,
+# idempotent install into bin_dir rather than assuming it pre-exists.
+# ==============================================================================
+
+- name: Ensure the destination binary directory exists
+  ansible.builtin.file:
+    path: "{{ bin_dir }}"
+    state: directory
+    mode: '0755'
+
+- name: Check if AWS CLI is already available in bin_dir
+  ansible.builtin.command: "{{ bin_dir }}/aws --version"
+  register: _nl_aws_cli_check
+  changed_when: false
+  ignore_errors: true
+
+- name: Install AWS CLI v2 into bin_dir (no sudo required)
+  when: _nl_aws_cli_check.rc != 0
+  block:
+    - name: Download AWS CLI v2 zip
+      ansible.builtin.get_url:
+        url: "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip"
+        dest: "/tmp/awscliv2-network-lockdown.zip"
+        mode: '0644'
+
+    - name: Extract AWS CLI v2 payload
+      ansible.builtin.unarchive:
+        src: "/tmp/awscliv2-network-lockdown.zip"
+        dest: "/tmp"
+        remote_src: true
+
+    - name: Install AWS CLI v2 into bin_dir
+      ansible.builtin.command: >
+        /tmp/aws/install
+        -i {{ bin_dir }}/aws-cli-lib
+        -b {{ bin_dir }}
+        --update
+      changed_when: true
+
+    - name: Clean up temporary AWS CLI installation files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/tmp/awscliv2-network-lockdown.zip"
+        - "/tmp/aws"
+
+    - name: Verify installed AWS CLI version
+      ansible.builtin.command: "{{ bin_dir }}/aws --version"
+      changed_when: false
