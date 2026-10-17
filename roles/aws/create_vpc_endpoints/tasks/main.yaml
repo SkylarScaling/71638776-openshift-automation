@@ -116,8 +116,44 @@
 # ------------------------------------------------------------------------------
 # INTERFACE ENDPOINTS — EC2, ELB, STS, Route53. Placed in the subnets passed
 # in via network_lockdown_subnet_ids (the hub's, at role-call time).
+#
+# Not every service offers a regional interface endpoint in every region (e.g.
+# Route53's PrivateLink endpoint is a recent, still-rolling-out addition) —
+# hardcoding availability would silently break as AWS's own rollout changes.
+# Discover what's actually offered in this region first and only attempt the
+# services that are, warning (not failing) on anything that isn't yet.
 # ------------------------------------------------------------------------------
-- name: Check if each interface endpoint already exists
+- name: Discover which interface endpoint services AWS offers in this region
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-vpc-endpoint-services
+    --query 'ServiceNames'
+    --output text
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  register: _nl_available_services
+  changed_when: false
+
+- name: Determine which configured interface endpoints are actually available here
+  ansible.builtin.set_fact:
+    _nl_iface_services_available: >-
+      {{ network_lockdown_interface_endpoint_services
+         | select('in', _nl_available_services.stdout.split() | map('regex_replace', '^com\.amazonaws\.' ~ network_lockdown_region ~ '\.', '') | list)
+         | list }}
+    _nl_iface_services_unavailable: >-
+      {{ network_lockdown_interface_endpoint_services
+         | reject('in', _nl_available_services.stdout.split() | map('regex_replace', '^com\.amazonaws\.' ~ network_lockdown_region ~ '\.', '') | list)
+         | list }}
+
+- name: Warn about interface endpoints not offered in this region
+  ansible.builtin.debug:
+    msg: >-
+      Skipping VPC interface endpoint(s) {{ _nl_iface_services_unavailable | join(', ') }}
+      — AWS does not offer a regional interface endpoint for them in
+      {{ network_lockdown_region }} yet. API calls for these services will need
+      another reachable path (e.g. once AWS expands the rollout to this region).
+  when: _nl_iface_services_unavailable | length > 0
+
+- name: Check if each available interface endpoint already exists
   ansible.builtin.command: >
     {{ bin_dir }}/aws ec2 describe-vpc-endpoints
     --filters
@@ -127,7 +163,7 @@
     --output text
     --region {{ network_lockdown_region }}
   environment: "{{ _aws_env }}"
-  loop: "{{ network_lockdown_interface_endpoint_services }}"
+  loop: "{{ _nl_iface_services_available }}"
   register: _nl_iface_endpoint_check
   changed_when: false
 
@@ -152,5 +188,8 @@
   ansible.builtin.debug:
     msg:
       - "S3 gateway endpoint: ready on route table {{ network_lockdown_route_table_id }}"
-      - "Interface endpoints: {{ network_lockdown_interface_endpoint_services | join(', ') }}"
+      - "Interface endpoints created: {{ _nl_iface_services_available | join(', ') }}"
+      - >-
+          Interface endpoints skipped (unavailable in region):
+          {{ _nl_iface_services_unavailable | join(', ') if _nl_iface_services_unavailable | length > 0 else 'none' }}
       - "Endpoint subnets: {{ network_lockdown_subnet_ids }}"

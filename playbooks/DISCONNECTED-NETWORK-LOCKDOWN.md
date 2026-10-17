@@ -29,6 +29,11 @@ the existing jumphost-mirrors-then-migrate-to-hub workflow. Set
 - **VPC Endpoints** (S3 gateway; EC2, ELB, STS, Route53 interface endpoints) in
   the Cluster VPC, so the AWS cloud-provider, ELB/EBS CSI controllers, and the
   ingress operator's Route53 DNS management work without any internet path.
+  Not every service's interface endpoint is offered in every region yet
+  (Route53's is a recent, still-rolling-out PrivateLink addition) — the role
+  discovers what AWS actually offers in the target region first and skips
+  (with a warning, not a failure) anything not yet available there, rather
+  than hardcoding a region list that would silently go stale.
 - **Security Group lockdown**: the installer always creates cluster node
   security groups with a broad `0.0.0.0/0` / all-protocols egress rule. A new
   role revokes that and replaces it with VPC-CIDR-only (plus jumphost-VPC-CIDR
