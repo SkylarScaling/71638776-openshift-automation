@@ -106,6 +106,19 @@
       poll: 0
       register: cluster_deploy
 
+    # Under network lockdown, openshift-install (running here, on the
+    # jumphost) is outside the Cluster VPC that the new private hosted zone
+    # gets associated with — without this, bootstrap fails trying to resolve
+    # api.<cluster>.<base_domain>. Runs concurrently with the async install
+    # job above; the zone appears well before the installer needs to resolve
+    # it. See aws/associate_private_zone_with_jumphost for details.
+    - name: Associate the cluster's private DNS zone with the jumphost VPC
+      ansible.builtin.include_role:
+        name: aws/associate_private_zone_with_jumphost
+      vars:
+        private_zone_domain: "{{ ocp_cluster.name }}.{{ base_domain }}"
+      when: disconnected.network_lockdown.enabled | default(true)
+
     - name: Check the status of the install
       ansible.builtin.async_status:
         jid: "{{ cluster_deploy.ansible_job_id }}"

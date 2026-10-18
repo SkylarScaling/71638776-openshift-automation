@@ -1,0 +1,78 @@
+---
+# ==============================================================================
+# ASSOCIATE THE CLUSTER'S PRIVATE ROUTE53 ZONE WITH THE JUMPHOST VPC
+#
+# A publish: Internal cluster's private hosted zone (api/apps DNS) is
+# associated only with the Cluster VPC by the installer. openshift-install
+# itself runs on the jumphost, which — under network lockdown — lives in its
+# own separate VPC, peered but not associated with that zone. Without this,
+# the installer can't resolve api.<cluster>.<base_domain> from the jumphost
+# and bootstrap fails ("no such host") even though the cluster side is fine.
+# Route53 private hosted zones support more than one VPC association, so this
+# adds the jumphost's VPC as a second one once the zone exists.
+#
+# Meant to run concurrently with the (async, poll:0) openshift-install job:
+# the zone is created within the first few minutes of a run, well before the
+# installer needs to resolve it while waiting for the Kubernetes API.
+# ==============================================================================
+
+- name: Ensure AWS CLI is available
+  ansible.builtin.include_role:
+    name: aws/ensure_aws_cli
+
+- name: Set AWS environment for all tasks
+  ansible.builtin.set_fact:
+    _aws_env:
+      AWS_ACCESS_KEY_ID: "{{ aws.aws_access_key_id }}"
+      AWS_SECRET_ACCESS_KEY: "{{ aws.aws_secret_access_key }}"
+      AWS_SESSION_TOKEN: ""
+
+- name: Find the jumphost VPC
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-vpcs
+    --filters Name=tag:Name,Values={{ jumphost_name | default('disconnected-jumphost') }}-vpc
+    --query 'Vpcs[0].VpcId'
+    --output text
+    --region {{ aws.aws_region }}
+  environment: "{{ _aws_env }}"
+  register: _pz_jumphost_vpc
+  changed_when: false
+
+- name: Fail if the jumphost VPC was not found
+  ansible.builtin.fail:
+    msg: >-
+      Could not find a VPC tagged '{{ jumphost_name | default('disconnected-jumphost') }}-vpc'
+      — cannot associate the private hosted zone with the jumphost VPC.
+  when: _pz_jumphost_vpc.stdout | trim in ['None', '']
+
+- name: Wait for the cluster's private hosted zone to be created
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws route53 list-hosted-zones-by-name
+    --dns-name {{ private_zone_domain }}
+    --query "HostedZones[?Name=='{{ private_zone_domain }}.'].Id | [0]"
+    --output text
+    --region {{ aws.aws_region }}
+  environment: "{{ _aws_env }}"
+  register: _pz_zone_lookup
+  until: _pz_zone_lookup.stdout | trim not in ['None', '']
+  retries: 30
+  delay: 20
+  changed_when: false
+
+- name: Associate the private hosted zone with the jumphost VPC
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws route53 associate-vpc-with-hosted-zone
+    --hosted-zone-id {{ _pz_zone_lookup.stdout | trim | regex_replace('^/hostedzone/', '') }}
+    --vpc VPCRegion={{ aws.aws_region }},VPCId={{ _pz_jumphost_vpc.stdout | trim }}
+    --comment "Lets the jumphost (outside the Cluster VPC) resolve this private zone during install"
+  environment: "{{ _aws_env }}"
+  register: _pz_associate
+  failed_when:
+    - _pz_associate.rc != 0
+    - "'ConflictingDomainExists' not in _pz_associate.stderr"
+    - "'already associated' not in _pz_associate.stderr"
+  changed_when: _pz_associate.rc == 0
+
+- name: Display private zone association summary
+  ansible.builtin.debug:
+    msg: "Private hosted zone {{ private_zone_domain }} associated with jumphost VPC {{ _pz_jumphost_vpc.stdout | trim }}"

@@ -26,6 +26,15 @@ the existing jumphost-mirrors-then-migrate-to-hub workflow. Set
   the public internet. The peering route (and the security-group egress that
   allows it) is only needed until `migrate_mirror` runs — at that point it's
   revoked, so the clusters become fully unreachable to/from the jumphost.
+- **Private hosted zone / jumphost VPC association**: `publish: Internal`
+  clusters get a private Route53 zone associated only with the Cluster VPC —
+  but `openshift-install` for the hub runs *on the jumphost*, outside that
+  VPC, so without an explicit second association it can't resolve
+  `api.<cluster>.<base_domain>` and bootstrap fails. `ocp/aws_provision_disconnected_ocp_ipi`
+  runs `aws/associate_private_zone_with_jumphost` concurrently with the async
+  install job to add that association as soon as the zone exists. Only needed
+  for the hub — spokes are provisioned by Hive running inside the hub, which
+  is already in the Cluster VPC.
 - **VPC Endpoints** (S3 gateway; EC2, ELB, STS, Route53 interface endpoints) in
   the Cluster VPC, so the AWS cloud-provider, ELB/EBS CSI controllers, and the
   ingress operator's Route53 DNS management work without any internet path.
@@ -51,6 +60,7 @@ the existing jumphost-mirrors-then-migrate-to-hub workflow. Set
 | `aws/provision_cluster_vpc` | jumphost phase, once | Isolated Cluster VPC, one shared private route table, peering connection to the jumphost VPC (discovered by tag, same pattern as `aws_provision_jumphost`). |
 | `aws/create_private_subnets` | hub phase (hub) / spokes phase (each spoke) | Per-cluster private subnets in the Cluster VPC — one per zone in `install_config.control_plane`/`workers.zones` (or one auto-discovered AZ if zones aren't set). CIDRs are allocated automatically: the Cluster VPC's `/16` is carved into `/24`s, each zone getting the lowest-numbered `/24` not already claimed anywhere in the VPC (re-checked against live AWS state before every allocation, so a spoke run after the hub naturally skips what the hub already took — no cross-host coordination needed). |
 | `aws/create_vpc_endpoints` | hub phase, once (after hub's subnets exist) | S3 gateway + EC2/ELB/STS/Route53 interface endpoints. |
+| `aws/associate_private_zone_with_jumphost` | hub phase, during the hub's IPI install, concurrently with the async install job | Associates the hub's `publish: Internal` private hosted zone with the jumphost VPC once it exists, so `openshift-install` (running on the jumphost) can resolve `api.<cluster>.<base_domain>` during bootstrap. |
 | `aws/lockdown_cluster_security_groups` | hub/spokes phase (initial) and migrate_mirror phase (final) | Tightens node security group egress. `network_lockdown_allow_jumphost_egress` controls whether jumphost-VPC-CIDR egress is still allowed. |
 | `aws/verify_network_isolation` | verify phase | Asserts no `0.0.0.0/0` route/egress remains; live `oc debug node` curl-to-public-IP check expecting failure. |
 | `ocp/disable_telemetry` | hub/spokes phase | Removes `cloud.openshift.com` from the pull secret, scales down Insights Operator. |
