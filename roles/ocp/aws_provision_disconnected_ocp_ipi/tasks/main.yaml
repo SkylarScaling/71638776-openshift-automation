@@ -23,8 +23,13 @@
     kubeadmin_pwd_stat.stat.exists
 
 - name: Kill any orphaned openshift-install process for this cluster
+  # Bracket-break one character of the pattern (e.g. "a[c]m-hub" instead of
+  # "acm-hub") so it doesn't literally appear in this very shell invocation's
+  # own command line — pkill -f matches against full process cmdlines,
+  # including its parent `sh -c '...'` wrapper, so an exact self-referential
+  # pattern here kills that wrapper (SIGTERM, rc=-15) before `|| true` can run.
   ansible.builtin.shell: >
-    pkill -f "openshift-install.*{{ ocp_cluster.name }}" 2>/dev/null || true
+    pkill -f "openshift-install.*{{ ocp_cluster.name[0] }}[{{ ocp_cluster.name[1] }}]{{ ocp_cluster.name[2:] }}" 2>/dev/null || true
   changed_when: false
   when: >
     cluster_dir_stat.stat.exists and
