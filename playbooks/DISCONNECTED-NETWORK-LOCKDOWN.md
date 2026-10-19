@@ -60,6 +60,18 @@ the existing jumphost-mirrors-then-migrate-to-hub workflow. Set
   playbook's own derivations) default to `jumphost_private_ip` instead
   whenever `network_lockdown.enabled` is true, falling back to
   `disconnected.mirror_registry.hostname` only when lockdown is disabled.
+- **Manual cloud credentials**: there is no IAM VPC endpoint in commercial AWS
+  regions, so the Cloud Credential Operator's mint-mode `GetUser` validation
+  against `iam.amazonaws.com` can never succeed from the no-IGW/no-NAT Cluster
+  VPC — it fails with an i/o timeout, zero CredentialsRequests get
+  provisioned, and no worker machines ever launch. The hub install-config sets
+  `credentialsMode: Manual` under lockdown, and `ocp/aws_provision_disconnected_ocp_ipi`
+  runs `openshift-install create manifests` then `ocp/create_manual_cloud_credentials`
+  (extracts CredentialsRequests from the mirrored release image, writes a
+  long-lived-key Secret per request into `manifests/`) before `create cluster`.
+  **Not yet implemented for Hive-provisioned spokes** (`roles/acm/aws_provision_disconnected_cluster_via_acm`) —
+  they land in the same isolated VPC and will hit the identical failure; Hive's
+  equivalent is a `manifestsConfigMap` referenced from the `ClusterDeployment`.
 - **VPC Endpoints** (S3 gateway; EC2, ELB, STS, Route53 interface endpoints) in
   the Cluster VPC, so the AWS cloud-provider, ELB/EBS CSI controllers, and the
   ingress operator's Route53 DNS management work without any internet path.

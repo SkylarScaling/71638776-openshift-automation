@@ -53,6 +53,12 @@ controlPlane:
   platform: {}
 {% endif %}
   replicas: 3
+{% if disconnected.network_lockdown.enabled | default(true) %}
+# The Cluster VPC has no route to iam.amazonaws.com (no IAM VPC endpoint
+# exists in commercial regions), so CCO's mint-mode credential validation
+# can never succeed here. Manual mode skips it — see ocp/create_manual_cloud_credentials.
+credentialsMode: Manual
+{% endif %}
 metadata:
   name: {{ install_config.cluster_name }}
 networking:

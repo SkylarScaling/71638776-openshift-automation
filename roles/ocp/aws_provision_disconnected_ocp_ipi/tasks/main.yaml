@@ -165,6 +165,26 @@
         src: "{{ role_path }}/templates/install-config.yaml.j2"
         dest: "{{ install_path.path }}/install-config.yaml"
 
+    - name: Generate installer manifests (needed to inject Manual-mode credential Secrets)
+      ansible.builtin.command: >
+        {{ bin_dir }}/openshift-install create manifests
+        --dir={{ install_path.path }}
+        --log-level=info
+      environment:
+        AWS_PROFILE: "ocp-{{ ocp_cluster.name }}"
+        AWS_SESSION_TOKEN: ""
+      changed_when: true
+      when: disconnected.network_lockdown.enabled | default(true)
+
+    # CCO mint mode needs iam.amazonaws.com, which is unreachable from a
+    # no-IGW/no-NAT Cluster VPC. credentialsMode: Manual (install-config.yaml.j2)
+    # skips that validation but requires each CredentialsRequest's Secret to
+    # already exist in manifests/ before `create cluster` runs.
+    - name: Pre-create Manual-mode cloud credential Secrets
+      ansible.builtin.include_role:
+        name: ocp/create_manual_cloud_credentials
+      when: disconnected.network_lockdown.enabled | default(true)
+
     - name: Print log path for live monitoring
       ansible.builtin.debug:
         msg: "Installer starting (disconnected). For live output: tail -f {{ install_path.path }}/.openshift_install.log"
@@ -177,7 +197,7 @@
       environment:
         AWS_PROFILE: "ocp-{{ ocp_cluster.name }}"
         AWS_SESSION_TOKEN: ""
-      async: 3600
+      async: 10800
       poll: 0
       register: cluster_deploy
 
@@ -214,7 +234,7 @@
         jid: "{{ cluster_deploy.ansible_job_id }}"
       register: job_status
       until: job_status.finished
-      retries: 120
+      retries: 360
       delay: 30
   when: not _cluster_actually_installed
 

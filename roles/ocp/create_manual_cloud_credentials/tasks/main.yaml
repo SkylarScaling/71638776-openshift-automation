@@ -1,0 +1,50 @@
+---
+# Under network lockdown the Cluster VPC has no route to iam.amazonaws.com
+# (no IAM VPC endpoint exists in commercial regions), so CCO's mint-mode
+# GetUser validation times out and zero CredentialsRequests are ever
+# provisioned — no worker machines, no ingress/console/registry/storage.
+# credentialsMode: Manual (set in install-config.yaml.j2) skips that
+# validation entirely, but requires each CredentialsRequest's Secret to be
+# pre-created in manifests/ before `openshift-install create cluster` runs.
+- name: Create directory for extracted CredentialsRequests
+  ansible.builtin.file:
+    path: "{{ install_path.path }}/credrequests"
+    state: directory
+    mode: '0755'
+
+- name: Extract CredentialsRequest manifests from the mirrored release image
+  ansible.builtin.command: >
+    {{ bin_dir }}/oc adm release extract
+    --credentials-requests
+    --cloud=aws
+    --to={{ install_path.path }}/credrequests
+    --registry-config={{ mirror_registry_dir }}/pull-secret-merged.json
+    --insecure=true
+    {{ release_image_pull_spec }}
+  changed_when: true
+
+- name: Find extracted CredentialsRequest manifests
+  ansible.builtin.find:
+    paths: "{{ install_path.path }}/credrequests"
+    patterns: "*.yaml"
+  register: _cred_requests_files
+
+- name: Render a long-lived credentials Secret for each CredentialsRequest
+  vars:
+    _cr: "{{ (lookup('ansible.builtin.file', item.path) | from_yaml) }}"
+  ansible.builtin.copy:
+    dest: "{{ install_path.path }}/manifests/{{ _cr.spec.secretRef.namespace }}-{{ _cr.spec.secretRef.name }}-credentials.yaml"
+    mode: '0644'
+    content: |
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: {{ _cr.spec.secretRef.name }}
+        namespace: {{ _cr.spec.secretRef.namespace }}
+      type: Opaque
+      stringData:
+        aws_access_key_id: {{ aws.aws_access_key_id }}
+        aws_secret_access_key: {{ aws.aws_secret_access_key }}
+  loop: "{{ _cred_requests_files.files }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
