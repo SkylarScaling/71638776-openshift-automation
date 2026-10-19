@@ -14,13 +14,45 @@
     path: "{{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeadmin-password"
   register: kubeadmin_pwd_stat
 
-- name: Skip provisioning if cluster exists
+# openshift-install writes auth/kubeconfig and kubeadmin-password to disk
+# early — well before the cluster is actually up — so their mere presence
+# does not mean the install succeeded. A failed/abandoned attempt (e.g.
+# bootstrap timing out) leaves these files behind too, which previously
+# caused this role to silently skip re-provisioning forever on re-runs.
+# Verify the cluster is actually reachable before trusting those files.
+- name: Check if an existing cluster is actually reachable
+  ansible.builtin.command: >
+    {{ bin_dir }}/oc get clusterversion
+    --kubeconfig {{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig
+    --request-timeout=15s
+  register: _existing_cluster_health
+  changed_when: false
+  failed_when: false
+  when:
+    - cluster_dir_stat.stat.exists
+    - auth_dir_stat.stat.exists
+    - kubeadmin_pwd_stat.stat.exists
+
+- name: Set cluster-actually-installed fact
+  ansible.builtin.set_fact:
+    _cluster_actually_installed: >-
+      {{ cluster_dir_stat.stat.exists and auth_dir_stat.stat.exists and kubeadmin_pwd_stat.stat.exists
+         and _existing_cluster_health is defined and _existing_cluster_health.rc == 0 }}
+
+- name: Skip provisioning if cluster exists and is reachable
   ansible.builtin.debug:
-    msg: "Cluster directory already exists, skipping provisioning..."
-  when: >
-    cluster_dir_stat.stat.exists and
-    auth_dir_stat.stat.exists and
-    kubeadmin_pwd_stat.stat.exists
+    msg: "Cluster directory already exists and the cluster is reachable, skipping provisioning..."
+  when: _cluster_actually_installed
+
+- name: Warn about a stale/failed install that will be cleaned up and retried
+  ansible.builtin.debug:
+    msg: >-
+      Found existing install files for {{ ocp_cluster.name }} but the cluster
+      is not reachable (stale or failed install) — destroying any leftover
+      AWS infrastructure and reinstalling from scratch.
+  when:
+    - cluster_dir_stat.stat.exists
+    - not _cluster_actually_installed
 
 - name: Kill any orphaned openshift-install process for this cluster
   # Bracket-break one character of the pattern (e.g. "a[c]m-hub" instead of
@@ -31,17 +63,60 @@
   ansible.builtin.shell: >
     pkill -f "openshift-install.*{{ ocp_cluster.name[0] }}[{{ ocp_cluster.name[1] }}]{{ ocp_cluster.name[2:] }}" 2>/dev/null || true
   changed_when: false
-  when: >
-    cluster_dir_stat.stat.exists and
-    not kubeadmin_pwd_stat.stat.exists
+  when:
+    - cluster_dir_stat.stat.exists
+    - not _cluster_actually_installed
+
+- name: Check if install metadata exists (needed to destroy stale cloud infrastructure)
+  ansible.builtin.stat:
+    path: "{{ install_dir }}/{{ ocp_cluster.name }}/metadata.json"
+  register: _stale_metadata_stat
+  when:
+    - cluster_dir_stat.stat.exists
+    - not _cluster_actually_installed
+
+# A failed/abandoned install still leaves real, billable AWS resources behind
+# (bootstrap/master instances, the private hosted zone, NLBs, IAM roles...).
+# Deleting only the local directory would orphan all of that — run the
+# installer's own destroy first so it tears down everything tagged with this
+# attempt's infra ID before we start a fresh one.
+- name: Destroy stale cloud infrastructure from a previous failed install
+  ansible.builtin.command: >
+    {{ bin_dir }}/openshift-install destroy cluster
+    --dir={{ install_dir }}/{{ ocp_cluster.name }}
+    --log-level=info
+  environment:
+    AWS_PROFILE: "ocp-{{ ocp_cluster.name }}"
+    AWS_SESSION_TOKEN: ""
+  async: 1800
+  poll: 0
+  register: _destroy_job
+  when:
+    - cluster_dir_stat.stat.exists
+    - not _cluster_actually_installed
+    - _stale_metadata_stat.stat.exists | default(false)
+
+- name: Wait for stale infrastructure destroy to complete
+  ansible.builtin.async_status:
+    jid: "{{ _destroy_job.ansible_job_id }}"
+  register: _destroy_result
+  until: _destroy_result.finished
+  retries: 60
+  delay: 30
+  when:
+    - _destroy_job is defined
+    - _destroy_job.ansible_job_id is defined
+  failed_when:
+    - _destroy_result.finished
+    - _destroy_result.rc != 0
 
 - name: Remove partial install directory to ensure clean start
   ansible.builtin.file:
     path: "{{ install_dir }}/{{ ocp_cluster.name }}"
     state: absent
-  when: >
-    cluster_dir_stat.stat.exists and
-    not kubeadmin_pwd_stat.stat.exists
+  when:
+    - cluster_dir_stat.stat.exists
+    - not _cluster_actually_installed
 
 - name: Provision Disconnected Cluster on AWS
   block:
@@ -126,10 +201,20 @@
       until: job_status.finished
       retries: 120
       delay: 30
-  when: >
-    not cluster_dir_stat.stat.exists or
-    not auth_dir_stat.stat.exists or
-    not kubeadmin_pwd_stat.stat.exists
+  when: not _cluster_actually_installed
+
+# Re-run outside the block above too (idempotent — the role tolerates an
+# already-associated VPC and the zone-wait loop resolves instantly once it
+# exists) so a re-run that skips the block entirely, because the cluster was
+# already installed, still converges. Without this, a cluster installed
+# before this association existed — or one where the first attempt never
+# reached this task — stays permanently unresolvable from the jumphost.
+- name: Ensure the cluster's private DNS zone is associated with the jumphost VPC
+  ansible.builtin.include_role:
+    name: aws/associate_private_zone_with_jumphost
+  vars:
+    private_zone_domain: "{{ ocp_cluster.name }}.{{ base_domain }}"
+  when: disconnected.network_lockdown.enabled | default(true)
 
 - debug:
     msg: "Cluster console available at: https://console-openshift-console.apps.{{ ocp_cluster.name }}.{{ base_domain }}/"
