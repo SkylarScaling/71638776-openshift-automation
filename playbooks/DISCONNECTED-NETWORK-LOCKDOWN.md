@@ -69,9 +69,11 @@ the existing jumphost-mirrors-then-migrate-to-hub workflow. Set
   runs `openshift-install create manifests` then `ocp/create_manual_cloud_credentials`
   (extracts CredentialsRequests from the mirrored release image, writes a
   long-lived-key Secret per request into `manifests/`) before `create cluster`.
-  **Not yet implemented for Hive-provisioned spokes** (`roles/acm/aws_provision_disconnected_cluster_via_acm`) —
-  they land in the same isolated VPC and will hit the identical failure; Hive's
-  equivalent is a `manifestsConfigMap` referenced from the `ClusterDeployment`.
+  Hive-provisioned spokes (`roles/acm/aws_provision_disconnected_cluster_via_acm`)
+  land in the same isolated VPC and hit the identical failure; `acm/create_manual_cloud_credentials_configmap`
+  does the same extraction and writes the Secrets into a ConfigMap referenced
+  from the `ClusterDeployment`'s `spec.provisioning.manifestsConfigMapRef`
+  (Hive's equivalent of dropping files into `manifests/` before install).
 - **VPC Endpoints** (S3 gateway; EC2, ELB, STS, Route53 interface endpoints) in
   the Cluster VPC, so the AWS cloud-provider, ELB/EBS CSI controllers, and the
   ingress operator's Route53 DNS management work without any internet path.

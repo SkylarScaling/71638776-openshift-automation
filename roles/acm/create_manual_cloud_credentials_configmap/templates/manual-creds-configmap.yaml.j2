@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ ocp_cluster.name }}-manual-creds
+  namespace: {{ ocp_cluster.name }}
+data:
+{% for f in cred_request_files %}
+{% set cr = lookup('file', f.path) | from_yaml %}
+  {{ cr.spec.secretRef.namespace }}-{{ cr.spec.secretRef.name }}-credentials.yaml: |
+    apiVersion: v1
+    kind: Secret
+    metadata:
+      name: {{ cr.spec.secretRef.name }}
+      namespace: {{ cr.spec.secretRef.namespace }}
+    type: Opaque
+    stringData:
+      aws_access_key_id: {{ aws.aws_access_key_id }}
+      aws_secret_access_key: {{ aws.aws_secret_access_key }}
+{% endfor %}

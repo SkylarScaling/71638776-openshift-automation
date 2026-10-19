@@ -1,0 +1,8 @@
+---
+# Must match the spoke install-config's imageContentSources mapping (oc-mirror
+# v2 pushes openshift-release-dev/ocp-release under openshift/release-images,
+# not under the original openshift-release-dev namespace).
+release_image_pull_spec: >-
+  {{ mirror_registry_url }}/{{ mirror_base_path }}/openshift/release-images:{{ openshift_version }}.{{ ocp_patch_version }}-x86_64
+
+manual_creds_work_dir: "{{ working_dir }}/manual-creds/{{ ocp_cluster.name }}"

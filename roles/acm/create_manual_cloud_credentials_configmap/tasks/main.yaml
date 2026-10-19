@@ -1,0 +1,37 @@
+---
+# Hive's own ClusterDeployment namespace has no path to iam.amazonaws.com any
+# more than the hub's install does (same isolated Cluster VPC, no IAM VPC
+# endpoint in commercial AWS regions) — CCO mint mode would time out the same
+# way. credentialsMode: Manual (03-secrets.yaml.j2) skips that validation, but
+# Hive needs the per-CredentialsRequest Secrets supplied as extra manifests
+# via spec.provisioning.manifestsConfigMapRef, since there's no local install
+# directory for a Hive-provisioned cluster to drop them into directly.
+- name: Create local working directory for CredentialsRequest extraction
+  ansible.builtin.file:
+    path: "{{ manual_creds_work_dir }}/credrequests"
+    state: directory
+    mode: '0755'
+
+- name: Extract CredentialsRequest manifests from the mirrored release image
+  ansible.builtin.command: >
+    {{ bin_dir }}/oc adm release extract
+    --credentials-requests
+    --cloud=aws
+    --to={{ manual_creds_work_dir }}/credrequests
+    --registry-config={{ mirror_registry_dir }}/pull-secret-merged.json
+    --insecure=true
+    {{ release_image_pull_spec }}
+  changed_when: true
+
+- name: Find extracted CredentialsRequest manifests
+  ansible.builtin.find:
+    paths: "{{ manual_creds_work_dir }}/credrequests"
+    patterns: "*.yaml"
+  register: cred_request_files
+
+- name: Apply manifestsConfigMap carrying long-lived credential Secrets
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: "{{ lookup('template', 'manual-creds-configmap.yaml.j2') }}"
+  changed_when: true
+  no_log: true

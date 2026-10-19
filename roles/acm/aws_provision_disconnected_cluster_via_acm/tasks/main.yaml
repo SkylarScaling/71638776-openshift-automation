@@ -51,6 +51,14 @@
   changed_when: true
   no_log: true
 
+# See roles/acm/create_manual_cloud_credentials_configmap for why this is
+# needed: the Cluster VPC has no route to iam.amazonaws.com, so CCO mint mode
+# can never succeed here, same as the hub.
+- name: Pre-create Manual-mode cloud credential manifestsConfigMap
+  ansible.builtin.include_role:
+    name: acm/create_manual_cloud_credentials_configmap
+  when: disconnected.network_lockdown.enabled | default(true)
+
 # installAttemptsLimit: 1 means Hive sets ProvisionStopped=True after the single
 # attempt fails. oc apply leaves the ClusterDeployment in-place on re-runs, so
 # Hive sees the limit already exhausted and never creates a new ClusterProvision.

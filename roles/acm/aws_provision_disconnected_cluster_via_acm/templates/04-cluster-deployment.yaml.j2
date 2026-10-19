@@ -24,5 +24,9 @@ spec:
       name: {{ spoke_clusterimageset_name }}
     installConfigSecretRef:
       name: {{ ocp_cluster.name }}-install-config
+{% if disconnected.network_lockdown.enabled | default(true) %}
+    manifestsConfigMapRef:
+      name: {{ ocp_cluster.name }}-manual-creds
+{% endif %}
   pullSecretRef:
     name: {{ ocp_cluster.name }}-pull-secret
