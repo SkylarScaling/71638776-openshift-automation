@@ -348,6 +348,40 @@
     jumphost_public_ip: "{{ jumphost_ip_result.stdout }}"
     jumphost_public_dns: "ec2-{{ jumphost_ip_result.stdout | replace('.', '-') }}.{{ jumphost_aws_region }}.compute.amazonaws.com"
 
+# Under network lockdown, the Cluster VPC has no Internet Gateway/NAT, and VPC
+# peering only routes traffic to the peer VPC's private CIDR — cluster nodes
+# can never reach the jumphost's public IP/DNS, only its private IP via the
+# peering connection. Auto-discovered here (like the public IP above) only as
+# a fallback — jumphost_private_ip set in inventory (already required for
+# LDAP, see CLAUDE.md) always wins, since that's a global var visible to every
+# phase's play, whereas this role only runs in the jumphost-tagged play and a
+# set_fact here would not be visible to the hub/spokes plays' hosts.
+- name: Get jumphost private IP address (fallback if not set in inventory)
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-instances
+    --instance-ids {{ _jumphost_instance_id }}
+    --query 'Reservations[0].Instances[0].PrivateIpAddress'
+    --output text
+    --region {{ jumphost_aws_region }}
+  environment: "{{ _aws_env }}"
+  register: jumphost_private_ip_result
+  changed_when: false
+  when: jumphost_private_ip is not defined or jumphost_private_ip | trim == ''
+
+- name: Set fallback jumphost private IP fact for this play
+  ansible.builtin.set_fact:
+    jumphost_private_ip: "{{ jumphost_private_ip_result.stdout }}"
+  when: jumphost_private_ip_result is defined and jumphost_private_ip_result.stdout is defined
+
+- name: Warn that jumphost_private_ip was discovered rather than set in inventory
+  ansible.builtin.debug:
+    msg: >-
+      jumphost_private_ip was not set in inventory; discovered
+      {{ jumphost_private_ip_result.stdout | default('') }} live from AWS for
+      this play only. Set jumphost_private_ip in inventory (all.vars) to make
+      this value available to every phase/play, not just this one.
+  when: jumphost_private_ip_result is defined and jumphost_private_ip_result.stdout is defined
+
 - name: Wait for SSH to become available
   ansible.builtin.wait_for:
     host: "{{ jumphost_public_ip }}"

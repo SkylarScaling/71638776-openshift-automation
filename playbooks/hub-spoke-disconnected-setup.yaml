@@ -91,7 +91,11 @@
     # ------------------------------------------------------------------
     - name: Derive mirror registry URL from inventory
       ansible.builtin.set_fact:
-        mirror_registry_url: "{{ disconnected.mirror_registry.hostname }}:{{ disconnected.mirror_registry.port | default(8443) }}"
+        mirror_registry_url: >-
+          {{ (jumphost_private_ip
+              if (disconnected.network_lockdown.enabled | default(true))
+              else disconnected.mirror_registry.hostname)
+             ~ ':' ~ (disconnected.mirror_registry.port | default(8443)) }}
       when: mirror_registry_url is not defined
 
     - name: Read mirror registry CA certificate from disk
@@ -448,7 +452,12 @@
     # ------------------------------------------------------------------
     - name: Load mirror_registry_url from Hub hostvars or inventory
       ansible.builtin.set_fact:
-        mirror_registry_url: "{{ hostvars[groups['hub_cluster'][0]]['mirror_registry_url'] | default(disconnected.mirror_registry.hostname ~ ':' ~ (disconnected.mirror_registry.port | default(8443))) }}"
+        mirror_registry_url: >-
+          {{ hostvars[groups['hub_cluster'][0]]['mirror_registry_url']
+             | default((jumphost_private_ip
+                        if (disconnected.network_lockdown.enabled | default(true))
+                        else disconnected.mirror_registry.hostname)
+                       ~ ':' ~ (disconnected.mirror_registry.port | default(8443))) }}
 
     - name: Read mirror registry CA certificate from disk
       ansible.builtin.slurp:
@@ -867,7 +876,11 @@
             ['==================================================================',
              'Disconnected ACM Hub+Spoke Deployment Complete!',
              '==================================================================',
-             'Mirror Registry: ' ~ (mirror_registry_url | default(disconnected.mirror_registry.hostname ~ ':' ~ (disconnected.mirror_registry.port | default(8443)))),
+             'Mirror Registry: ' ~ (mirror_registry_url
+                                    | default((jumphost_private_ip
+                                               if (disconnected.network_lockdown.enabled | default(true))
+                                               else disconnected.mirror_registry.hostname)
+                                              ~ ':' ~ (disconnected.mirror_registry.port | default(8443)))),
              'Internal Gitea:  https://gitea.gitea.' ~ base_domain ~ ' (in-cluster: http://gitea.gitea.svc.cluster.local:3000)'] +
             _summary_lines +
             ['', '==================================================================']

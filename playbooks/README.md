@@ -305,7 +305,7 @@ This will:
 6. Copy your pull secret and AWS credentials
 7. Print the SSH command and next steps
 
-After it completes, set `disconnected.mirror_registry.hostname` in your inventory to the printed public IP, then copy the inventory to the jumphost and run the disconnected playbook from there.
+After it completes, set `jumphost_private_ip` in your inventory to the printed private IP (required under network lockdown, which is enabled by default — see below), then copy the inventory to the jumphost and run the disconnected playbook from there. `disconnected.mirror_registry.hostname` is only used when `disconnected.network_lockdown.enabled: false`.
 
 **Customization** (override in inventory `all.vars`):
 
@@ -409,7 +409,7 @@ all:
     force_update: true
     base_domain: "example.com"
     automation_repo_branch: "main"        # branch of 71638776-openshift-automation to clone on jumphost
-    jumphost_private_ip: ""               # private IP of jumphost within the VPC; used as LDAP server address so cluster pods can reach it without internet
+    jumphost_private_ip: ""               # private IP of jumphost within the VPC; used as LDAP server address, and (under network lockdown, the default) as the mirror registry hostname cluster nodes pull from
     ssh_key: "{{ lookup('file', '~/.ssh/id_ed25519.pub') }}"
     pull_secret: "{{ lookup('file', '~/pull-secret.json') | from_json }}"
     aws:
@@ -712,7 +712,7 @@ all:
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `disconnected.mirror_registry.hostname` | Yes | — | FQDN or IP of the jumphost, reachable by all cluster nodes |
+| `disconnected.mirror_registry.hostname` | Only if `network_lockdown.enabled: false` | — | FQDN or IP of the jumphost, reachable by all cluster nodes. Under network lockdown (default), `jumphost_private_ip` is used instead — cluster nodes have no route to any public IP/DNS, only to the jumphost's private IP via VPC peering. |
 | `disconnected.mirror_registry.port` | No | `8443` | Mirror registry port |
 | `disconnected.mirror_registry.init_user` | No | `init` | Mirror registry admin username |
 | `disconnected.mirror_registry.init_password` | Yes | — | Mirror registry admin password |

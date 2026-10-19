@@ -51,6 +51,15 @@ the existing jumphost-mirrors-then-migrate-to-hub workflow. Set
   infrastructure` against the spoke's kubeconfig, since spokes have no local
   `metadata.json`). `aws/lockdown_cluster_security_groups` revokes this same
   ingress at the same final-cutover point it revokes egress.
+- **Mirror registry address**: the Cluster VPC has no Internet Gateway/NAT at
+  all, and VPC peering only routes to the peer VPC's private CIDR — it can
+  never route to the jumphost's public IP/DNS. `disconnected.mirror_registry.hostname`
+  (documented as the jumphost's public IP/FQDN) is therefore unreachable from
+  any cluster node under lockdown. `mirror_registry_hostname`/`mirror_registry_url`
+  (in `ocp/setup_mirror_registry`, `ocp/remirror_to_quay`, and the main
+  playbook's own derivations) default to `jumphost_private_ip` instead
+  whenever `network_lockdown.enabled` is true, falling back to
+  `disconnected.mirror_registry.hostname` only when lockdown is disabled.
 - **VPC Endpoints** (S3 gateway; EC2, ELB, STS, Route53 interface endpoints) in
   the Cluster VPC, so the AWS cloud-provider, ELB/EBS CSI controllers, and the
   ingress operator's Route53 DNS management work without any internet path.

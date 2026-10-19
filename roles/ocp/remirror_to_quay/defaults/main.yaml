@@ -8,6 +8,12 @@ initial_mirror_workspace: "{{ oc_mirror_workspace | default(working_dir ~ '/oc-m
 # Fresh workspace for the Quay mirror run (must differ from initial_mirror_workspace)
 quay_mirror_workspace: "{{ working_dir }}/oc-mirror-workspace-quay"
 
-# Source mirror registry — set by setup_mirror_registry; default derives from inventory
-mirror_registry_url: "{{ disconnected.mirror_registry.hostname }}:{{ disconnected.mirror_registry.port | default(8443) }}"
+# Source mirror registry — set by setup_mirror_registry; default derives from
+# inventory, preferring jumphost_private_ip under network lockdown (see
+# setup_mirror_registry/defaults for why).
+mirror_registry_url: >-
+  {{ (jumphost_private_ip
+      if (disconnected.network_lockdown.enabled | default(true))
+      else disconnected.mirror_registry.hostname)
+     ~ ':' ~ (disconnected.mirror_registry.port | default(8443)) }}
 mirror_base_path: "{{ disconnected.mirror_base_path | default('ocp4') }}"
