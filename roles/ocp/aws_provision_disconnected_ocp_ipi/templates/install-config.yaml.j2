@@ -106,10 +106,14 @@ sshKey: |
 {% endif %}
 additionalTrustBundle: |
 {{ mirror_registry_ca_bundle | indent(2, first=true) }}
+# oc-mirror v2 remaps both quay.io/openshift-release-dev repos under a
+# shared "openshift" namespace (release-images / release) rather than
+# preserving the original openshift-release-dev path — verified against
+# oc-mirror's own generated idms-oc-mirror.yaml.
 imageContentSources:
 - mirrors:
-  - {{ mirror_registry_url }}/{{ mirror_base_path }}/openshift-release-dev/ocp-release
+  - {{ mirror_registry_url }}/{{ mirror_base_path }}/openshift/release-images
   source: quay.io/openshift-release-dev/ocp-release
 - mirrors:
-  - {{ mirror_registry_url }}/{{ mirror_base_path }}/openshift-release-dev/ocp-v4.0-art-dev
+  - {{ mirror_registry_url }}/{{ mirror_base_path }}/openshift/release
   source: quay.io/openshift-release-dev/ocp-v4.0-art-dev
