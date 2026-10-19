@@ -1,0 +1,9 @@
+---
+network_lockdown_region: "{{ aws.aws_region }}"
+# SSH (bootstrap log gathering), API (openshift-install waiting for the
+# Kubernetes API / Day 2 config from the jumphost), and the Machine Config
+# Server (ignition fetch during bootstrap/scale-out).
+network_lockdown_jumphost_ingress_ports:
+  - 22
+  - 6443
+  - 22623

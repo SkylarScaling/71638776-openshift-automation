@@ -1,0 +1,120 @@
+---
+# ==============================================================================
+# ALLOW THE JUMPHOST INGRESS TO CLUSTER NODE SECURITY GROUPS
+#
+# VPC peering (aws/provision_cluster_vpc) plus the routes it adds only create
+# a network *path* between the jumphost VPC and the Cluster VPC — security
+# groups are a separate, stateful allow-list that must independently permit
+# the traffic. openshift-install's auto-created master/worker/bootstrap
+# security groups only allow ingress from the cluster's own machineNetwork
+# (the Cluster VPC CIDR) by default, never from a peered VPC. Without this,
+# the jumphost — which runs openshift-install itself for the hub, and all
+# subsequent Day 2 `oc`/ansible config against every cluster — can reach
+# nothing: SSH to bootstrap for log gathering times out, and the API times
+# out/refuses once bootstrap would otherwise be reachable.
+#
+# Meant to run concurrently with the (async, poll:0) openshift-install job for
+# the hub, same pattern as aws/associate_private_zone_with_jumphost:
+# metadata.json (and therefore the infra ID every node security group is
+# tagged with) is written within the first couple of minutes, well before the
+# installer waits on the API or needs to SSH the bootstrap node. Pass
+# `_metadata_json_path` for that case.
+#
+# Spokes are provisioned via Hive/ACM from inside the hub, so there is no
+# local metadata.json — the infra ID is discovered via `oc get infrastructure`
+# against `target_kubeconfig` instead. Pass `target_kubeconfig` for that case.
+# Needed there too: every subsequent Day 2 `oc`/ansible task against a spoke
+# also runs from the jumphost.
+# ==============================================================================
+
+- name: Ensure AWS CLI is available
+  ansible.builtin.include_role:
+    name: aws/ensure_aws_cli
+
+- name: Set AWS environment for all tasks
+  ansible.builtin.set_fact:
+    _aji_aws_env:
+      AWS_ACCESS_KEY_ID: "{{ aws.aws_access_key_id }}"
+      AWS_SECRET_ACCESS_KEY: "{{ aws.aws_secret_access_key }}"
+      AWS_SESSION_TOKEN: ""
+
+- name: Find the jumphost VPC CIDR
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-vpcs
+    --filters Name=tag:Name,Values={{ jumphost_name | default('disconnected-jumphost') }}-vpc
+    --query 'Vpcs[0].CidrBlock'
+    --output text
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aji_aws_env }}"
+  register: _aji_jumphost_vpc_cidr
+  changed_when: false
+
+- name: Fail if the jumphost VPC was not found
+  ansible.builtin.fail:
+    msg: >-
+      Could not find a VPC tagged '{{ jumphost_name | default('disconnected-jumphost') }}-vpc'
+      — cannot allow jumphost ingress to the cluster's node security groups.
+  when: _aji_jumphost_vpc_cidr.stdout | trim in ['None', '']
+
+- name: Wait for install metadata.json to be written
+  ansible.builtin.wait_for:
+    path: "{{ _metadata_json_path }}"
+    timeout: 900
+  when: _metadata_json_path is defined
+
+- name: Read the cluster's infra ID from install metadata
+  ansible.builtin.slurp:
+    src: "{{ _metadata_json_path }}"
+  register: _aji_metadata_raw
+  when: _metadata_json_path is defined
+
+- name: Get cluster infrastructure name from a running cluster
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get infrastructure cluster
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.infrastructureName}'
+  register: _aji_infra_name_from_oc
+  changed_when: false
+  when: _metadata_json_path is not defined
+
+- name: Set the infra ID fact
+  ansible.builtin.set_fact:
+    _aji_infra_id: >-
+      {{ (_aji_metadata_raw.content | b64decode | from_json).infraID
+         if _metadata_json_path is defined
+         else _aji_infra_name_from_oc.stdout | trim }}
+
+- name: Wait for the cluster's node security groups to exist
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-security-groups
+    --filters Name=tag-key,Values=kubernetes.io/cluster/{{ _aji_infra_id }}
+    --query 'SecurityGroups[].GroupId'
+    --output text
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aji_aws_env }}"
+  register: _aji_cluster_sgs
+  until: _aji_cluster_sgs.stdout | trim != ''
+  retries: 30
+  delay: 20
+  changed_when: false
+
+- name: Allow jumphost ingress on each required port
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 authorize-security-group-ingress
+    --group-id {{ item.0 }}
+    --ip-permissions '[{"IpProtocol":"tcp","FromPort":{{ item.1 }},"ToPort":{{ item.1 }},"IpRanges":[{"CidrIp":"{{ _aji_jumphost_vpc_cidr.stdout | trim }}"}]}]'
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aji_aws_env }}"
+  loop: "{{ _aji_cluster_sgs.stdout.split() | product(network_lockdown_jumphost_ingress_ports) | list }}"
+  register: _aji_allow_ingress
+  failed_when:
+    - _aji_allow_ingress.rc != 0
+    - "'InvalidPermission.Duplicate' not in _aji_allow_ingress.stderr"
+  changed_when: _aji_allow_ingress.rc == 0
+
+- name: Display jumphost ingress summary
+  ansible.builtin.debug:
+    msg: >-
+      Jumphost VPC ({{ _aji_jumphost_vpc_cidr.stdout | trim }}) allowed ingress on
+      ports {{ network_lockdown_jumphost_ingress_ports }} to node security groups
+      {{ _aji_cluster_sgs.stdout.split() }} for infra {{ _aji_infra_id }}

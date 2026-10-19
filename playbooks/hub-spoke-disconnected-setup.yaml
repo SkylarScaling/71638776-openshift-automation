@@ -542,6 +542,13 @@
       ansible.builtin.set_fact:
         spoke_kubeconfig: "{{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig"
 
+    - name: Allow the jumphost ingress to the Spoke's node security groups (network lockdown)
+      ansible.builtin.include_role:
+        name: aws/allow_jumphost_ingress_to_nodes
+      vars:
+        target_kubeconfig: "{{ spoke_kubeconfig }}"
+      when: disconnected.network_lockdown.enabled | default(true)
+
     - name: Apply Disconnected Cluster Configuration to Spoke (IDMS, CatalogSource, Pull Secret)
       ansible.builtin.include_role:
         name: ocp/configure_disconnected_cluster

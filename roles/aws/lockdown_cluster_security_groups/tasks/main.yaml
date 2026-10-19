@@ -133,6 +133,26 @@
   changed_when: _nl_revoke_jumphost_cidr.rc == 0
   when: not (network_lockdown_allow_jumphost_egress | bool)
 
+# aws/allow_jumphost_ingress_to_nodes (or this role's own prior run) opened
+# ingress from the jumphost VPC for SSH/API/MCS so the jumphost could install
+# the cluster and run Day 2 config against it. That access must be revoked at
+# the same final-cutover point egress is — otherwise the jumphost retains
+# inbound access to every cluster node indefinitely post-migration.
+- name: Revoke jumphost ingress to node security groups (final lockdown, post-migration)
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 revoke-security-group-ingress
+    --group-id {{ item.0 }}
+    --ip-permissions '[{"IpProtocol":"tcp","FromPort":{{ item.1 }},"ToPort":{{ item.1 }},"IpRanges":[{"CidrIp":"{{ _nl_jumphost_vpc_cidr.stdout | trim }}"}]}]'
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  loop: "{{ _nl_cluster_sgs.stdout.split() | product(network_lockdown_jumphost_ingress_ports) | list }}"
+  register: _nl_revoke_jumphost_ingress
+  failed_when:
+    - _nl_revoke_jumphost_ingress.rc != 0
+    - "'InvalidPermission.NotFound' not in _nl_revoke_jumphost_ingress.stderr"
+  changed_when: _nl_revoke_jumphost_ingress.rc == 0
+  when: not (network_lockdown_allow_jumphost_egress | bool)
+
 - name: Display lockdown summary
   ansible.builtin.debug:
     msg:

@@ -194,6 +194,21 @@
         private_zone_domain: "{{ ocp_cluster.name }}.{{ base_domain }}"
       when: disconnected.network_lockdown.enabled | default(true)
 
+    # VPC peering (provision_cluster_vpc) only opens a network path between
+    # the jumphost VPC and the Cluster VPC — it does not touch security
+    # groups. The installer's auto-created node security groups only allow
+    # ingress from the cluster's own machineNetwork by default, so without
+    # this the jumphost can't SSH the bootstrap node for log gathering or
+    # reach the API/MCS, even though routing is fine. Runs concurrently with
+    # the async install job above; metadata.json (and the infra ID) exists
+    # well before the installer needs to reach the bootstrap node or the API.
+    - name: Allow the jumphost ingress to the cluster's node security groups
+      ansible.builtin.include_role:
+        name: aws/allow_jumphost_ingress_to_nodes
+      vars:
+        _metadata_json_path: "{{ install_path.path }}/metadata.json"
+      when: disconnected.network_lockdown.enabled | default(true)
+
     - name: Check the status of the install
       ansible.builtin.async_status:
         jid: "{{ cluster_deploy.ansible_job_id }}"

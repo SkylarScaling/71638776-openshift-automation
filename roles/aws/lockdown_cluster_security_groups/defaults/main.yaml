@@ -5,3 +5,10 @@ network_lockdown_region: "{{ aws.aws_region }}"
 # peering); set false in the migrate_mirror phase once Quay on the hub is the
 # live mirror and the jumphost is no longer needed.
 network_lockdown_allow_jumphost_egress: true
+# Must match aws/allow_jumphost_ingress_to_nodes — SSH (bootstrap log
+# gathering), API (install/Day 2 config from the jumphost), and MCS (ignition
+# fetch during bootstrap/scale-out).
+network_lockdown_jumphost_ingress_ports:
+  - 22
+  - 6443
+  - 22623
