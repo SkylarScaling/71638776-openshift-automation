@@ -95,8 +95,14 @@ the existing jumphost-mirrors-then-migrate-to-hub workflow. Set
   itself instead, from the jumphost (which has real AWS access, unlike the
   cluster), once the router's load balancer exists. Runs concurrently with
   the hub's async install job, same pattern as the private-zone-association
-  and jumphost-ingress roles. **Not yet implemented for Hive-provisioned
-  spokes** — they will hit the identical `NoZones` failure.
+  and jumphost-ingress roles. Hive-provisioned spokes hit the identical
+  `NoZones` failure and get the same fix: the IngressController manifest
+  rides along in the spoke's existing manifestsConfigMap (Hive's
+  `manifestsConfigMapRef` only accepts one), and the record is created
+  mid-install using the infra ID from the `ClusterDeployment`'s own
+  `status.infraID` (read from the Hub) rather than `oc get infrastructure`
+  against the spoke — the jumphost has no route to a spoke's API yet at
+  this point in the install.
 - **Security Group lockdown**: the installer always creates cluster node
   security groups with a broad `0.0.0.0/0` / all-protocols egress rule. A new
   role revokes that and replaces it with VPC-CIDR-only (plus jumphost-VPC-CIDR
