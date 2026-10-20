@@ -72,7 +72,7 @@
     filters:
       "tag:Name": >-
         {{ (disconnected.network_lockdown.vpc_name | default('ocp-cluster-vpc'))
-           if (disconnected.network_lockdown.enabled | default(false))
+           if (disconnected.network_lockdown.enabled | default(true))
            else (cluster_id ~ '-vpc') }}
   register: vpc_info_result
   failed_when: vpc_info_result.vpcs | length != 1
@@ -90,7 +90,7 @@
       vpc-id: "{{ vpc_info_result.vpcs[0].id }}"
       "tag:Name": >-
         {{ (ocp_cluster.name ~ '-*')
-           if (disconnected.network_lockdown.enabled | default(false))
+           if (disconnected.network_lockdown.enabled | default(true))
            else '*private*' }}
   register: subnet_info_result
   failed_when: subnet_info_result.subnets | length == 0
