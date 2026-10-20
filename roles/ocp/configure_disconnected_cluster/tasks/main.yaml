@@ -2,21 +2,38 @@
 # On re-runs (e.g. --tags hub to update Day 2 config after migrate_mirror),
 # oc_mirror_idms_manifests and oc_mirror_catalogsource_manifests may not be
 # loaded from disk because the original workspace was cleaned during migration.
-# Check if the cluster already has CatalogSources — if so, it's already
-# configured and we skip the manifest-apply steps entirely.
-- name: Check if cluster already has CatalogSources (re-run idempotency)
+# Check if the cluster already has OUR mirrored CatalogSource and IDMS — if
+# so, it's already configured and we skip the manifest-apply steps entirely.
+#
+# Must NOT just check "does any CatalogSource exist": the marketplace
+# operator always creates the three stock sources (certified-operators,
+# community-operators, redhat-operators) at install time, pointing at
+# registry.redhat.io — that is true on every fresh cluster, so a bare
+# existence check always evaluates true and skips configuration entirely,
+# including on a first-ever run. Scope the check to an object whose
+# spec.image actually points at our mirror registry.
+- name: Check if cluster already has a mirrored CatalogSource (re-run idempotency)
   ansible.builtin.shell: >
     {{ bin_dir }}/oc get catalogsource
     -n openshift-marketplace
     --kubeconfig {{ target_kubeconfig }}
-    -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true
+    -o jsonpath='{range .items[*]}{.spec.image}{"\n"}{end}' 2>/dev/null || true
   register: _existing_catalogsources
+  changed_when: false
+
+- name: Check if cluster already has an ImageDigestMirrorSet
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get imagedigestmirrorset
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true
+  register: _existing_idms
   changed_when: false
 
 - name: Set cluster already configured flag
   ansible.builtin.set_fact:
     _disconnected_cluster_already_configured: >-
-      {{ _existing_catalogsources.stdout | trim != '' }}
+      {{ (mirror_registry_url in _existing_catalogsources.stdout)
+         and (_existing_idms.stdout | trim != '') }}
 
 - name: Apply ImageDigestMirrorSet / ImageContentSourcePolicy manifests
   ansible.builtin.shell:
@@ -43,6 +60,42 @@
     - not _disconnected_cluster_already_configured
     - disable_default_catalog_sources | bool
   changed_when: true
+
+# Fail fast and loudly here if the patch above didn't take, rather than
+# discovering it 30+ minutes later from the mirrored CatalogSource's own
+# verify loop timing out on unrelated stock sources still sitting in the
+# namespace.
+# Only check the two stock sources this role never recreates under the same
+# name (redhat-operators is intentionally kept — this role repoints it at
+# the mirror in the very next task — so its presence here says nothing about
+# whether disableAllDefaultSources actually worked).
+- name: Wait for the marketplace operator to remove the default CatalogSources
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get catalogsource certified-operators community-operators
+    -n openshift-marketplace
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true
+  register: _stock_catalogsources
+  until: _stock_catalogsources.stdout | trim == ''
+  retries: 20
+  delay: 15
+  changed_when: false
+  failed_when: false
+  when:
+    - not _disconnected_cluster_already_configured
+    - disable_default_catalog_sources | bool
+
+- name: Fail if default CatalogSources were not removed
+  ansible.builtin.fail:
+    msg: >-
+      disableAllDefaultSources: true was applied to OperatorHub/cluster, but
+      {{ _stock_catalogsources.stdout }} still exist in openshift-marketplace
+      after 5 minutes. Check `oc get operatorhub cluster -o yaml` — the patch
+      may not have taken effect.
+  when:
+    - not _disconnected_cluster_already_configured
+    - disable_default_catalog_sources | bool
+    - _stock_catalogsources.stdout | default('') | trim != ''
 
 - name: Fail if oc-mirror produced no CatalogSource manifests
   ansible.builtin.fail:
@@ -206,18 +259,24 @@
   delay: 30
   changed_when: false
 
-- name: Verify CatalogSource pods are ready
+# Scoped to CatalogSources whose spec.image points at our mirror registry —
+# not "every CatalogSource in the namespace" — so stock sources that
+# `disableAllDefaultSources` hasn't reaped yet (or never will, if that patch
+# failed to apply) can't hold this loop for 30 minutes over objects this role
+# doesn't manage and nothing downstream uses.
+- name: Verify the mirrored CatalogSource pod is ready
   ansible.builtin.shell: >
     {{ bin_dir }}/oc get catalogsource -n openshift-marketplace
     --kubeconfig {{ target_kubeconfig }}
-    -o jsonpath='{range .items[*]}{.metadata.name}={.status.connectionState.lastObservedState}{"\n"}{end}'
+    -o jsonpath='{range .items[*]}{.metadata.name}={.spec.image}={.status.connectionState.lastObservedState}{"\n"}{end}'
   register: catalog_status
   until: >
-    catalog_status.stdout != "" and
-    (catalog_status.stdout_lines | reject('search', '=READY$') | reject('match', '^$') | list | length == 0)
+    (catalog_status.stdout_lines | select('search', mirror_registry_url) | list | length > 0) and
+    (catalog_status.stdout_lines | select('search', mirror_registry_url) | reject('search', '=READY$') | list | length == 0)
   retries: 60
   delay: 30
   changed_when: false
+  when: not _disconnected_cluster_already_configured
 
 - name: Display disconnected cluster configuration status
   ansible.builtin.debug:
@@ -226,5 +285,5 @@
       - "Mirror registry: {{ mirror_registry_url }}"
       - "Default catalog sources: {{ 'disabled' if disable_default_catalog_sources else 'enabled' }}"
       - "MachineConfigPools: updated"
-      - "CatalogSource status: {{ catalog_status.stdout_lines }}"
+      - "CatalogSource status: {{ catalog_status.stdout_lines | default(['(already configured — not re-checked)']) }}"
   when: not _disconnected_cluster_already_configured
