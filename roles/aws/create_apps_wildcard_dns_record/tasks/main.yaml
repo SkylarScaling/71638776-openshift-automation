@@ -1,0 +1,109 @@
+---
+# ==============================================================================
+# CREATE THE *.apps WILDCARD DNS RECORD OURSELVES
+#
+# The in-cluster ingress operator manages this record by default, but under
+# network lockdown it has no path to route53.amazonaws.com or
+# tagging.us-east-1.amazonaws.com at all — no interface endpoint for either
+# exists in any commercial AWS region, so its DNS management call always
+# times out ("NoZones: The record isn't present in any zones"). The default
+# IngressController is set to dnsManagementPolicy: Unmanaged (see the
+# cluster-ingress-default-ingresscontroller.yaml manifest injected at
+# `create manifests` time) so it stops trying. The jumphost has real AWS
+# access, so it creates the record directly instead, once the router's
+# load balancer exists.
+#
+# Meant to run concurrently with the (async, poll:0) openshift-install job:
+# the router Service/LB doesn't appear until well into cluster
+# initialization, long after bootstrap, so this polls rather than firing once.
+# ==============================================================================
+
+- name: Ensure AWS CLI is available
+  ansible.builtin.include_role:
+    name: aws/ensure_aws_cli
+
+- name: Set AWS environment for all tasks
+  ansible.builtin.set_fact:
+    _awd_aws_env:
+      AWS_ACCESS_KEY_ID: "{{ aws.aws_access_key_id }}"
+      AWS_SECRET_ACCESS_KEY: "{{ aws.aws_secret_access_key }}"
+      AWS_SESSION_TOKEN: ""
+    _awd_private_zone_domain: "{{ ocp_cluster.name }}.{{ base_domain }}"
+
+- name: Wait for the cluster's private hosted zone to be created
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws route53 list-hosted-zones-by-name
+    --dns-name {{ _awd_private_zone_domain }}
+    --query "HostedZones[?Name=='{{ _awd_private_zone_domain }}.'].Id | [0]"
+    --output text
+    --region {{ aws.aws_region }}
+  environment: "{{ _awd_aws_env }}"
+  register: _awd_zone_lookup
+  until: _awd_zone_lookup.stdout | trim not in ['None', '']
+  retries: 30
+  delay: 20
+  changed_when: false
+
+- name: Wait for the router's load balancer to exist
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws resourcegroupstaggingapi get-resources
+    --tag-filters Key=kubernetes.io/service-name,Values=openshift-ingress/router-default
+    --resource-type-filters elasticloadbalancing
+    --query 'ResourceTagMappingList[0].ResourceARN'
+    --output text
+    --region {{ aws.aws_region }}
+  environment: "{{ _awd_aws_env }}"
+  register: _awd_router_lb_arn
+  until: _awd_router_lb_arn.stdout | trim not in ['None', '']
+  retries: 180
+  delay: 20
+  changed_when: false
+
+- name: Set router load balancer facts
+  ansible.builtin.set_fact:
+    # Classic ELB ARNs are .../loadbalancer/<name>; NLB/ALB ARNs are
+    # .../loadbalancer/net/<name>/<id> or .../loadbalancer/app/<name>/<id>.
+    _awd_router_lb_is_classic: "{{ '/net/' not in _awd_router_lb_arn.stdout and '/app/' not in _awd_router_lb_arn.stdout }}"
+    _awd_router_lb_name: "{{ _awd_router_lb_arn.stdout | trim | regex_replace('^.*loadbalancer/(net/|app/)?', '') | regex_replace('/[^/]+$', '') if ('/net/' in _awd_router_lb_arn.stdout or '/app/' in _awd_router_lb_arn.stdout) else (_awd_router_lb_arn.stdout | trim | regex_replace('^.*loadbalancer/', '')) }}"
+
+- name: Get Classic ELB DNS name
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws elb describe-load-balancers
+    --load-balancer-names {{ _awd_router_lb_name }}
+    --query 'LoadBalancerDescriptions[0].DNSName'
+    --output text
+    --region {{ aws.aws_region }}
+  environment: "{{ _awd_aws_env }}"
+  register: _awd_classic_lb_dns
+  changed_when: false
+  when: _awd_router_lb_is_classic | bool
+
+- name: Get NLB/ALB DNS name
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws elbv2 describe-load-balancers
+    --load-balancer-arns {{ _awd_router_lb_arn.stdout | trim }}
+    --query 'LoadBalancers[0].DNSName'
+    --output text
+    --region {{ aws.aws_region }}
+  environment: "{{ _awd_aws_env }}"
+  register: _awd_v2_lb_dns
+  changed_when: false
+  when: not (_awd_router_lb_is_classic | bool)
+
+- name: Set router load balancer DNS name fact
+  ansible.builtin.set_fact:
+    _awd_router_lb_dns: >-
+      {{ (_awd_classic_lb_dns.stdout | trim) if (_awd_router_lb_is_classic | bool) else (_awd_v2_lb_dns.stdout | trim) }}
+
+- name: Create the *.apps CNAME record in the private hosted zone
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws route53 change-resource-record-sets
+    --hosted-zone-id {{ _awd_zone_lookup.stdout | trim | regex_replace('^/hostedzone/', '') }}
+    --change-batch '{"Changes":[{"Action":"UPSERT","ResourceRecordSet":{"Name":"*.apps.{{ _awd_private_zone_domain }}","Type":"CNAME","TTL":300,"ResourceRecords":[{"Value":"{{ _awd_router_lb_dns }}."}]}}]}'
+    --region {{ aws.aws_region }}
+  environment: "{{ _awd_aws_env }}"
+  changed_when: true
+
+- name: Display apps wildcard DNS record summary
+  ansible.builtin.debug:
+    msg: "*.apps.{{ _awd_private_zone_domain }} -> {{ _awd_router_lb_dns }} (CNAME, zone {{ _awd_zone_lookup.stdout | trim }})"

@@ -1,8 +1,12 @@
 ---
 network_lockdown_vpc_name: "{{ disconnected.network_lockdown.vpc_name | default('ocp-cluster-vpc') }}"
 network_lockdown_region: "{{ aws.aws_region }}"
+# route53 deliberately excluded: com.amazonaws.<region>.route53 does not
+# exist in any commercial AWS region (confirmed via
+# describe-vpc-endpoint-services) — it is not a rollout gap, it will never
+# appear. See DISCONNECTED-NETWORK-LOCKDOWN.md "Apps wildcard DNS" for how
+# the ingress operator's Route53 dependency is avoided instead.
 network_lockdown_interface_endpoint_services:
   - ec2
   - elasticloadbalancing
   - sts
-  - route53

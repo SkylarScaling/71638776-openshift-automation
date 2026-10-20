@@ -74,14 +74,29 @@ the existing jumphost-mirrors-then-migrate-to-hub workflow. Set
   does the same extraction and writes the Secrets into a ConfigMap referenced
   from the `ClusterDeployment`'s `spec.provisioning.manifestsConfigMapRef`
   (Hive's equivalent of dropping files into `manifests/` before install).
-- **VPC Endpoints** (S3 gateway; EC2, ELB, STS, Route53 interface endpoints) in
-  the Cluster VPC, so the AWS cloud-provider, ELB/EBS CSI controllers, and the
-  ingress operator's Route53 DNS management work without any internet path.
-  Not every service's interface endpoint is offered in every region yet
-  (Route53's is a recent, still-rolling-out PrivateLink addition) — the role
+- **VPC Endpoints** (S3 gateway; EC2, ELB, STS interface endpoints) in the
+  Cluster VPC, so the AWS cloud-provider and ELB/EBS CSI controllers work
+  without any internet path. There is no Route53 interface endpoint —
+  `com.amazonaws.<region>.route53` does not exist in any commercial AWS
+  region (confirmed via `describe-vpc-endpoint-services`; it is not a
+  still-rolling-out gap, it will never appear) — so the ingress operator can
+  never reach Route53 to manage DNS itself from inside the Cluster VPC. See
+  "Apps wildcard DNS" below for how that's handled instead. Not every other
+  service's interface endpoint is offered in every region either — the role
   discovers what AWS actually offers in the target region first and skips
-  (with a warning, not a failure) anything not yet available there, rather
-  than hardcoding a region list that would silently go stale.
+  (with a warning, not a failure) anything not available there, rather than
+  hardcoding a region list that would silently go stale.
+- **Apps wildcard DNS**: because the ingress operator can't reach Route53 (see
+  above), the default IngressController's `endpointPublishingStrategy.loadBalancer.dnsManagementPolicy`
+  is set to `Unmanaged` via a manifest `ocp/aws_provision_disconnected_ocp_ipi`
+  injects at `create manifests` time — otherwise it fails forever with
+  `NoZones: The record isn't present in any zones`. `aws/create_apps_wildcard_dns_record`
+  creates the `*.apps` CNAME in the installer-managed private hosted zone
+  itself instead, from the jumphost (which has real AWS access, unlike the
+  cluster), once the router's load balancer exists. Runs concurrently with
+  the hub's async install job, same pattern as the private-zone-association
+  and jumphost-ingress roles. **Not yet implemented for Hive-provisioned
+  spokes** — they will hit the identical `NoZones` failure.
 - **Security Group lockdown**: the installer always creates cluster node
   security groups with a broad `0.0.0.0/0` / all-protocols egress rule. A new
   role revokes that and replaces it with VPC-CIDR-only (plus jumphost-VPC-CIDR

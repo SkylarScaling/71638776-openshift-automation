@@ -185,6 +185,32 @@
         name: ocp/create_manual_cloud_credentials
       when: disconnected.network_lockdown.enabled | default(true)
 
+    # Neither route53.amazonaws.com nor tagging.us-east-1.amazonaws.com has an
+    # interface VPC endpoint in any commercial AWS region, so the in-cluster
+    # ingress operator can never reach Route53 from the locked-down Cluster
+    # VPC to manage the *.apps record itself — it fails forever with
+    # "NoZones: The record isn't present in any zones". Tell it not to try;
+    # aws/create_apps_wildcard_dns_record (below) creates the record instead,
+    # from the jumphost, which has real AWS access.
+    - name: Write default IngressController manifest (Unmanaged apps DNS)
+      ansible.builtin.copy:
+        dest: "{{ install_path.path }}/manifests/cluster-ingress-default-ingresscontroller.yaml"
+        mode: '0644'
+        content: |
+          apiVersion: operator.openshift.io/v1
+          kind: IngressController
+          metadata:
+            name: default
+            namespace: openshift-ingress-operator
+          spec:
+            domain: apps.{{ ocp_cluster.name }}.{{ base_domain }}
+            endpointPublishingStrategy:
+              type: LoadBalancerService
+              loadBalancer:
+                scope: Internal
+                dnsManagementPolicy: Unmanaged
+      when: disconnected.network_lockdown.enabled | default(true)
+
     - name: Print log path for live monitoring
       ansible.builtin.debug:
         msg: "Installer starting (disconnected). For live output: tail -f {{ install_path.path }}/.openshift_install.log"
@@ -212,6 +238,16 @@
         name: aws/associate_private_zone_with_jumphost
       vars:
         private_zone_domain: "{{ ocp_cluster.name }}.{{ base_domain }}"
+      when: disconnected.network_lockdown.enabled | default(true)
+
+    # The default IngressController is set to dnsManagementPolicy: Unmanaged
+    # above, so nothing else will ever create *.apps. Runs concurrently with
+    # the async install job; the router's load balancer doesn't exist until
+    # well into cluster initialization, long after bootstrap, so this polls
+    # for it rather than running once early like the zone association above.
+    - name: Create the *.apps wildcard DNS record
+      ansible.builtin.include_role:
+        name: aws/create_apps_wildcard_dns_record
       when: disconnected.network_lockdown.enabled | default(true)
 
     # VPC peering (provision_cluster_vpc) only opens a network path between
