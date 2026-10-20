@@ -25,3 +25,25 @@ data:
       aws_secret_access_key: {{ aws.aws_secret_access_key }}
 {% endif %}
 {% endfor %}
+{# Neither route53.amazonaws.com nor tagging.us-east-1.amazonaws.com has an
+   interface VPC endpoint in any commercial AWS region, so the in-cluster
+   ingress operator can never manage *.apps itself from the isolated Cluster
+   VPC — it fails forever with "NoZones". aws/create_apps_wildcard_dns_record
+   creates the record instead from the jumphost; this just stops the operator
+   from trying. Hive's manifestsConfigMapRef only takes one ConfigMap, so this
+   rides along with the credential Secrets above rather than a separate one. #}
+{% if disconnected.network_lockdown.enabled | default(true) %}
+  cluster-ingress-default-ingresscontroller.yaml: |
+    apiVersion: operator.openshift.io/v1
+    kind: IngressController
+    metadata:
+      name: default
+      namespace: openshift-ingress-operator
+    spec:
+      domain: apps.{{ ocp_cluster.name }}.{{ base_domain }}
+      endpointPublishingStrategy:
+        type: LoadBalancerService
+        loadBalancer:
+          scope: Internal
+          dnsManagementPolicy: Unmanaged
+{% endif %}

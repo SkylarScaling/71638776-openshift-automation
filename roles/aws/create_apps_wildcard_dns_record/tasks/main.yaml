@@ -13,9 +13,22 @@
 # access, so it creates the record directly instead, once the router's
 # load balancer exists.
 #
-# Meant to run concurrently with the (async, poll:0) openshift-install job:
-# the router Service/LB doesn't appear until well into cluster
-# initialization, long after bootstrap, so this polls rather than firing once.
+# Meant to run concurrently with the (async, poll:0) openshift-install job for
+# the hub, same pattern as aws/associate_private_zone_with_jumphost: pass
+# `_metadata_json_path` for that case. Spokes are provisioned via Hive/ACM
+# from inside the hub, so there is no local metadata.json there — pass
+# `target_kubeconfig` instead to discover the infra ID via `oc get
+# infrastructure`. The router Service/LB doesn't appear until well into
+# cluster initialization, long after bootstrap, so this polls rather than
+# firing once — for a Hive spoke this blocks Ansible, but the install itself
+# runs server-side in a pod on the hub, so it keeps progressing regardless.
+#
+# The infra ID is required to scope the load-balancer tag lookup below:
+# "kubernetes.io/service-name": "openshift-ingress/router-default" is
+# identical across every OCP cluster's router Service, so without also
+# filtering on "kubernetes.io/cluster/<infraID>" the lookup would return an
+# arbitrary router LB once more than one cluster exists in the account (e.g.
+# hub + spokes).
 # ==============================================================================
 
 - name: Ensure AWS CLI is available
@@ -29,6 +42,34 @@
       AWS_SECRET_ACCESS_KEY: "{{ aws.aws_secret_access_key }}"
       AWS_SESSION_TOKEN: ""
     _awd_private_zone_domain: "{{ ocp_cluster.name }}.{{ base_domain }}"
+
+- name: Wait for install metadata.json to be written
+  ansible.builtin.wait_for:
+    path: "{{ _metadata_json_path }}"
+    timeout: 900
+  when: _metadata_json_path is defined
+
+- name: Read the cluster's infra ID from install metadata
+  ansible.builtin.slurp:
+    src: "{{ _metadata_json_path }}"
+  register: _awd_metadata_raw
+  when: _metadata_json_path is defined
+
+- name: Get cluster infrastructure name from a running cluster
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get infrastructure cluster
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.infrastructureName}'
+  register: _awd_infra_name_from_oc
+  changed_when: false
+  when: _metadata_json_path is not defined
+
+- name: Set the infra ID fact
+  ansible.builtin.set_fact:
+    _awd_infra_id: >-
+      {{ (_awd_metadata_raw.content | b64decode | from_json).infraID
+         if _metadata_json_path is defined
+         else _awd_infra_name_from_oc.stdout | trim }}
 
 - name: Wait for the cluster's private hosted zone to be created
   ansible.builtin.command: >
@@ -47,7 +88,7 @@
 - name: Wait for the router's load balancer to exist
   ansible.builtin.command: >
     {{ bin_dir }}/aws resourcegroupstaggingapi get-resources
-    --tag-filters Key=kubernetes.io/service-name,Values=openshift-ingress/router-default
+    --tag-filters Key=kubernetes.io/cluster/{{ _awd_infra_id }},Values=owned Key=kubernetes.io/service-name,Values=openshift-ingress/router-default
     --resource-type-filters elasticloadbalancing
     --query 'ResourceTagMappingList[0].ResourceARN'
     --output text
