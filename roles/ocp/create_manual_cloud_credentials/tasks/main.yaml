@@ -48,3 +48,10 @@
   loop: "{{ _cred_requests_files.files }}"
   loop_control:
     label: "{{ item.path | basename }}"
+  # Feature-gated CredentialsRequests (e.g. the cluster-api provider's, whose
+  # secretRef.namespace is openshift-cluster-api) target namespaces that are
+  # never created on a default-featureSet cluster. Creating their Secret
+  # pre-emptively wedges cluster-bootstrap's asset loop forever ("namespaces
+  # ... not found"), which keeps the bootstrap node (and its MCS) alive and
+  # starves workers whose ignition requests land on it instead of a master.
+  when: "'release.openshift.io/feature-gate' not in (_cr.metadata.annotations | default({}))"

@@ -6,6 +6,13 @@ metadata:
 data:
 {% for f in cred_request_files %}
 {% set cr = lookup('file', f.path) | from_yaml %}
+{# Feature-gated CredentialsRequests (e.g. the cluster-api provider's, in
+   namespace openshift-cluster-api) target namespaces never created on a
+   default-featureSet cluster. Including their Secret here wedges
+   cluster-bootstrap's asset loop forever ("namespaces ... not found"),
+   which keeps the bootstrap node's MCS alive and starves workers whose
+   ignition requests land on it instead of a master. #}
+{% if 'release.openshift.io/feature-gate' not in (cr.metadata.annotations | default({})) %}
   {{ cr.spec.secretRef.namespace }}-{{ cr.spec.secretRef.name }}-credentials.yaml: |
     apiVersion: v1
     kind: Secret
@@ -16,4 +23,5 @@ data:
     stringData:
       aws_access_key_id: {{ aws.aws_access_key_id }}
       aws_secret_access_key: {{ aws.aws_secret_access_key }}
+{% endif %}
 {% endfor %}
