@@ -101,8 +101,9 @@
 - name: Extract IP from EC2-format hostname for disconnected pod DNS bypass
   ansible.builtin.set_fact:
     _ldap_host_ip: >-
-      {{ _ldap_host
-         | regex_search('^ec2-(\d+)-(\d+)-(\d+)-(\d+)\.', '\1', '\2', '\3', '\4')
+      {{ (_ldap_host
+          | regex_search('^ec2-(\d+)-(\d+)-(\d+)-(\d+)\.', '\1', '\2', '\3', '\4')
+          | default([], true))
          | join('.') }}
 
 - name: Create LDAPSyncConfig ConfigMap
