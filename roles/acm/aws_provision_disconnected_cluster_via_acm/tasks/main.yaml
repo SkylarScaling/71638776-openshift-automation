@@ -214,12 +214,18 @@
 # exists — well before Provisioned=True — so get it from there instead and
 # hand it off the same way the hub does (a synthetic metadata.json; the role
 # only ever reads the .infraID key out of it).
+#
+# It lives at spec.clusterMetadata.infraID, not status.infraID — confirmed
+# against the ClusterDeployment CRD schema (the only infraID field in it) and
+# its own additionalPrinterColumns; status.infraID doesn't exist on this
+# object at all, so the old path could never have succeeded regardless of
+# how long it polled.
 - name: Wait for Hive to report the spoke's infra ID
   ansible.builtin.shell: >
     {{ bin_dir }}/oc get clusterdeployment {{ ocp_cluster.name }}
     -n {{ ocp_cluster.name }}
     --kubeconfig {{ target_kubeconfig }}
-    -o jsonpath='{.status.infraID}' 2>/dev/null || true
+    -o jsonpath='{.spec.clusterMetadata.infraID}' 2>/dev/null || true
   register: _spoke_infra_id
   changed_when: false
   until: _spoke_infra_id.stdout | trim != ''
