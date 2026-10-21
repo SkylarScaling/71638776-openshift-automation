@@ -6,4 +6,8 @@ metadata:
     channel: stable
     visible: "true"
 spec:
-  releaseImage: {{ mirror_registry_url }}/{{ mirror_base_path }}/openshift-release-dev/ocp-release:{{ openshift_version }}.{{ ocp_patch_version }}-x86_64
+  # oc-mirror v2 remaps quay.io/openshift-release-dev/ocp-release under a
+  # shared "openshift" namespace (release-images), not the original
+  # openshift-release-dev path — verified against oc-mirror's own generated
+  # idms-oc-mirror.yaml (see install-config.yaml.j2's imageContentSources).
+  releaseImage: {{ mirror_registry_url }}/{{ mirror_base_path }}/openshift/release-images:{{ openshift_version }}.{{ ocp_patch_version }}-x86_64

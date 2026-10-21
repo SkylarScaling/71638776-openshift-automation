@@ -152,6 +152,42 @@
       ansible.builtin.debug:
         msg: "{{ _hive_ctrl_logs.stdout_lines }}"
 
+    # InstallImagesNotResolved=True means Hive's own imageset job (which
+    # resolves the ClusterImageSet's releaseImage before a ClusterProvision
+    # can even be created) failed or hung — usually a bad/unmirrored
+    # releaseImage pull spec, not a hive-controllers/validation problem. Call
+    # it out explicitly: the generic failure message below sends people
+    # looking at hive-controllers and ClusterDeployment validation instead.
+    - name: Surface imageset job pod details if image resolution failed
+      when: "'InstallImagesNotResolved=True' in _cd_no_prov_conditions.stdout"
+      block:
+        - name: Show imageset job pod events
+          ansible.builtin.shell: >
+            {{ bin_dir }}/oc get pods -n {{ ocp_cluster.name }}
+            --kubeconfig {{ target_kubeconfig }}
+            -l hive.openshift.io/imageset=true
+            -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'
+            | xargs -I{} {{ bin_dir }}/oc describe pod {} -n {{ ocp_cluster.name }} --kubeconfig {{ target_kubeconfig }}
+            2>/dev/null || true
+          register: _imageset_pod_details
+          changed_when: false
+
+        - name: Display imageset job pod details
+          ansible.builtin.debug:
+            msg: "{{ _imageset_pod_details.stdout_lines }}"
+
+        - name: Fail — releaseImage could not be resolved for {{ ocp_cluster.name }}
+          ansible.builtin.fail:
+            msg: >-
+              Hive's imageset job failed to pull/resolve the ClusterImageSet's
+              releaseImage (InstallImagesNotResolved=True) — see pod details
+              above, usually an ImagePullBackOff with a "repository not found"
+              or auth error. This means the releaseImage pull spec on the
+              ClusterImageSet doesn't match what's actually in the mirror
+              registry (check roles/acm/configure_disconnected_hub's
+              ClusterImageSet template against oc-mirror's generated
+              idms-oc-mirror.yaml), not a hive-controllers or validation issue.
+
     - name: Fail — Hive never started provisioning for {{ ocp_cluster.name }}
       ansible.builtin.fail:
         msg: >-

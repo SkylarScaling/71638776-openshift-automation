@@ -6,4 +6,10 @@ metadata:
     channel: stable
     visible: "true"
 spec:
+  # CAUTION: roles/acm/configure_disconnected_hub's initial-install ClusterImageSet
+  # template had this exact openshift-release-dev/ocp-release path wrong — oc-mirror v2
+  # actually pushes it under openshift/release-images. This template targets Quay
+  # post-migrate_mirror (quay_registry_url/quay_mirror_org, not mirror_registry_url/
+  # mirror_base_path), whose layout wasn't verified when that fix was made — confirm
+  # the real path in Quay (e.g. via `skopeo list-tags` or the Quay UI) before trusting this.
   releaseImage: {{ quay_registry_url }}/{{ quay_mirror_org }}/openshift-release-dev/ocp-release:{{ openshift_version }}.{{ ocp_patch_version }}-x86_64

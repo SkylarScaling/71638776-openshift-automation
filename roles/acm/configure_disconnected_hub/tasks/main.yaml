@@ -191,4 +191,4 @@
     msg:
       - "Disconnected hub configuration complete"
       - "ClusterImageSet: img{{ openshift_version }}.{{ ocp_patch_version }}-x86-64-appsub"
-      - "Release image: {{ mirror_registry_url }}/{{ mirror_base_path }}/openshift-release-dev/ocp-release:{{ openshift_version }}.{{ ocp_patch_version }}-x86_64"
+      - "Release image: {{ mirror_registry_url }}/{{ mirror_base_path }}/openshift/release-images:{{ openshift_version }}.{{ ocp_patch_version }}-x86_64"
