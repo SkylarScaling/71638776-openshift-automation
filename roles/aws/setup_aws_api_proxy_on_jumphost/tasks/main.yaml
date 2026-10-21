@@ -1,0 +1,128 @@
+---
+# ==============================================================================
+# AWS-API-ONLY FORWARD PROXY ON THE JUMPHOST
+#
+# Hive's spoke install pod runs on a hub node — inside the isolated Cluster
+# VPC, same as every other hub workload. That VPC has no route to IAM or
+# Route53 (neither has a VPC interface endpoint in any AWS region), so
+# openshift-install can't create a spoke's instance profiles or private
+# hosted zone from there.
+#
+# This stands up a squid forward proxy on the jumphost (which has normal
+# internet access), reachable from the Cluster VPC over the existing VPC
+# peering, restricted to *.amazonaws.com only — not general internet access.
+# Hive's ClusterDeployment points its install pod at this proxy via
+# spec.provisioning.installerEnv (HTTP_PROXY/HTTPS_PROXY), so the one-shot
+# install process can reach AWS's own APIs while the resulting cluster nodes
+# remain fully locked down post-install (this proxy is never wired into the
+# cluster itself, only the installer).
+# ==============================================================================
+
+- name: Ensure AWS CLI is available
+  ansible.builtin.include_role:
+    name: aws/ensure_aws_cli
+
+- name: Set AWS environment for all tasks
+  ansible.builtin.set_fact:
+    _aws_env:
+      AWS_ACCESS_KEY_ID: "{{ aws.aws_access_key_id }}"
+      AWS_SECRET_ACCESS_KEY: "{{ aws.aws_secret_access_key }}"
+      AWS_SESSION_TOKEN: ""
+
+# ------------------------------------------------------------------------------
+# SQUID CONTAINER
+# ------------------------------------------------------------------------------
+- name: Ensure squid config directory exists
+  ansible.builtin.file:
+    path: "{{ ansible_env.HOME }}/aws-api-proxy"
+    state: directory
+    mode: '0755'
+
+- name: Write squid configuration
+  ansible.builtin.template:
+    src: squid.conf.j2
+    dest: "{{ ansible_env.HOME }}/aws-api-proxy/squid.conf"
+    mode: '0644'
+  register: _aws_api_proxy_conf
+
+- name: Check if aws-api-proxy container is already running
+  ansible.builtin.shell: >
+    podman inspect aws-api-proxy --format '{% raw %}{{.State.Running}}{% endraw %}' 2>/dev/null || echo false
+  register: _aws_api_proxy_running
+  changed_when: false
+  failed_when: false
+  become: true
+
+- name: Pull squid image
+  ansible.builtin.command: podman pull {{ aws_api_proxy_image }}
+  changed_when: true
+  become: true
+  when: (_aws_api_proxy_running.stdout | trim) != 'true'
+
+- name: Remove stale aws-api-proxy container (config changed or not running)
+  ansible.builtin.command: podman rm -f aws-api-proxy
+  register: _aws_api_proxy_rm
+  changed_when: _aws_api_proxy_rm.rc == 0
+  failed_when: false
+  become: true
+  when: (_aws_api_proxy_running.stdout | trim) != 'true' or _aws_api_proxy_conf is changed
+
+- name: Run aws-api-proxy container
+  ansible.builtin.command: >
+    podman run -d --name aws-api-proxy
+    --restart=always
+    -p {{ aws_api_proxy_port }}:{{ aws_api_proxy_port }}
+    -v {{ ansible_env.HOME }}/aws-api-proxy/squid.conf:/etc/squid/squid.conf:ro,z
+    {{ aws_api_proxy_image }}
+  changed_when: true
+  become: true
+  when: (_aws_api_proxy_running.stdout | trim) != 'true' or _aws_api_proxy_conf is changed
+
+- name: Wait for aws-api-proxy to accept connections
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: "{{ aws_api_proxy_port }}"
+    timeout: 60
+
+# ------------------------------------------------------------------------------
+# SECURITY GROUP — allow the Cluster VPC in to the proxy port only
+# ------------------------------------------------------------------------------
+- name: Find jumphost security group
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-security-groups
+    --filters Name=group-name,Values={{ jumphost_security_group | default('disconnected-jumphost-sg') }}
+    --query 'SecurityGroups[0].GroupId'
+    --output text
+    --region {{ aws.aws_region }}
+  environment: "{{ _aws_env }}"
+  register: _aws_api_proxy_jumphost_sg
+  changed_when: false
+
+- name: Fail if jumphost security group was not found
+  ansible.builtin.fail:
+    msg: >-
+      Could not find security group '{{ jumphost_security_group | default('disconnected-jumphost-sg') }}'.
+      Run provision-jumphost.yaml first.
+  when: _aws_api_proxy_jumphost_sg.stdout | trim in ['None', '']
+
+- name: Allow the Cluster VPC ingress to the proxy port
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 authorize-security-group-ingress
+    --group-id {{ _aws_api_proxy_jumphost_sg.stdout | trim }}
+    --protocol tcp
+    --port {{ aws_api_proxy_port }}
+    --cidr {{ disconnected.network_lockdown.vpc_cidr | default('10.90.0.0/16') }}
+    --region {{ aws.aws_region }}
+  environment: "{{ _aws_env }}"
+  register: _aws_api_proxy_sg_rule
+  failed_when:
+    - _aws_api_proxy_sg_rule.rc != 0
+    - "'InvalidPermission.Duplicate' not in _aws_api_proxy_sg_rule.stderr"
+  changed_when: _aws_api_proxy_sg_rule.rc == 0
+
+- name: Display AWS API proxy summary
+  ansible.builtin.debug:
+    msg:
+      - "AWS API proxy ready on jumphost: {{ jumphost_private_ip }}:{{ aws_api_proxy_port }}"
+      - "Allowed destinations: {{ aws_api_proxy_allowed_domains | join(', ') }}"
+      - "Ingress allowed from Cluster VPC: {{ disconnected.network_lockdown.vpc_cidr | default('10.90.0.0/16') }}"

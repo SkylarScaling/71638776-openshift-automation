@@ -1,0 +1,10 @@
+---
+aws_api_proxy_image: "docker.io/ubuntu/squid:latest"
+aws_api_proxy_port: 3128
+# AWS has no VPC interface endpoint for IAM or Route53 in any commercial
+# region, so Hive's install pod (running on a hub node inside the isolated
+# Cluster VPC) has no private path to them. This forward proxy, reachable
+# over the existing jumphost VPC peering, gives it one — scoped to AWS's own
+# API domains only, not general internet access.
+aws_api_proxy_allowed_domains:
+  - .amazonaws.com

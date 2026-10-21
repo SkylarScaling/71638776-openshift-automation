@@ -26,30 +26,15 @@ the existing jumphost-mirrors-then-migrate-to-hub workflow. Set
   the public internet. The peering route (and the security-group egress that
   allows it) is only needed until `migrate_mirror` runs — at that point it's
   revoked, so the clusters become fully unreachable to/from the jumphost.
-- **Spoke provisioning model**: Hive's provisioner pod runs on a hub node —
-  inside the same isolated Cluster VPC as the cluster being installed, not on
-  the jumphost. That VPC has no route to IAM or Route53, and neither service
-  has an interface VPC endpoint in any AWS region, so `openshift-install` can
-  never create a spoke's instance profiles or hosted zone via Hive there
-  (confirmed live: 3h, zero AWS resources created, installer hung
-  indefinitely on a tagging API call). Under lockdown, spokes are instead
-  provisioned the same way the hub is — directly from the jumphost via
-  `ocp/aws_provision_disconnected_ocp_ipi` — then imported into ACM via
-  `acm/import_cluster`, mirroring the non-disconnected IPI-spokes flow in
-  `hub-spoke-ipi-setup.yaml`. Without lockdown the hub has normal internet
-  access, so Hive's provisioner pod can reach IAM/Route53 fine and the
-  original Hive/ACM (`acm/aws_provision_disconnected_cluster_via_acm`) path
-  is kept for that case.
 - **Private hosted zone / jumphost VPC association**: `publish: Internal`
   clusters get a private Route53 zone associated only with the Cluster VPC —
-  but `openshift-install` runs *on the jumphost*, outside that VPC, so
-  without an explicit second association it can't resolve
-  `api.<cluster>.<base_domain>` and bootstrap fails.
-  `ocp/aws_provision_disconnected_ocp_ipi` runs
-  `aws/associate_private_zone_with_jumphost` concurrently with the async
-  install job to add that association as soon as the zone exists. Needed for
-  the hub and, under lockdown, every spoke too, since both now install via
-  this same role.
+  but `openshift-install` for the hub runs *on the jumphost*, outside that
+  VPC, so without an explicit second association it can't resolve
+  `api.<cluster>.<base_domain>` and bootstrap fails. `ocp/aws_provision_disconnected_ocp_ipi`
+  runs `aws/associate_private_zone_with_jumphost` concurrently with the async
+  install job to add that association as soon as the zone exists. Only needed
+  for the hub — spokes are provisioned by Hive running inside the hub, which
+  is already in the Cluster VPC.
 - **Jumphost ingress to node security groups**: VPC peering and the routes it
   adds only establish a network *path* — they don't open anything. Security
   groups are a separate, stateful allow-list, and openshift-install's
@@ -84,15 +69,12 @@ the existing jumphost-mirrors-then-migrate-to-hub workflow. Set
   runs `openshift-install create manifests` then `ocp/create_manual_cloud_credentials`
   (extracts CredentialsRequests from the mirrored release image, writes a
   long-lived-key Secret per request into `manifests/`) before `create cluster`.
-  Under lockdown, spokes install via this same role and get the same fix for
-  free. `acm/create_manual_cloud_credentials_configmap` (writes the Secrets
-  into a ConfigMap referenced from the `ClusterDeployment`'s
-  `spec.provisioning.manifestsConfigMapRef`, Hive's equivalent of dropping
-  files into `manifests/`) only applies to the non-lockdown Hive/ACM spoke
-  path, where the hub has normal internet access and this is the sole
-  remaining gap.
-- **VPC Endpoints** (S3 gateway; EC2, ELB, STS, Service Quotas, Resource
-  Group Tagging API interface endpoints) in the
+  Hive-provisioned spokes (`roles/acm/aws_provision_disconnected_cluster_via_acm`)
+  land in the same isolated VPC and hit the identical failure; `acm/create_manual_cloud_credentials_configmap`
+  does the same extraction and writes the Secrets into a ConfigMap referenced
+  from the `ClusterDeployment`'s `spec.provisioning.manifestsConfigMapRef`
+  (Hive's equivalent of dropping files into `manifests/` before install).
+- **VPC Endpoints** (S3 gateway; EC2, ELB, STS interface endpoints) in the
   Cluster VPC, so the AWS cloud-provider and ELB/EBS CSI controllers work
   without any internet path. There is no Route53 interface endpoint —
   `com.amazonaws.<region>.route53` does not exist in any commercial AWS
@@ -112,14 +94,15 @@ the existing jumphost-mirrors-then-migrate-to-hub workflow. Set
   creates the `*.apps` CNAME in the installer-managed private hosted zone
   itself instead, from the jumphost (which has real AWS access, unlike the
   cluster), once the router's load balancer exists. Runs concurrently with
-  the async install job, same pattern as the private-zone-association and
-  jumphost-ingress roles. Under lockdown, spokes install via this same role
-  (`ocp/aws_provision_disconnected_ocp_ipi`) and get the same fix for free —
-  via `oc get infrastructure` against their own `metadata.json`, same as the
-  hub. The Hive-specific variant of this fix (IngressController manifest
-  riding along in the spoke's manifestsConfigMap, infra ID read from the
-  `ClusterDeployment`'s `spec.clusterMetadata.infraID` on the Hub) only
-  applies to the non-lockdown Hive/ACM spoke path.
+  the hub's async install job, same pattern as the private-zone-association
+  and jumphost-ingress roles. Hive-provisioned spokes hit the identical
+  `NoZones` failure and get the same fix: the IngressController manifest
+  rides along in the spoke's existing manifestsConfigMap (Hive's
+  `manifestsConfigMapRef` only accepts one), and the record is created
+  mid-install using the infra ID from the `ClusterDeployment`'s own
+  `status.infraID` (read from the Hub) rather than `oc get infrastructure`
+  against the spoke — the jumphost has no route to a spoke's API yet at
+  this point in the install.
 - **Security Group lockdown**: the installer always creates cluster node
   security groups with a broad `0.0.0.0/0` / all-protocols egress rule. A new
   role revokes that and replaces it with VPC-CIDR-only (plus jumphost-VPC-CIDR
