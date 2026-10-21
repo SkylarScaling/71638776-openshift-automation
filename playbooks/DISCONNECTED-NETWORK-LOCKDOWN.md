@@ -74,7 +74,26 @@ the existing jumphost-mirrors-then-migrate-to-hub workflow. Set
   does the same extraction and writes the Secrets into a ConfigMap referenced
   from the `ClusterDeployment`'s `spec.provisioning.manifestsConfigMapRef`
   (Hive's equivalent of dropping files into `manifests/` before install).
-- **VPC Endpoints** (S3 gateway; EC2, ELB, STS interface endpoints) in the
+- **AWS API proxy for Hive spoke installs**: Hive's spoke install pod runs on
+  a hub node — inside the same isolated Cluster VPC as the cluster being
+  installed, not on the jumphost. That VPC has no route to IAM or Route53 at
+  all (see above), so beyond CredentialsRequests, the install pod also can't
+  create the spoke's master/worker instance profiles or private hosted zone
+  (confirmed live: 3h, zero AWS resources created, installer hung
+  indefinitely on a tagging API call). `aws/setup_aws_api_proxy_on_jumphost`
+  runs a squid forward proxy on the jumphost, reachable from the Cluster VPC
+  over the existing peering, restricted to `*.amazonaws.com` only — not
+  general internet access. The spoke's `ClusterDeployment` points its
+  install pod at this proxy via `spec.provisioning.installerEnv`
+  (HTTP_PROXY/HTTPS_PROXY/NO_PROXY), so the one-shot install process can
+  reach AWS's own APIs directly, matching the real target topology (ACM Hub
+  provisions spokes directly, even across sites) without ever wiring this
+  proxy into the resulting cluster itself — once installed, spoke nodes stay
+  exactly as locked down as before. The hub doesn't need this: its own
+  `openshift-install` runs directly on the jumphost, which already has full
+  internet access.
+- **VPC Endpoints** (S3 gateway; EC2, ELB, STS, Service Quotas, Resource
+  Group Tagging API interface endpoints) in the
   Cluster VPC, so the AWS cloud-provider and ELB/EBS CSI controllers work
   without any internet path. There is no Route53 interface endpoint —
   `com.amazonaws.<region>.route53` does not exist in any commercial AWS
@@ -100,8 +119,8 @@ the existing jumphost-mirrors-then-migrate-to-hub workflow. Set
   rides along in the spoke's existing manifestsConfigMap (Hive's
   `manifestsConfigMapRef` only accepts one), and the record is created
   mid-install using the infra ID from the `ClusterDeployment`'s own
-  `status.infraID` (read from the Hub) rather than `oc get infrastructure`
-  against the spoke — the jumphost has no route to a spoke's API yet at
+  `spec.clusterMetadata.infraID` (read from the Hub) rather than `oc get
+  infrastructure` against the spoke — the jumphost has no route to a spoke's API yet at
   this point in the install.
 - **Security Group lockdown**: the installer always creates cluster node
   security groups with a broad `0.0.0.0/0` / all-protocols egress rule. A new
