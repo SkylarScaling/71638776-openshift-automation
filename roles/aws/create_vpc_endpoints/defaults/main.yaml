@@ -17,3 +17,10 @@ network_lockdown_interface_endpoint_services:
   # 25+ minutes per install. The role's own discover-and-skip logic handles
   # it gracefully if a region doesn't offer this endpoint either.
   - servicequotas
+  # Hive's provisioner pod (openshift-install) runs on a hub node, which is
+  # itself inside the locked-down Cluster VPC for spoke installs — not on
+  # the jumphost. The installer's cleanup/tagging lookups (resourcegroups-
+  # taggingapi) need this endpoint or they hang indefinitely retrying.
+  # com.amazonaws.<region>.tagging exists in every commercial region
+  # (confirmed via describe-vpc-endpoint-services), unlike iam/route53.
+  - tagging
