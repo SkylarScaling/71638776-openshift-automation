@@ -27,6 +27,19 @@ spec:
 {% if disconnected.network_lockdown.enabled | default(true) %}
     manifestsConfigMapRef:
       name: {{ ocp_cluster.name }}-manual-creds
+    # The Cluster VPC has no route to IAM or Route53 (no VPC endpoint exists
+    # for either, in any region) — without this, the install pod can never
+    # create the spoke's instance profiles or private hosted zone. Routes the
+    # one-shot install process only through aws/setup_aws_api_proxy_on_jumphost
+    # (restricted to *.amazonaws.com); the resulting cluster's own nodes never
+    # see this proxy and stay fully locked down post-install.
+    installerEnv:
+      - name: HTTP_PROXY
+        value: "http://{{ jumphost_private_ip }}:{{ aws_api_proxy_port | default(3128) }}"
+      - name: HTTPS_PROXY
+        value: "http://{{ jumphost_private_ip }}:{{ aws_api_proxy_port | default(3128) }}"
+      - name: NO_PROXY
+        value: "{{ ([disconnected.network_lockdown.vpc_cidr | default('10.90.0.0/16'), '.svc', '.cluster.local', 'localhost', '127.0.0.1', '169.254.169.254']) | join(',') }}"
 {% endif %}
   pullSecretRef:
     name: {{ ocp_cluster.name }}-pull-secret

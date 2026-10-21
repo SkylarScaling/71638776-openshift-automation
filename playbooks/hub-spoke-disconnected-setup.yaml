@@ -32,6 +32,11 @@
         name: aws/provision_cluster_vpc
       when: disconnected.network_lockdown.enabled | default(true)
 
+    - name: Setup AWS-API-only forward proxy on jumphost for Hive spoke installs (network lockdown)
+      ansible.builtin.include_role:
+        name: aws/setup_aws_api_proxy_on_jumphost
+      when: disconnected.network_lockdown.enabled | default(true)
+
     - name: Print jumphost preparation summary
       ansible.builtin.debug:
         msg:
