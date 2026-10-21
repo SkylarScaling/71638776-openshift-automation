@@ -10,3 +10,10 @@ network_lockdown_interface_endpoint_services:
   - ec2
   - elasticloadbalancing
   - sts
+  # openshift-install's platform quota check calls the AWS Service Quotas
+  # API during every install (hub and spoke); without this, the SDK burns
+  # its full retry/backoff budget against an unreachable endpoint before
+  # treating the check as non-fatal and continuing — confirmed live costing
+  # 25+ minutes per install. The role's own discover-and-skip logic handles
+  # it gracefully if a region doesn't offer this endpoint either.
+  - servicequotas
