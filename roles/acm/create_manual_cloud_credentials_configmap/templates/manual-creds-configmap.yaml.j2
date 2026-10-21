@@ -4,7 +4,7 @@ metadata:
   name: {{ ocp_cluster.name }}-manual-creds
   namespace: {{ ocp_cluster.name }}
 data:
-{% for f in cred_request_files %}
+{% for f in cred_request_files.files %}
 {% set cr = lookup('file', f.path) | from_yaml %}
 {# Feature-gated CredentialsRequests (e.g. the cluster-api provider's, in
    namespace openshift-cluster-api) target namespaces never created on a

@@ -29,9 +29,19 @@
     patterns: "*.yaml"
   register: cred_request_files
 
-- name: Apply manifestsConfigMap carrying long-lived credential Secrets
-  ansible.builtin.shell:
-    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
-    stdin: "{{ lookup('template', 'manual-creds-configmap.yaml.j2') }}"
-  changed_when: true
+# Written to disk (no_log, since it carries AWS keys) rather than piped
+# through stdin, so the `oc apply` below can run without no_log and any
+# real failure (YAML/template error, API rejection, etc.) is actually
+# visible in the log instead of being swallowed as "censored".
+- name: Render manifestsConfigMap carrying long-lived credential Secrets
+  ansible.builtin.copy:
+    content: "{{ lookup('template', 'manual-creds-configmap.yaml.j2') }}"
+    dest: "{{ manual_creds_work_dir }}/manual-creds-configmap.yaml"
+    mode: '0600'
   no_log: true
+
+- name: Apply manifestsConfigMap carrying long-lived credential Secrets
+  ansible.builtin.command: >
+    {{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }}
+    -f {{ manual_creds_work_dir }}/manual-creds-configmap.yaml
+  changed_when: true
