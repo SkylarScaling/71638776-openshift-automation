@@ -534,29 +534,74 @@
         name: aws/create_private_subnets
       when: disconnected.network_lockdown.enabled | default(true)
 
-    - name: Apply Hive Provisioning Manifests to Hub (Disconnected)
+    # Under network lockdown, Hive's provisioner pod runs on a hub node —
+    # inside the same isolated Cluster VPC as the cluster being installed,
+    # not on the jumphost. That VPC has no route to IAM or Route53, and
+    # neither service has an interface VPC endpoint in any AWS region, so
+    # openshift-install can never create the spoke's instance profiles or
+    # hosted zone via Hive there (confirmed live: 3h, zero AWS resources
+    # created, installer hung on a tagging API call). Provision the spoke
+    # directly from the jumphost instead — the same IPI path already proven
+    # for the hub — then import it into ACM, exactly like the non-disconnected
+    # IPI-spokes flow (hub-spoke-ipi-setup.yaml) does.
+    #
+    # Without lockdown the hub has normal internet access, so Hive's
+    # provisioner pod can reach IAM/Route53 fine — keep the original path.
+    - name: Request Elastic IP Quota Increase for Spoke
+      ansible.builtin.include_role:
+        name: aws/aws_eip_quota
+      when: disconnected.network_lockdown.enabled | default(true)
+
+    - name: Provision Spoke via Disconnected IPI (network lockdown)
+      ansible.builtin.include_role:
+        name: ocp/aws_provision_disconnected_ocp_ipi
+      when: disconnected.network_lockdown.enabled | default(true)
+
+    - name: Set Spoke Kubeconfig Path
+      ansible.builtin.set_fact:
+        spoke_kubeconfig: "{{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig"
+      when: disconnected.network_lockdown.enabled | default(true)
+
+    - name: Import Spoke into the Hub (network lockdown)
+      ansible.builtin.include_role:
+        name: acm/import_cluster
+      vars:
+        hub_kubeconfig: "{{ hub_kubeconfig }}"
+        spoke_kubeconfig: "{{ spoke_kubeconfig }}"
+        cluster_name: "{{ ocp_cluster.name }}"
+        parent_clusterset: "{{ ocp_cluster.parent_clusterset }}"
+      when: disconnected.network_lockdown.enabled | default(true)
+
+    - name: Ensure Observability Namespace exists on the Spoke (network lockdown)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ spoke_kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: open-cluster-management-observability
+      when: disconnected.network_lockdown.enabled | default(true)
+
+    - name: Apply Hive Provisioning Manifests to Hub (Disconnected, no lockdown)
       ansible.builtin.include_role:
         name: acm/aws_provision_disconnected_cluster_via_acm
       vars:
         target_kubeconfig: "{{ hub_kubeconfig }}"
         parent_clusterset: "{{ ocp_cluster.parent_clusterset }}"
+      when: not (disconnected.network_lockdown.enabled | default(true))
 
-    - name: Extract Kubeconfig for Managed Cluster
+    - name: Extract Kubeconfig for Managed Cluster (no lockdown)
       ansible.builtin.include_role:
         name: acm/admin_extract_spoke_credentials
       vars:
         target_kubeconfig: "{{ hub_kubeconfig }}"
+      when: not (disconnected.network_lockdown.enabled | default(true))
 
-    - name: Set Spoke Kubeconfig Path
+    - name: Set Spoke Kubeconfig Path (no lockdown)
       ansible.builtin.set_fact:
         spoke_kubeconfig: "{{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig"
-
-    - name: Allow the jumphost ingress to the Spoke's node security groups (network lockdown)
-      ansible.builtin.include_role:
-        name: aws/allow_jumphost_ingress_to_nodes
-      vars:
-        target_kubeconfig: "{{ spoke_kubeconfig }}"
-      when: disconnected.network_lockdown.enabled | default(true)
+      when: not (disconnected.network_lockdown.enabled | default(true))
 
     - name: Apply Disconnected Cluster Configuration to Spoke (IDMS, CatalogSource, Pull Secret)
       ansible.builtin.include_role:
