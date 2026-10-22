@@ -59,6 +59,31 @@
     name: acm/create_manual_cloud_credentials_configmap
   when: disconnected.network_lockdown.enabled | default(true)
 
+# The install pod's HTTP_PROXY/HTTPS_PROXY env vars (below) apply to every
+# outbound call it makes, not just AWS API calls — including its own
+# in-cluster Kubernetes API calls (hiveutil install-manager talks to the hub
+# apiserver by service-network IP before it ever touches AWS). Without the
+# hub's actual service/cluster network CIDRs in NO_PROXY, squid denies that
+# first call with a 403 and the install pod dies before setting infraID
+# (confirmed live — hardcoding a guessed CIDR here previously broke this).
+- name: Discover hub service/cluster network CIDRs for NO_PROXY scoping (network lockdown)
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get network.config cluster
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.spec.serviceNetwork[*]} {.spec.clusterNetwork[*].cidr}'
+  register: _hub_network_cidrs
+  changed_when: false
+  when: disconnected.network_lockdown.enabled | default(true)
+
+- name: Set spoke installer NO_PROXY fact (network lockdown)
+  ansible.builtin.set_fact:
+    spoke_installer_no_proxy: >-
+      {{ ([disconnected.network_lockdown.vpc_cidr | default('10.90.0.0/16'), jumphost_private_ip]
+          + _hub_network_cidrs.stdout.split()
+          + ['.svc', '.cluster.local', 'localhost', '127.0.0.1', '169.254.169.254'])
+         | select('ne', '') | join(',') }}
+  when: disconnected.network_lockdown.enabled | default(true)
+
 # installAttemptsLimit: 1 means Hive sets ProvisionStopped=True after the single
 # attempt fails. oc apply leaves the ClusterDeployment in-place on re-runs, so
 # Hive sees the limit already exhausted and never creates a new ClusterProvision.
@@ -306,18 +331,60 @@
 # its own additionalPrinterColumns; status.infraID doesn't exist on this
 # object at all, so the old path could never have succeeded regardless of
 # how long it polled.
-- name: Wait for Hive to report the spoke's infra ID
+- name: Wait for Hive to report the spoke's infra ID (or stop early on ProvisionStopped)
   ansible.builtin.shell: >
     {{ bin_dir }}/oc get clusterdeployment {{ ocp_cluster.name }}
     -n {{ ocp_cluster.name }}
     --kubeconfig {{ target_kubeconfig }}
-    -o jsonpath='{.spec.clusterMetadata.infraID}' 2>/dev/null || true
+    -o jsonpath='{.spec.clusterMetadata.infraID}|{.status.conditions[?(@.type=="ProvisionStopped")].status}'
+    2>/dev/null || true
   register: _spoke_infra_id
   changed_when: false
-  until: _spoke_infra_id.stdout | trim != ''
+  until: >
+    (_spoke_infra_id.stdout.split('|')[0] | trim != '') or
+    (_spoke_infra_id.stdout.split('|')[1] | default('') | trim == 'True')
   retries: 60
   delay: 10
   when: disconnected.network_lockdown.enabled | default(true)
+
+# Fail fast instead of letting Ansible keep polling a ClusterDeployment that
+# Hive already gave up on — surface the failed provisioner pod's logs
+# directly instead of a generic timeout (this is exactly how the NO_PROXY
+# scoping bug for the install pod's in-cluster API calls first surfaced:
+# ProvisionStopped within ~1 minute, but the old loop polled for 10).
+- name: Collect diagnostics if Hive stopped provisioning before reporting an infra ID
+  when:
+    - disconnected.network_lockdown.enabled | default(true)
+    - (_spoke_infra_id.stdout.split('|')[1] | default('') | trim) == 'True'
+    - (_spoke_infra_id.stdout.split('|')[0] | trim) == ''
+  block:
+    - name: Get the most recent ClusterProvision's provisioner pod name
+      ansible.builtin.shell: >
+        {{ bin_dir }}/oc get pod -n {{ ocp_cluster.name }}
+        --kubeconfig {{ target_kubeconfig }}
+        -l hive.openshift.io/cluster-deployment-name={{ ocp_cluster.name }}
+        -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null || true
+      register: _early_fail_pod_name
+      changed_when: false
+
+    - name: Collect that pod's logs
+      ansible.builtin.shell: >
+        {{ bin_dir }}/oc logs {{ _early_fail_pod_name.stdout }}
+        -n {{ ocp_cluster.name }}
+        --kubeconfig {{ target_kubeconfig }}
+        --all-containers --tail=100 2>&1 || true
+      register: _early_fail_pod_logs
+      changed_when: false
+      when: _early_fail_pod_name.stdout | default('') != ''
+
+    - name: Fail — Hive stopped provisioning {{ ocp_cluster.name }} before it ever reported an infra ID
+      ansible.builtin.fail:
+        msg: >-
+          ClusterDeployment {{ ocp_cluster.name }} is ProvisionStopped and
+          never set spec.clusterMetadata.infraID — the install pod died
+          before it got far enough to create any AWS infrastructure. Most
+          recent provisioner pod logs:
+          {{ _early_fail_pod_logs.stdout_lines | default(['(no logs)']) }}
 
 - name: Ensure local working directory exists for the spoke
   ansible.builtin.file:

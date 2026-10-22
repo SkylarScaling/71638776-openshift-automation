@@ -39,7 +39,7 @@ spec:
       - name: HTTPS_PROXY
         value: "http://{{ jumphost_private_ip }}:{{ aws_api_proxy_port | default(3128) }}"
       - name: NO_PROXY
-        value: "{{ ([disconnected.network_lockdown.vpc_cidr | default('10.90.0.0/16'), '.svc', '.cluster.local', 'localhost', '127.0.0.1', '169.254.169.254']) | join(',') }}"
+        value: "{{ spoke_installer_no_proxy }}"
 {% endif %}
   pullSecretRef:
     name: {{ ocp_cluster.name }}-pull-secret
