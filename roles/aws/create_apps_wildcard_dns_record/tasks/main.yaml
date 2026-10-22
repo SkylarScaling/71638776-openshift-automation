@@ -85,27 +85,90 @@
   delay: 20
   changed_when: false
 
-- name: Wait for the router's load balancer to exist
+# Matching by DNS name alone can match a leaked zone from an unrelated,
+# orphaned cluster attempt that happened to reuse this same cluster name —
+# this is exactly what let a stale zone silently satisfy this wait once
+# (confirmed live, before roles/aws/cleanup_orphaned_cluster_resources
+# existed to actually remove such zones). Verify the tag too.
+- name: Verify the matched hosted zone belongs to this infra ID
   ansible.builtin.command: >
-    {{ bin_dir }}/aws resourcegroupstaggingapi get-resources
+    {{ bin_dir }}/aws route53 list-tags-for-resource
+    --resource-type hostedzone
+    --resource-id {{ _awd_zone_lookup.stdout | trim | regex_replace('^/hostedzone/', '') }}
+    --query "ResourceTagSet.Tags[?Key=='kubernetes.io/cluster/{{ _awd_infra_id }}'].Value | [0]"
+    --output text
+    --region {{ aws.aws_region }}
+  environment: "{{ _awd_aws_env }}"
+  register: _awd_zone_tag_check
+  changed_when: false
+
+- name: Fail if the matched hosted zone is not tagged for this infra ID
+  ansible.builtin.fail:
+    msg: >-
+      Found a private hosted zone named {{ _awd_private_zone_domain }}
+      ({{ _awd_zone_lookup.stdout | trim }}) but it is not tagged
+      kubernetes.io/cluster/{{ _awd_infra_id }}=owned — this looks like a
+      leftover zone from a different (likely orphaned) cluster attempt that
+      reused the same domain name, not the cluster currently being
+      installed. Refusing to create a DNS record in it.
+  when: (_awd_zone_tag_check.stdout | default('') | trim) != 'owned'
+
+# Combine the LB lookup with a check of the owning ClusterDeployment's
+# ProvisionStopped condition (when the caller is a Hive spoke install, i.e.
+# _awd_clusterdeployment_name is set) so a dead install can't burn the full
+# 60-minute timeout here — confirmed live: a Hive attempt that failed right
+# after infra creation left this polling a router LB that would never exist.
+# Not applicable to the hub's own IPI install (no ClusterDeployment), where
+# this var is left unset and the check is skipped.
+- name: Wait for the router's load balancer to exist (or the owning install to stop)
+  ansible.builtin.shell: >
+    lb_arn=$({{ bin_dir }}/aws resourcegroupstaggingapi get-resources
     --tag-filters Key=kubernetes.io/cluster/{{ _awd_infra_id }},Values=owned Key=kubernetes.io/service-name,Values=openshift-ingress/router-default
     --resource-type-filters elasticloadbalancing
     --query 'ResourceTagMappingList[0].ResourceARN'
     --output text
-    --region {{ aws.aws_region }}
+    --region {{ aws.aws_region }});
+    {% if _awd_clusterdeployment_name is defined %}
+    cd_stopped=$({{ bin_dir }}/oc get clusterdeployment {{ _awd_clusterdeployment_name }}
+    -n {{ _awd_clusterdeployment_namespace | default(_awd_clusterdeployment_name) }}
+    --kubeconfig {{ _awd_clusterdeployment_kubeconfig }}
+    -o jsonpath='{.status.conditions[?(@.type=="ProvisionStopped")].status}' 2>/dev/null || true);
+    {% else %}
+    cd_stopped="";
+    {% endif %}
+    echo "${lb_arn}|${cd_stopped}"
   environment: "{{ _awd_aws_env }}"
   register: _awd_router_lb_arn
-  until: _awd_router_lb_arn.stdout | trim not in ['None', '']
+  until: >
+    (_awd_router_lb_arn.stdout.split('|')[0] | trim) not in ['None', ''] or
+    (_awd_router_lb_arn.stdout.split('|')[1] | default('') | trim) == 'True'
   retries: 180
   delay: 20
   changed_when: false
+
+- name: Fail if the owning install stopped before the router's load balancer ever appeared
+  ansible.builtin.fail:
+    msg: >-
+      ClusterDeployment {{ _awd_clusterdeployment_name | default('') }} is
+      ProvisionStopped and no router load balancer for infra ID
+      {{ _awd_infra_id }} ever appeared — the install failed before ingress
+      came up. Check the ClusterDeployment/ClusterProvision for the real
+      failure instead of this generic timeout.
+  when:
+    - _awd_clusterdeployment_name is defined
+    - (_awd_router_lb_arn.stdout.split('|')[0] | trim) in ['None', '']
+    - (_awd_router_lb_arn.stdout.split('|')[1] | default('') | trim) == 'True'
+
+- name: Set router load balancer ARN fact
+  ansible.builtin.set_fact:
+    _awd_router_lb_arn_value: "{{ _awd_router_lb_arn.stdout.split('|')[0] | trim }}"
 
 - name: Set router load balancer facts
   ansible.builtin.set_fact:
     # Classic ELB ARNs are .../loadbalancer/<name>; NLB/ALB ARNs are
     # .../loadbalancer/net/<name>/<id> or .../loadbalancer/app/<name>/<id>.
-    _awd_router_lb_is_classic: "{{ '/net/' not in _awd_router_lb_arn.stdout and '/app/' not in _awd_router_lb_arn.stdout }}"
-    _awd_router_lb_name: "{{ _awd_router_lb_arn.stdout | trim | regex_replace('^.*loadbalancer/(net/|app/)?', '') | regex_replace('/[^/]+$', '') if ('/net/' in _awd_router_lb_arn.stdout or '/app/' in _awd_router_lb_arn.stdout) else (_awd_router_lb_arn.stdout | trim | regex_replace('^.*loadbalancer/', '')) }}"
+    _awd_router_lb_is_classic: "{{ '/net/' not in _awd_router_lb_arn_value and '/app/' not in _awd_router_lb_arn_value }}"
+    _awd_router_lb_name: "{{ _awd_router_lb_arn_value | regex_replace('^.*loadbalancer/(net/|app/)?', '') | regex_replace('/[^/]+$', '') if ('/net/' in _awd_router_lb_arn_value or '/app/' in _awd_router_lb_arn_value) else (_awd_router_lb_arn_value | regex_replace('^.*loadbalancer/', '')) }}"
 
 - name: Get Classic ELB DNS name
   ansible.builtin.command: >
@@ -122,7 +185,7 @@
 - name: Get NLB/ALB DNS name
   ansible.builtin.command: >
     {{ bin_dir }}/aws elbv2 describe-load-balancers
-    --load-balancer-arns {{ _awd_router_lb_arn.stdout | trim }}
+    --load-balancer-arns {{ _awd_router_lb_arn_value }}
     --query 'LoadBalancers[0].DNSName'
     --output text
     --region {{ aws.aws_region }}
