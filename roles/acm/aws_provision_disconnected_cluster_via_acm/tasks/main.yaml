@@ -93,7 +93,7 @@
     {{ bin_dir }}/oc get clusterdeployment {{ ocp_cluster.name }}
     -n {{ ocp_cluster.name }}
     --kubeconfig {{ target_kubeconfig }}
-    -o jsonpath='{.status.conditions[?(@.type=="ProvisionStopped")].status}'
+    -o jsonpath='{.status.conditions[?(@.type=="ProvisionStopped")].status}|{.spec.clusterMetadata.infraID}'
     2>/dev/null || true
   register: _cd_stopped_check
   changed_when: false
@@ -101,16 +101,31 @@
 # Hive's AWS deprovision runs in-process inside hive-controllers (no separate
 # pod), which — under lockdown — has no more route to IAM/EC2/Route53 than
 # anything else on a hub node. `oc delete` would hang indefinitely waiting on
-# the finalizer while hive-controllers' cleanup call times out. Set
-# preserveOnDelete first (a mutable field) so Hive drops the finalizer without
-# attempting cloud cleanup — safe here because the cluster never finished
-# installing, so there's nothing real at stake except possibly-orphaned AWS
-# resources from the failed attempt, which may need manual cleanup under
-# lockdown. (Giving hive-controllers itself a proxied path instead was
-# considered and rejected: HTTP_PROXY/HTTPS_PROXY env vars would apply to
-# ALL of its outbound calls, including to the Kubernetes API server, and
-# getting NO_PROXY scoped safely enough to not break that is far riskier
-# than accepting manual AWS cleanup here.)
+# the finalizer while hive-controllers' cleanup call times out.
+#
+# Clean up the real AWS resources ourselves first (from the jumphost, which
+# has actual AWS access), then set preserveOnDelete (a mutable field) so
+# Hive drops the finalizer without attempting its own cleanup. Skipping the
+# cleanup step entirely (relying on preserveOnDelete alone) was tried and
+# caused a real incident: a leaked private hosted zone from one failed
+# attempt made every subsequent attempt fail with "ConflictingDomainExists"
+# for over a day before it was noticed, while the leaked EC2
+# instances/load balancer kept running. (Giving hive-controllers itself a
+# proxied path instead was considered and rejected: HTTP_PROXY/HTTPS_PROXY
+# env vars would apply to ALL of its outbound calls, including to the
+# Kubernetes API server, and getting NO_PROXY scoped safely enough to not
+# break that is far riskier than running this cleanup ourselves.)
+- name: Clean up orphaned AWS resources from the stopped attempt (network lockdown)
+  ansible.builtin.include_role:
+    name: aws/cleanup_orphaned_cluster_resources
+  vars:
+    _cleanup_infra_id: "{{ _cd_stopped_check.stdout.split('|')[1] | default('') | trim }}"
+    _cleanup_cluster_name: "{{ ocp_cluster.name }}"
+  when:
+    - (_cd_stopped_check.stdout.split('|')[0] | default('')) == "True"
+    - disconnected.network_lockdown.enabled | default(true)
+    - (_cd_stopped_check.stdout.split('|')[1] | default('') | trim) != ''
+
 - name: Set preserveOnDelete on stopped ClusterDeployment (network lockdown — avoid a hung deprovision)
   ansible.builtin.shell: >
     {{ bin_dir }}/oc patch clusterdeployment {{ ocp_cluster.name }}
@@ -119,7 +134,7 @@
     --type=merge -p '{"spec":{"preserveOnDelete":true}}'
   changed_when: true
   when:
-    - _cd_stopped_check.stdout == "True"
+    - (_cd_stopped_check.stdout.split('|')[0] | default('')) == "True"
     - disconnected.network_lockdown.enabled | default(true)
 
 - name: Delete stopped ClusterDeployment so Hive can provision fresh
@@ -129,7 +144,7 @@
     --kubeconfig {{ target_kubeconfig }}
     --wait=true --timeout=5m
   changed_when: true
-  when: _cd_stopped_check.stdout == "True"
+  when: (_cd_stopped_check.stdout.split('|')[0] | default('')) == "True"
 
 - name: Create ClusterDeployment object
   ansible.builtin.shell:
@@ -155,7 +170,7 @@
         {{ bin_dir }}/oc get clusterdeployment {{ ocp_cluster.name }}
         -n {{ ocp_cluster.name }}
         --kubeconfig {{ target_kubeconfig }}
-        -o jsonpath='{.status.installed}' 2>/dev/null || true
+        -o jsonpath='{.status.installed}|{.spec.clusterMetadata.infraID}' 2>/dev/null || true
       register: _cd_installed_check
       changed_when: false
 
@@ -167,7 +182,21 @@
           cluster that already finished installing. Resolve the desired spec
           change manually (e.g. patch a supported field, or deliberately
           delete the ClusterDeployment yourself if a rebuild is intended).
-      when: _cd_installed_check.stdout | trim == 'true'
+      when: (_cd_installed_check.stdout.split('|')[0] | trim) == 'true'
+
+    # See the matching comment on the ProvisionStopped path above — cleaning
+    # up for real, rather than relying on preserveOnDelete alone, is what
+    # prevents a leaked private hosted zone from blocking every future
+    # attempt with ConflictingDomainExists.
+    - name: Clean up orphaned AWS resources before recreating (network lockdown)
+      ansible.builtin.include_role:
+        name: aws/cleanup_orphaned_cluster_resources
+      vars:
+        _cleanup_infra_id: "{{ _cd_installed_check.stdout.split('|')[1] | default('') | trim }}"
+        _cleanup_cluster_name: "{{ ocp_cluster.name }}"
+      when:
+        - disconnected.network_lockdown.enabled | default(true)
+        - (_cd_installed_check.stdout.split('|')[1] | default('') | trim) != ''
 
     - name: Set preserveOnDelete on the not-yet-installed ClusterDeployment (network lockdown — avoid a hung deprovision)
       ansible.builtin.shell: >
@@ -405,6 +434,9 @@
     name: aws/create_apps_wildcard_dns_record
   vars:
     _metadata_json_path: "{{ install_dir }}/{{ ocp_cluster.name }}/metadata-infraid-only.json"
+    _awd_clusterdeployment_kubeconfig: "{{ target_kubeconfig }}"
+    _awd_clusterdeployment_name: "{{ ocp_cluster.name }}"
+    _awd_clusterdeployment_namespace: "{{ ocp_cluster.name }}"
   when: disconnected.network_lockdown.enabled | default(true)
 
 - name: Wait for OpenShift cluster installation to complete or fail (Takes 35-45+ minutes)

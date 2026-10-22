@@ -1,0 +1,200 @@
+---
+# ==============================================================================
+# CLEAN UP ORPHANED AWS RESOURCES FROM A FAILED/ABANDONED CLUSTER ATTEMPT
+#
+# Hive's AWS deprovision runs in-process inside hive-controllers, which has
+# no route to AWS under network lockdown — `oc delete clusterdeployment`
+# would hang forever waiting on a finalizer that hive-controllers can never
+# clear. The call site works around that by patching spec.preserveOnDelete
+# first, but that alone just abandons the real AWS resources — confirmed
+# live: a leaked private hosted zone from one failed attempt caused
+# "ConflictingDomainExists" on every subsequent retry, because AWS refuses a
+# second private hosted zone for the same domain on the same VPC.
+#
+# This role does the cleanup itself, directly from the jumphost (which has
+# real AWS access, unlike hive-controllers): terminate EC2 instances, delete
+# load balancers, and delete the private hosted zone — all scoped to this
+# attempt's infra ID via the kubernetes.io/cluster/<infraID>=owned tag, so it
+# can never touch another cluster's resources.
+#
+# Requires: _cleanup_infra_id, _cleanup_cluster_name
+# ==============================================================================
+
+- name: Ensure AWS CLI is available
+  ansible.builtin.include_role:
+    name: aws/ensure_aws_cli
+
+- name: Set AWS environment for all tasks
+  ansible.builtin.set_fact:
+    _cleanup_aws_env:
+      AWS_ACCESS_KEY_ID: "{{ aws.aws_access_key_id }}"
+      AWS_SECRET_ACCESS_KEY: "{{ aws.aws_secret_access_key }}"
+      AWS_SESSION_TOKEN: ""
+
+# ------------------------------------------------------------------------------
+# EC2 INSTANCES
+# ------------------------------------------------------------------------------
+- name: Find EC2 instances for this infra ID
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-instances
+    --filters "Name=tag:kubernetes.io/cluster/{{ _cleanup_infra_id }},Values=owned" "Name=instance-state-name,Values=pending,running,stopping,stopped"
+    --query 'Reservations[].Instances[].InstanceId'
+    --output text
+    --region {{ aws.aws_region }}
+  environment: "{{ _cleanup_aws_env }}"
+  register: _cleanup_instances
+  changed_when: false
+
+- name: Terminate EC2 instances for this infra ID
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 terminate-instances
+    --instance-ids {{ _cleanup_instances.stdout }}
+    --region {{ aws.aws_region }}
+  environment: "{{ _cleanup_aws_env }}"
+  when: _cleanup_instances.stdout | trim != ''
+  changed_when: true
+
+# ------------------------------------------------------------------------------
+# LOAD BALANCERS (classic and v2/NLB/ALB)
+# ------------------------------------------------------------------------------
+- name: Find load balancers for this infra ID
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws resourcegroupstaggingapi get-resources
+    --tag-filters "Key=kubernetes.io/cluster/{{ _cleanup_infra_id }},Values=owned"
+    --resource-type-filters elasticloadbalancing
+    --query 'ResourceTagMappingList[].ResourceARN'
+    --output text
+    --region {{ aws.aws_region }}
+  environment: "{{ _cleanup_aws_env }}"
+  register: _cleanup_lbs
+  changed_when: false
+
+- name: Delete ELBv2 load balancers (NLB/ALB) for this infra ID
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws elbv2 delete-load-balancer
+    --load-balancer-arn {{ item }}
+    --region {{ aws.aws_region }}
+  environment: "{{ _cleanup_aws_env }}"
+  loop: "{{ _cleanup_lbs.stdout.split() }}"
+  loop_control:
+    label: "{{ item }}"
+  when: "':loadbalancer/net/' in item or ':loadbalancer/app/' in item"
+  failed_when: false
+  changed_when: true
+
+- name: Delete classic ELBs for this infra ID
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws elb delete-load-balancer
+    --load-balancer-name {{ item.split('/') | last }}
+    --region {{ aws.aws_region }}
+  environment: "{{ _cleanup_aws_env }}"
+  loop: "{{ _cleanup_lbs.stdout.split() }}"
+  loop_control:
+    label: "{{ item }}"
+  when:
+    - "':loadbalancer/' in item"
+    - "':loadbalancer/net/' not in item"
+    - "':loadbalancer/app/' not in item"
+  failed_when: false
+  changed_when: true
+
+# ------------------------------------------------------------------------------
+# PRIVATE HOSTED ZONE — the resource that actually blocks retries if leaked
+# (AWS refuses a second private zone for the same domain on the same VPC).
+# Tag-verified before deletion so a DNS-name match alone can never delete
+# someone else's zone (the exact false-pass bug that let this go unnoticed).
+# ------------------------------------------------------------------------------
+- name: Find the private hosted zone for this cluster
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws route53 list-hosted-zones-by-name
+    --dns-name {{ _cleanup_cluster_name }}.{{ base_domain }}
+    --query "HostedZones[?Name=='{{ _cleanup_cluster_name }}.{{ base_domain }}.'].Id | [0]"
+    --output text
+    --region {{ aws.aws_region }}
+  environment: "{{ _cleanup_aws_env }}"
+  register: _cleanup_zone_id_raw
+  changed_when: false
+
+- name: Set cleanup zone ID fact
+  ansible.builtin.set_fact:
+    _cleanup_zone_id: "{{ _cleanup_zone_id_raw.stdout | trim | regex_replace('^/hostedzone/', '') }}"
+  when: _cleanup_zone_id_raw.stdout | trim not in ['None', '']
+
+- name: Verify the found zone actually belongs to this infra ID
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws route53 list-tags-for-resource
+    --resource-type hostedzone
+    --resource-id {{ _cleanup_zone_id }}
+    --query "ResourceTagSet.Tags[?Key=='kubernetes.io/cluster/{{ _cleanup_infra_id }}'].Value | [0]"
+    --output text
+    --region {{ aws.aws_region }}
+  environment: "{{ _cleanup_aws_env }}"
+  register: _cleanup_zone_tag_check
+  changed_when: false
+  when: _cleanup_zone_id is defined
+
+- name: Dump the zone's non-NS/SOA record sets
+  ansible.builtin.shell: >
+    {{ bin_dir }}/aws route53 list-resource-record-sets
+    --hosted-zone-id {{ _cleanup_zone_id }}
+    --region {{ aws.aws_region }}
+    --query "ResourceRecordSets[?Type != 'NS' && Type != 'SOA']"
+    --output json > /tmp/{{ _cleanup_infra_id }}-rrsets.json
+  environment: "{{ _cleanup_aws_env }}"
+  when:
+    - _cleanup_zone_id is defined
+    - (_cleanup_zone_tag_check.stdout | default('') | trim) == 'owned'
+  changed_when: false
+
+- name: Build DELETE change batch for those record sets
+  ansible.builtin.shell: >
+    jq '{Changes: [.[] | {Action: "DELETE", ResourceRecordSet: .}]}'
+    /tmp/{{ _cleanup_infra_id }}-rrsets.json > /tmp/{{ _cleanup_infra_id }}-changebatch.json
+  when:
+    - _cleanup_zone_id is defined
+    - (_cleanup_zone_tag_check.stdout | default('') | trim) == 'owned'
+  changed_when: false
+
+- name: Apply the DELETE change batch (skipped if there were no records to remove)
+  ansible.builtin.shell: >
+    if [ "$(jq '.Changes | length' /tmp/{{ _cleanup_infra_id }}-changebatch.json)" -gt 0 ]; then
+      {{ bin_dir }}/aws route53 change-resource-record-sets
+      --hosted-zone-id {{ _cleanup_zone_id }}
+      --change-batch file:///tmp/{{ _cleanup_infra_id }}-changebatch.json
+      --region {{ aws.aws_region }};
+    fi
+  environment: "{{ _cleanup_aws_env }}"
+  when:
+    - _cleanup_zone_id is defined
+    - (_cleanup_zone_tag_check.stdout | default('') | trim) == 'owned'
+  changed_when: true
+
+- name: Delete the hosted zone
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws route53 delete-hosted-zone
+    --id {{ _cleanup_zone_id }}
+    --region {{ aws.aws_region }}
+  environment: "{{ _cleanup_aws_env }}"
+  when:
+    - _cleanup_zone_id is defined
+    - (_cleanup_zone_tag_check.stdout | default('') | trim) == 'owned'
+  changed_when: true
+
+- name: Clean up temp files
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "/tmp/{{ _cleanup_infra_id }}-rrsets.json"
+    - "/tmp/{{ _cleanup_infra_id }}-changebatch.json"
+  when: _cleanup_zone_id is defined
+
+- name: Display cleanup summary
+  ansible.builtin.debug:
+    msg:
+      - "Orphaned resource cleanup for infra ID {{ _cleanup_infra_id }}:"
+      - "EC2 instances terminated: {{ _cleanup_instances.stdout.split() | length }}"
+      - "Load balancers deleted: {{ _cleanup_lbs.stdout.split() | length }}"
+      - >-
+          Hosted zone: {{ 'deleted ' ~ _cleanup_zone_id if (_cleanup_zone_id is defined and (_cleanup_zone_tag_check.stdout | default('') | trim) == 'owned')
+                           else ('found but not tagged for this infra ID, left alone' if _cleanup_zone_id is defined else 'none found') }}
