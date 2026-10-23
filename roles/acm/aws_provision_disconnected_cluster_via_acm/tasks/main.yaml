@@ -75,12 +75,23 @@
   changed_when: false
   when: disconnected.network_lockdown.enabled | default(true)
 
+# NO_PROXY CIDR entries only match when the request host is a literal IP —
+# Go's proxy matcher (golang.org/x/net/http/httpproxy) never resolves
+# hostnames against a CIDR. The installer polls the spoke's own API by name
+# (api.<cluster>.<base_domain>:6443), so the Cluster VPC CIDR above does NOT
+# cover it: squid denies the CONNECT with a 403 (hostname isn't in its
+# .amazonaws.com allowlist either), and the install fails KubeAPIWaitFailed
+# after a 20m wait even though the cluster bootstrapped fine (confirmed
+# live — worker nodes existed, created by the in-cluster machine-api, minutes
+# after the installer had already given up blind). A single domain-suffix
+# entry for the spoke's own domain covers api., api-int., and *.apps. together.
 - name: Set spoke installer NO_PROXY fact (network lockdown)
   ansible.builtin.set_fact:
     spoke_installer_no_proxy: >-
       {{ ([disconnected.network_lockdown.vpc_cidr | default('10.90.0.0/16'), jumphost_private_ip]
           + _hub_network_cidrs.stdout.split()
-          + ['.svc', '.cluster.local', 'localhost', '127.0.0.1', '169.254.169.254'])
+          + ['.' ~ ocp_cluster.name ~ '.' ~ base_domain,
+             '.svc', '.cluster.local', 'localhost', '127.0.0.1', '169.254.169.254'])
          | select('ne', '') | join(',') }}
   when: disconnected.network_lockdown.enabled | default(true)
 
