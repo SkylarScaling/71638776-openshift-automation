@@ -351,12 +351,19 @@
 # Under network lockdown, the Cluster VPC has no Internet Gateway/NAT, and VPC
 # peering only routes traffic to the peer VPC's private CIDR — cluster nodes
 # can never reach the jumphost's public IP/DNS, only its private IP via the
-# peering connection. Auto-discovered here (like the public IP above) only as
-# a fallback — jumphost_private_ip set in inventory (already required for
-# LDAP, see CLAUDE.md) always wins, since that's a global var visible to every
-# phase's play, whereas this role only runs in the jumphost-tagged play and a
-# set_fact here would not be visible to the hub/spokes plays' hosts.
-- name: Get jumphost private IP address (fallback if not set in inventory)
+# peering connection. jumphost_private_ip set in inventory (already required
+# for LDAP, see CLAUDE.md) is what every phase's play actually uses, since
+# that's a global var visible everywhere, whereas this role only runs in the
+# jumphost-tagged play and a set_fact here would not be visible to the
+# hub/spokes plays' hosts. Always query the instance's real IP here (not just
+# as a fallback) so a stale inventory value — e.g. carried over from a
+# previous jumphost/account and never cleared — is caught now instead of
+# getting silently baked into Quay's SERVER_HOSTNAME/TLS cert later
+# (confirmed live: a brand-new instance got a different private IP than the
+# stale value already sitting in inventory, and the old "fallback if not
+# set" guard skipped this lookup entirely because inventory already had
+# *a* value, just the wrong one).
+- name: Get jumphost's actual private IP address from AWS
   ansible.builtin.command: >
     {{ bin_dir }}/aws ec2 describe-instances
     --instance-ids {{ _jumphost_instance_id }}
@@ -366,12 +373,29 @@
   environment: "{{ _aws_env }}"
   register: jumphost_private_ip_result
   changed_when: false
-  when: jumphost_private_ip is not defined or jumphost_private_ip | trim == ''
+
+- name: Fail if inventory's jumphost_private_ip does not match this instance's real private IP
+  ansible.builtin.fail:
+    msg: >-
+      jumphost_private_ip in inventory is {{ jumphost_private_ip }}, but this
+      freshly launched instance's real private IP is
+      {{ jumphost_private_ip_result.stdout }}. This value is baked into
+      Quay's SERVER_HOSTNAME and TLS cert by ocp/setup_mirror_registry — set
+      jumphost_private_ip: {{ jumphost_private_ip_result.stdout }} in
+      disconnected-aws-inventory (all.vars) before continuing.
+  when:
+    - jumphost_private_ip is defined
+    - jumphost_private_ip | trim != ''
+    - jumphost_private_ip | trim != jumphost_private_ip_result.stdout | trim
+
+- name: Set fact for whether jumphost_private_ip was unset in inventory
+  ansible.builtin.set_fact:
+    _jumphost_private_ip_was_unset: "{{ jumphost_private_ip is not defined or jumphost_private_ip | trim == '' }}"
 
 - name: Set fallback jumphost private IP fact for this play
   ansible.builtin.set_fact:
     jumphost_private_ip: "{{ jumphost_private_ip_result.stdout }}"
-  when: jumphost_private_ip_result is defined and jumphost_private_ip_result.stdout is defined
+  when: _jumphost_private_ip_was_unset | bool
 
 - name: Warn that jumphost_private_ip was discovered rather than set in inventory
   ansible.builtin.debug:
@@ -380,7 +404,7 @@
       {{ jumphost_private_ip_result.stdout | default('') }} live from AWS for
       this play only. Set jumphost_private_ip in inventory (all.vars) to make
       this value available to every phase/play, not just this one.
-  when: jumphost_private_ip_result is defined and jumphost_private_ip_result.stdout is defined
+  when: _jumphost_private_ip_was_unset | bool
 
 - name: Wait for SSH to become available
   ansible.builtin.wait_for:
