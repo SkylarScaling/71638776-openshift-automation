@@ -3,6 +3,26 @@
   ansible.builtin.set_fact:
     _quay_hostname_is_ip: "{{ mirror_registry_hostname is match('^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$') }}"
 
+# jumphost_private_ip is hand-maintained in the inventory and easily left
+# stale across a rebuilt jumphost (confirmed live: an inventory still
+# pointing at a previous jumphost's IP baked that dead IP into Quay's
+# SERVER_HOSTNAME and TLS cert, and the healthcheck then failed with
+# EHOSTUNREACH against an address nothing in the VPC owns). Catch that
+# before spending ~10 minutes running the installer against the wrong value.
+- name: Assert the mirror registry hostname is an address this host actually owns
+  ansible.builtin.assert:
+    that:
+      - mirror_registry_hostname in ansible_all_ipv4_addresses
+    fail_msg: >-
+      mirror_registry_hostname is {{ mirror_registry_hostname }} but this host's
+      addresses are {{ ansible_all_ipv4_addresses | join(', ') }}. jumphost_private_ip
+      in the inventory is stale (likely left over from a previous jumphost). Correct
+      it before installing — the value is baked into Quay's SERVER_HOSTNAME and TLS
+      cert.
+  when:
+    - _quay_hostname_is_ip
+    - ansible_all_ipv4_addresses is defined
+
 - name: Check if mirror registry is already running
   ansible.builtin.uri:
     url: "https://{{ mirror_registry_hostname }}:{{ mirror_registry_port }}/health/instance"
@@ -18,15 +38,17 @@
     msg: "Mirror registry is already running at {{ mirror_registry_hostname }}:{{ mirror_registry_port }}, skipping setup."
   when: registry_health.status | default(0) in [200, 301]
 
-# If the registry is not responding but a previous installation exists on disk,
-# the EC2 instance was likely stopped and restarted (Podman containers don't
-# auto-start). Attempt mirror-registry start before falling through to a fresh
-# install — mirror-registry install hangs when it finds an existing installation.
+# Previous installation detection and the hostname-change check below run
+# unconditionally — not gated on registry_health — because a registry that
+# answers 200 can still be serving the *wrong* hostname/cert (e.g. right
+# after jumphost_private_ip gets corrected in the inventory): the health
+# probe uses validate_certs: false, so a mismatched cert doesn't fail it.
+# Gating this on an unhealthy registry made "running but wrong cert" an
+# unrecoverable-by-rerun state (confirmed live).
 - name: Check if mirror registry was previously installed (quay-config directory present)
   ansible.builtin.stat:
     path: "{{ mirror_registry_dir }}/quay-config/config.yaml"
   register: _quay_config_stat
-  when: registry_health.status | default(0) not in [200, 301]
 
 # mirror-registry bakes --quayHostname into both SERVER_HOSTNAME and the
 # self-signed TLS cert's SAN at install time. If the desired hostname has
@@ -41,9 +63,7 @@
   register: _quay_current_hostname
   changed_when: false
   failed_when: false
-  when:
-    - registry_health.status | default(0) not in [200, 301]
-    - _quay_config_stat.stat is defined and _quay_config_stat.stat.exists
+  when: _quay_config_stat.stat is defined and _quay_config_stat.stat.exists
 
 - name: Set fact for whether the installed registry's hostname has changed
   ansible.builtin.set_fact:
@@ -51,9 +71,7 @@
       {{ _quay_config_stat.stat.exists
          and (_quay_current_hostname.stdout | default('') | trim)
              != ('SERVER_HOSTNAME: ' ~ mirror_registry_hostname ~ ':' ~ mirror_registry_port) }}
-  when:
-    - registry_health.status | default(0) not in [200, 301]
-    - _quay_config_stat.stat is defined and _quay_config_stat.stat.exists
+  when: _quay_config_stat.stat is defined and _quay_config_stat.stat.exists
 
 - name: Uninstall mirror registry (hostname changed — cert must be regenerated)
   ansible.builtin.command: >
@@ -67,6 +85,7 @@
 - name: Treat registry as not previously installed after uninstalling for a hostname change
   ansible.builtin.set_fact:
     _quay_config_stat: "{{ _quay_config_stat | combine({'stat': {'exists': false}}) }}"
+    registry_health: {}
   when: _quay_hostname_changed | default(false)
 
 # Our custom IP-SAN cert (see below) is keyed to the old hostname and the
