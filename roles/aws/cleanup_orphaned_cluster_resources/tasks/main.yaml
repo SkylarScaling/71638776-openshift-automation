@@ -155,13 +155,18 @@
     - (_cleanup_zone_tag_check.stdout | default('') | trim) == 'owned'
   changed_when: false
 
+# A YAML folded (">") scalar only joins lines with a space when they share
+# the block's base indentation — the aws command's flags here were indented
+# one level deeper than "if"/"fi" to look nested, which YAML instead treats
+# as a literal (un-folded) block: each flag landed on its own line in the
+# rendered script, so the shell ran `aws route53 change-resource-record-sets`
+# with no arguments and then tried to execute "--hosted-zone-id ..." as its
+# own command (confirmed live: "command not found" for each flag). Keep the
+# whole aws invocation on one line to avoid relying on folding behavior.
 - name: Apply the DELETE change batch (skipped if there were no records to remove)
   ansible.builtin.shell: >
     if [ "$(jq '.Changes | length' /tmp/{{ _cleanup_infra_id }}-changebatch.json)" -gt 0 ]; then
-      {{ bin_dir }}/aws route53 change-resource-record-sets
-      --hosted-zone-id {{ _cleanup_zone_id }}
-      --change-batch file:///tmp/{{ _cleanup_infra_id }}-changebatch.json
-      --region {{ aws.aws_region }};
+    {{ bin_dir }}/aws route53 change-resource-record-sets --hosted-zone-id {{ _cleanup_zone_id }} --change-batch file:///tmp/{{ _cleanup_infra_id }}-changebatch.json --region {{ aws.aws_region }};
     fi
   environment: "{{ _cleanup_aws_env }}"
   when:
