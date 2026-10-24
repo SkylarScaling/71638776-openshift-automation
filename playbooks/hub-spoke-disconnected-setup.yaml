@@ -556,11 +556,20 @@
       ansible.builtin.set_fact:
         spoke_kubeconfig: "{{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig"
 
+    # Use the synthetic metadata.json (written by
+    # acm/aws_provision_disconnected_cluster_via_acm from the ClusterDeployment's
+    # own spec.clusterMetadata.infraID, read via the hub) instead of
+    # target_kubeconfig — discovering the infra ID via `oc get infrastructure`
+    # against the spoke's own API requires resolving api.<spoke>.<base_domain>,
+    # which the jumphost cannot do: only the Cluster VPC has each cluster's
+    # private hosted zone associated (aws/associate_private_zone_with_jumphost
+    # only covers the hub's zone), so this failed live with "no such host"
+    # even though the spoke's infra ID was already known from the hub.
     - name: Allow the jumphost ingress to the Spoke's node security groups (network lockdown)
       ansible.builtin.include_role:
         name: aws/allow_jumphost_ingress_to_nodes
       vars:
-        target_kubeconfig: "{{ spoke_kubeconfig }}"
+        _metadata_json_path: "{{ install_dir }}/{{ ocp_cluster.name }}/metadata-infraid-only.json"
       when: disconnected.network_lockdown.enabled | default(true)
 
     - name: Apply Disconnected Cluster Configuration to Spoke (IDMS, CatalogSource, Pull Secret)
