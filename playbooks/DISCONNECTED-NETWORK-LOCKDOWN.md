@@ -32,9 +32,14 @@ the existing jumphost-mirrors-then-migrate-to-hub workflow. Set
   VPC, so without an explicit second association it can't resolve
   `api.<cluster>.<base_domain>` and bootstrap fails. `ocp/aws_provision_disconnected_ocp_ipi`
   runs `aws/associate_private_zone_with_jumphost` concurrently with the async
-  install job to add that association as soon as the zone exists. Only needed
-  for the hub — spokes are provisioned by Hive running inside the hub, which
-  is already in the Cluster VPC.
+  install job to add that association as soon as the zone exists. Spokes need
+  it too, just for a different reason: Hive's installer runs inside
+  hive-controllers on the hub (already in the Cluster VPC, so Hive itself is
+  never blocked), but every Day 2 spoke-configuration task in
+  `hub-spoke-disconnected-setup.yaml` runs `oc`/ansible against the spoke's
+  own kubeconfig from the jumphost, which needs the same resolution.
+  `acm/aws_provision_disconnected_cluster_via_acm` runs the same role once the
+  spoke's infra ID is known, before any Day 2 task touches the spoke's API.
 - **Jumphost ingress to node security groups**: VPC peering and the routes it
   adds only establish a network *path* — they don't open anything. Security
   groups are a separate, stateful allow-list, and openshift-install's

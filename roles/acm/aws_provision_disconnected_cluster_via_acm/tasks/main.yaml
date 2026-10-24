@@ -440,6 +440,23 @@
     content: "{{ {'infraID': _spoke_infra_id.stdout.split('|')[0] | trim} | to_json }}"
   when: disconnected.network_lockdown.enabled | default(true)
 
+# Hive's installer runs inside hive-controllers (in the Cluster VPC), so the
+# spoke's private hosted zone only ever gets associated with that VPC — same
+# gap as the hub (see aws/associate_private_zone_with_jumphost), except here
+# nothing associated it with the jumphost VPC at all. Every later task in this
+# play that runs `oc`/ansible against the spoke's own kubeconfig from the
+# jumphost (configure_disconnected_cluster, configure_ntp, configure_rbac,
+# etc.) needs to resolve api.<spoke>.<base_domain> to do so — confirmed live:
+# "no such host" from the jumphost even though the spoke's own installer
+# (running inside the Cluster VPC) wasn't affected. Do this before waiting for
+# install to complete so later tasks are never blocked on it.
+- name: Associate the spoke's private DNS zone with the jumphost VPC
+  ansible.builtin.include_role:
+    name: aws/associate_private_zone_with_jumphost
+  vars:
+    private_zone_domain: "{{ ocp_cluster.name }}.{{ base_domain }}"
+  when: disconnected.network_lockdown.enabled | default(true)
+
 - name: Create the spoke's *.apps wildcard DNS record
   ansible.builtin.include_role:
     name: aws/create_apps_wildcard_dns_record
