@@ -59,12 +59,49 @@
   delay: 20
   changed_when: false
 
+- name: Set zone ID fact
+  ansible.builtin.set_fact:
+    _pz_zone_id: "{{ _pz_zone_lookup.stdout | trim | regex_replace('^/hostedzone/', '') }}"
+
+# list-hosted-zones-by-name matches on domain name alone. An orphaned,
+# un-cleaned-up zone from a prior failed attempt for the same cluster name
+# would silently win this lookup and get associated instead of the zone that
+# actually serves the current install — confirmed pattern already guarded
+# against in aws/create_apps_wildcard_dns_record and
+# aws/cleanup_orphaned_cluster_resources; apply the same tag check here.
+- name: Verify the matched hosted zone belongs to this infra ID
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws route53 list-tags-for-resource
+    --resource-type hostedzone
+    --resource-id {{ _pz_zone_id }}
+    --query "ResourceTagSet.Tags[?Key=='kubernetes.io/cluster/{{ _pz_infra_id }}'].Value | [0]"
+    --output text
+    --region {{ aws.aws_region }}
+  environment: "{{ _aws_env }}"
+  register: _pz_zone_tag_check
+  changed_when: false
+  when: _pz_infra_id is defined
+
+- name: Fail if the matched hosted zone is not tagged for this infra ID
+  ansible.builtin.fail:
+    msg: >-
+      Found a private hosted zone named {{ private_zone_domain }}
+      ({{ _pz_zone_id }}) but it is not tagged
+      kubernetes.io/cluster/{{ _pz_infra_id }}=owned — this looks like a
+      leftover zone from a different (likely orphaned) cluster attempt that
+      reused the same domain name, not the cluster currently being
+      installed. Refusing to associate it with the jumphost VPC.
+  when:
+    - _pz_infra_id is defined
+    - (_pz_zone_tag_check.stdout | default('') | trim) != 'owned'
+
 - name: Associate the private hosted zone with the jumphost VPC
   ansible.builtin.command: >
     {{ bin_dir }}/aws route53 associate-vpc-with-hosted-zone
-    --hosted-zone-id {{ _pz_zone_lookup.stdout | trim | regex_replace('^/hostedzone/', '') }}
+    --hosted-zone-id {{ _pz_zone_id }}
     --vpc VPCRegion={{ aws.aws_region }},VPCId={{ _pz_jumphost_vpc.stdout | trim }}
     --comment "Lets the jumphost (outside the Cluster VPC) resolve this private zone during install"
+    --output json
   environment: "{{ _aws_env }}"
   register: _pz_associate
   failed_when:
@@ -72,6 +109,41 @@
     - "'ConflictingDomainExists' not in _pz_associate.stderr"
     - "'already associated' not in _pz_associate.stderr"
   changed_when: _pz_associate.rc == 0
+
+# associate-vpc-with-hosted-zone is asynchronous — it returns a PENDING
+# change that Route53 says propagates "within 60 seconds", but on a
+# previously-installed cluster the very next task can run milliseconds
+# later (there's no install-wait to absorb the lag the way there is on a
+# cold build). Confirmed live: a `changed` association at 02:20:46 was
+# still unresolvable from the jumphost at 02:21:24. Wait for INSYNC when we
+# actually made a new association; skip when the zone was already
+# associated (rc != 0, swallowed above) since there's nothing to propagate.
+- name: Wait for the VPC association change to propagate (INSYNC)
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws route53 get-change
+    --id {{ (_pz_associate.stdout | from_json).ChangeInfo.Id }}
+    --query 'ChangeInfo.Status'
+    --output text
+    --region {{ aws.aws_region }}
+  environment: "{{ _aws_env }}"
+  register: _pz_change_status
+  until: _pz_change_status.stdout | trim == 'INSYNC'
+  retries: 20
+  delay: 10
+  changed_when: false
+  when: _pz_associate.rc == 0
+
+# Belt-and-braces: INSYNC on the Route53 side doesn't guarantee the
+# jumphost's own VPC resolver has picked it up yet. Don't hand off to the
+# next task until the hostname this whole role exists for actually resolves.
+- name: Wait for the private zone's api hostname to resolve from the jumphost
+  ansible.builtin.command: getent hosts api.{{ private_zone_domain }}
+  register: _pz_resolve_check
+  until: _pz_resolve_check.rc == 0
+  retries: 30
+  delay: 20
+  changed_when: false
+  failed_when: false
 
 - name: Display private zone association summary
   ansible.builtin.debug:

@@ -455,6 +455,7 @@
     name: aws/associate_private_zone_with_jumphost
   vars:
     private_zone_domain: "{{ ocp_cluster.name }}.{{ base_domain }}"
+    _pz_infra_id: "{{ _spoke_infra_id.stdout.split('|')[0] | trim }}"
   when: disconnected.network_lockdown.enabled | default(true)
 
 - name: Create the spoke's *.apps wildcard DNS record
