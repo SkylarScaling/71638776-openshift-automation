@@ -167,6 +167,8 @@
     --v2
     --config {{ quay_mirror_workspace }}/imageset-config.yaml
     --workspace file://{{ quay_mirror_workspace }}
+    --parallel-images {{ quay_mirror_parallel_images }}
+    --parallel-layers {{ quay_mirror_parallel_layers }}
     docker://{{ quay_registry_url }}/{{ quay_mirror_org }}
   environment:
     XDG_RUNTIME_DIR: "{{ quay_mirror_workspace }}"
@@ -292,6 +294,8 @@
     --v2
     --config {{ quay_mirror_workspace }}/imageset-config.yaml
     --workspace file://{{ quay_mirror_workspace }}
+    --parallel-images {{ quay_mirror_parallel_images }}
+    --parallel-layers {{ quay_mirror_parallel_layers }}
     docker://{{ quay_registry_url }}/{{ quay_mirror_org }}
   environment:
     XDG_RUNTIME_DIR: "{{ quay_mirror_workspace }}"
@@ -410,6 +414,8 @@
     --v2
     --config {{ quay_mirror_workspace }}/imageset-config.yaml
     --workspace file://{{ quay_mirror_workspace }}
+    --parallel-images {{ quay_mirror_parallel_images }}
+    --parallel-layers {{ quay_mirror_parallel_layers }}
     docker://{{ quay_registry_url }}/{{ quay_mirror_org }}
   environment:
     XDG_RUNTIME_DIR: "{{ quay_mirror_workspace }}"

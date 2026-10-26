@@ -17,3 +17,14 @@ mirror_registry_url: >-
       else disconnected.mirror_registry.hostname)
      ~ ':' ~ (disconnected.mirror_registry.port | default(8443)) }}
 mirror_base_path: "{{ disconnected.mirror_base_path | default('ocp4') }}"
+
+# oc-mirror v2's default concurrency (8 parallel images x 10 parallel layers)
+# pushes enough simultaneous chunked uploads to the in-cluster Quay's NooBaa
+# pv-pool backing store to OOMKill its agent pods even after scaling
+# numVolumes up (see configure_quay_mirror/defaults) — NooBaa hardcodes each
+# agent to a 400Mi memory limit regardless of volume count, and that's not
+# configurable via the backingstore CRD. Confirmed live: agent OOMKills land
+# at the same second as "blob upload invalid"/EOF errors from oc-mirror.
+# Cut concurrency instead of fighting a limit that can't be raised.
+quay_mirror_parallel_images: "{{ disconnected.quay_mirror.parallel_images | default(2) }}"
+quay_mirror_parallel_layers: "{{ disconnected.quay_mirror.parallel_layers | default(2) }}"
