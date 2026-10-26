@@ -10,6 +10,57 @@
 # calling Quay's internal model functions directly in the container.
 # ==============================================================================
 
+# Quay's blob storage (NooBaa/MCG default pv-pool) only ever gets a single
+# 50Gi volume from ODF out of the box — far too small for the full OCP
+# release+operator mirror payload (confirmed live: 82G on the jumphost's own
+# registry), and the single agent pod backing it gets OOMKilled mid-upload
+# under that load (NooBaa hardcodes 400Mi per agent; not configurable via
+# this CRD). Quay then returns a 500 on blob writes that no retry in
+# ocp/remirror_to_quay can recover from, since it's a capacity problem, not
+# a transient race. Scale out before Quay/oc-mirror ever touch it.
+- name: Wait for the default NooBaa backing store to exist
+  ansible.builtin.command: >
+    {{ bin_dir }}/oc get backingstore noobaa-default-backing-store
+    -n openshift-storage
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.metadata.name}'
+  register: _noobaa_backingstore_check
+  changed_when: false
+  failed_when: false
+  until: _noobaa_backingstore_check.rc == 0
+  retries: 30
+  delay: 20
+
+- name: Scale the NooBaa default backing store pv-pool
+  ansible.builtin.command: >
+    {{ bin_dir }}/oc patch backingstore noobaa-default-backing-store
+    -n openshift-storage
+    --kubeconfig {{ target_kubeconfig }}
+    --type=merge
+    -p "{\"spec\":{\"pvPool\":{\"numVolumes\": {{ quay_backing_store_num_volumes }} }}}"
+  register: _noobaa_backingstore_patch
+  changed_when: "'no change' not in _noobaa_backingstore_patch.stdout"
+  when: _noobaa_backingstore_check.rc == 0
+
+# Non-fatal: this is a best-effort readiness wait, not a hard gate. If the
+# pod-listing heuristic below ever breaks (e.g. a NooBaa version changes
+# naming), remirror_to_quay's own failure message already points at the
+# right place to look, so don't block the whole run on this probe.
+- name: Wait for NooBaa pv-pool agent pods to scale up and stabilize
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get pods -n openshift-storage
+    --kubeconfig {{ target_kubeconfig }}
+    --no-headers 2>/dev/null
+    | grep noobaa-default-backing-store
+    | grep -c Running
+  register: _noobaa_running_count
+  changed_when: false
+  failed_when: false
+  until: (_noobaa_running_count.stdout | default('0') | trim | int) >= (quay_backing_store_num_volumes | int)
+  retries: 30
+  delay: 20
+  when: _noobaa_backingstore_check.rc == 0
+
 - name: Wait for QuayRegistry to be Available
   ansible.builtin.shell: >
     {{ bin_dir }}/oc get quayregistry {{ quay_mirror_registry_name }}

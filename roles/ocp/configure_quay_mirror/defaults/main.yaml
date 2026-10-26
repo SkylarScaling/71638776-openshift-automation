@@ -10,3 +10,12 @@ quay_mirror_admin_password: "{{ disconnected.quay_mirror.admin_password | defaul
 # uploads that go silent during Quay's object-storage commit. AWS caps
 # Classic ELB idle timeout at 3600s.
 quay_mirror_ingress_idle_timeout: "{{ disconnected.quay_mirror.ingress_idle_timeout | default('30m') }}"
+
+# ODF creates the default NooBaa backing store with a single 50Gi pv-pool
+# volume. Confirmed live: mirroring the full OCP release+operator payload
+# (82G on the jumphost's own registry) OOMKills that single agent pod mid
+# upload (NooBaa's 400Mi memory limit per agent isn't configurable via this
+# CRD) and Quay returns a 500 on every subsequent blob write. Each extra
+# volume adds another 50Gi and another agent pod, which both raises total
+# capacity and spreads data across more of the fixed 400Mi ceilings.
+quay_backing_store_num_volumes: "{{ disconnected.quay_mirror.backing_store_num_volumes | default(4) }}"
