@@ -142,7 +142,7 @@
 # dependent on apps_install_quay having run recently.
 - name: Ensure the Quay ArgoCD Application protects our storage secret edit from selfHeal
   ansible.builtin.command: >
-    {{ bin_dir }}/oc patch application {{ quay_argocd_app_name }}
+    {{ bin_dir }}/oc patch applications.argoproj.io {{ quay_argocd_app_name }}
     -n {{ quay_argocd_namespace }}
     --kubeconfig {{ target_kubeconfig }}
     --type=merge
@@ -153,7 +153,7 @@
 
 - name: Wait for ArgoCD to pick up the ignoreDifferences update
   ansible.builtin.shell: >
-    {{ bin_dir }}/oc get application {{ quay_argocd_app_name }}
+    {{ bin_dir }}/oc get applications.argoproj.io {{ quay_argocd_app_name }}
     -n {{ quay_argocd_namespace }}
     --kubeconfig {{ target_kubeconfig }}
     -o jsonpath='{.spec.ignoreDifferences}'
