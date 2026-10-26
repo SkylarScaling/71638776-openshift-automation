@@ -19,3 +19,13 @@ quay_mirror_ingress_idle_timeout: "{{ disconnected.quay_mirror.ingress_idle_time
 # volume adds another 50Gi and another agent pod, which both raises total
 # capacity and spreads data across more of the fixed 400Mi ceilings.
 quay_backing_store_num_volumes: "{{ disconnected.quay_mirror.backing_store_num_volumes | default(4) }}"
+
+# Scaling the pv-pool above only raises total capacity — confirmed live it
+# still OOMKills under the full mirror payload regardless (NooBaa's 400Mi
+# per-agent ceiling applies no matter how many agents share the work, and
+# Quay's server-side multipart assembly runs independently of client-side
+# concurrency). ODF skips Ceph RGW on cloud platforms, so there's no
+# in-cluster S3-compatible alternative — use a real AWS S3 bucket instead.
+# The Cluster VPC already has an S3 gateway endpoint (aws/create_vpc_endpoints),
+# so this works even under network lockdown with no internet egress.
+quay_s3_storage_bucket: "{{ disconnected.quay_mirror.s3_bucket | default(ocp_cluster.name ~ '-quay-storage-' ~ aws.aws_region) }}"

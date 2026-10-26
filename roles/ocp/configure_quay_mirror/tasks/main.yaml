@@ -61,6 +61,123 @@
   delay: 20
   when: _noobaa_backingstore_check.rc == 0
 
+# The pv-pool scaling above only raises total capacity — confirmed live
+# (two separate ocp-debug investigations) it still OOMKills under the full
+# mirror payload regardless of numVolumes or oc-mirror client concurrency,
+# because NooBaa hardcodes each agent to 400Mi and Quay's server-side
+# multipart assembly (UploadPartCopy) runs independently of the client.
+# There's no supported knob to raise that limit. Move Quay's storage off
+# the pv-pool entirely onto a real AWS S3 bucket instead — the Cluster VPC
+# already has an S3 gateway endpoint (aws/create_vpc_endpoints), so this
+# works under network lockdown with no internet egress required.
+- name: Ensure AWS CLI is available
+  ansible.builtin.include_role:
+    name: aws/ensure_aws_cli
+
+- name: Set AWS environment for Quay S3 storage tasks
+  ansible.builtin.set_fact:
+    _quay_s3_aws_env:
+      AWS_ACCESS_KEY_ID: "{{ aws.aws_access_key_id }}"
+      AWS_SECRET_ACCESS_KEY: "{{ aws.aws_secret_access_key }}"
+      AWS_SESSION_TOKEN: ""
+
+- name: Check if the Quay S3 storage bucket already exists
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws s3api head-bucket
+    --bucket {{ quay_s3_storage_bucket }}
+    --region {{ aws.aws_region }}
+  environment: "{{ _quay_s3_aws_env }}"
+  register: _quay_s3_bucket_check
+  changed_when: false
+  failed_when: false
+
+- name: Create the Quay S3 storage bucket
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws s3api create-bucket
+    --bucket {{ quay_s3_storage_bucket }}
+    --region {{ aws.aws_region }}
+    {{ ('--create-bucket-configuration LocationConstraint=' ~ aws.aws_region) if aws.aws_region != 'us-east-1' else '' }}
+  environment: "{{ _quay_s3_aws_env }}"
+  when: _quay_s3_bucket_check.rc != 0
+  changed_when: true
+
+- name: Block public access to the Quay S3 storage bucket
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws s3api put-public-access-block
+    --bucket {{ quay_s3_storage_bucket }}
+    --region {{ aws.aws_region }}
+    --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+  environment: "{{ _quay_s3_aws_env }}"
+  when: _quay_s3_bucket_check.rc != 0
+  changed_when: true
+
+# Read-modify-write so we don't clobber FEATURE_USER_INITIALIZE/SUPER_USERS/
+# etc. already set by gitops-install-quay's 04-init-config-bundle-secret.yaml.
+- name: Read current Quay config bundle secret
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get secret init-config-bundle-secret
+    -n {{ quay_mirror_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.data.config\.yaml}' | base64 -d
+  args:
+    executable: /bin/bash
+  register: _quay_current_config
+  changed_when: false
+
+- name: Set fact for whether Quay is already using S3 storage
+  ansible.builtin.set_fact:
+    _quay_already_on_s3: "{{ 'DISTRIBUTED_STORAGE_CONFIG' in _quay_current_config.stdout }}"
+
+- name: Merge S3 storage config into Quay config bundle
+  ansible.builtin.set_fact:
+    _quay_merged_config: >-
+      {{ (_quay_current_config.stdout | from_yaml) | combine({
+        'DISTRIBUTED_STORAGE_CONFIG': {
+          'default': [
+            'S3Storage',
+            {
+              'host': 's3.' ~ aws.aws_region ~ '.amazonaws.com',
+              's3_bucket': quay_s3_storage_bucket,
+              's3_region': aws.aws_region,
+              'storage_path': '/datastorage/registry',
+              'access_key': aws.aws_access_key_id,
+              'secret_key': aws.aws_secret_access_key
+            }
+          ]
+        },
+        'DISTRIBUTED_STORAGE_DEFAULT_LOCATIONS': ['default'],
+        'DISTRIBUTED_STORAGE_PREFERENCE': ['default']
+      }) }}
+  no_log: true
+  when: not (_quay_already_on_s3 | bool)
+
+- name: Apply updated Quay config bundle secret with S3 storage config
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
+    stdin: |
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: init-config-bundle-secret
+        namespace: {{ quay_mirror_namespace }}
+      type: Opaque
+      stringData:
+        config.yaml: |
+          {{ (_quay_merged_config | to_nice_yaml(indent=2)) | indent(10) }}
+  changed_when: true
+  no_log: true
+  when: not (_quay_already_on_s3 | bool)
+
+- name: Mark Quay objectstorage component as unmanaged (external S3)
+  ansible.builtin.command: >
+    {{ bin_dir }}/oc patch quayregistry {{ quay_mirror_registry_name }}
+    -n {{ quay_mirror_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+    --type=merge
+    -p "{\"spec\":{\"components\":[{\"kind\":\"objectstorage\",\"managed\":false},{\"kind\":\"tls\",\"managed\":true}]}}"
+  register: _quay_objectstorage_patch
+  changed_when: "'no change' not in _quay_objectstorage_patch.stdout"
+
 - name: Wait for QuayRegistry to be Available
   ansible.builtin.shell: >
     {{ bin_dir }}/oc get quayregistry {{ quay_mirror_registry_name }}

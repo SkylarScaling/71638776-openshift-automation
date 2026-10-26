@@ -34,3 +34,14 @@ spec:
       kind: QuayRegistry
       jsonPointers:
         - /spec/components
+    # ocp/configure_quay_mirror rewrites this secret's config.yaml in-place to
+    # add DISTRIBUTED_STORAGE_CONFIG (switching Quay off the NooBaa pv-pool,
+    # which can't hold the full mirror payload — see that role for details).
+    # Without this, selfHeal reverts it back to the repo's minimal config.yaml
+    # on the next sync, wiping the storage backend out from under Quay.
+    - group: ""
+      kind: Secret
+      name: init-config-bundle-secret
+      jsonPointers:
+        - /data
+        - /stringData
