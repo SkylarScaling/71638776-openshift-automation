@@ -128,6 +128,51 @@
   ansible.builtin.set_fact:
     _quay_already_on_s3: "{{ 'DISTRIBUTED_STORAGE_CONFIG' in _quay_current_config.stdout }}"
 
+# apps_install_quay (which templates this Application, including the
+# ignoreDifferences protecting this exact secret) only runs during the hub
+# phase — a later re-run scoped to just --tags migrate_mirror never touches
+# it, so the live Application can predate that protection even once the
+# template has it. Confirmed live: without this, ArgoCD's selfHeal reverted
+# our S3 config out of the secret 2 seconds after we applied it (no error
+# anywhere in this role — the operator just silently refused to reconcile:
+# "ConfigInvalid: objectstorage unmanaged but configBundleSecret missing
+# necessary fields"), Quay's app pods kept running on the old NooBaa config,
+# and remirror_to_quay failed with the exact same pv-pool OOM 500 as before
+# the S3 switch. Patch the live object directly so this role is never
+# dependent on apps_install_quay having run recently.
+- name: Ensure the Quay ArgoCD Application protects our storage secret edit from selfHeal
+  ansible.builtin.command: >
+    {{ bin_dir }}/oc patch application {{ quay_argocd_app_name }}
+    -n {{ quay_argocd_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+    --type=merge
+    -p "{\"spec\":{\"ignoreDifferences\":[{\"group\":\"quay.redhat.com\",\"kind\":\"QuayRegistry\",\"jsonPointers\":[\"/spec/components\"]},{\"group\":\"\",\"kind\":\"Secret\",\"name\":\"init-config-bundle-secret\",\"jsonPointers\":[\"/data\",\"/stringData\"]}]}}"
+  register: _quay_argocd_app_patch
+  changed_when: "'no change' not in _quay_argocd_app_patch.stdout"
+  when: not (_quay_already_on_s3 | bool)
+
+- name: Wait for ArgoCD to pick up the ignoreDifferences update
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get application {{ quay_argocd_app_name }}
+    -n {{ quay_argocd_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.spec.ignoreDifferences}'
+  register: _quay_argocd_ignorediff_check
+  changed_when: false
+  until: "'init-config-bundle-secret' in _quay_argocd_ignorediff_check.stdout"
+  retries: 10
+  delay: 5
+  when: not (_quay_already_on_s3 | bool)
+
+# The patch above only guarantees the Application's desired spec includes
+# the protection — ArgoCD's controller still needs a watch cycle to notice
+# before it stops reverting live drift on its own. Give it a moment rather
+# than racing straight into the secret apply below.
+- name: Allow ArgoCD a moment to pick up the Application update before editing the secret
+  ansible.builtin.pause:
+    seconds: 15
+  when: not (_quay_already_on_s3 | bool)
+
 - name: Merge S3 storage config into Quay config bundle
   ansible.builtin.set_fact:
     _quay_merged_config: >-
@@ -177,6 +222,61 @@
     -p "{\"spec\":{\"components\":[{\"kind\":\"objectstorage\",\"managed\":false},{\"kind\":\"tls\",\"managed\":true}]}}"
   register: _quay_objectstorage_patch
   changed_when: "'no change' not in _quay_objectstorage_patch.stdout"
+
+# "Available=True" on QuayRegistry can be stale leftover state from before
+# this patch (the operator doesn't flip it to False just because it's stuck
+# refusing to reconcile a ConfigInvalid component) — confirmed live: that
+# wait previously returned in well under a second, satisfied by a condition
+# set long before this run even started, while the operator sat spinning on
+# "required component objectstorage marked unmanaged, but configBundleSecret
+# is missing necessary fields" and Quay's app pods never picked up the new
+# storage config at all. Check the operator's own generated config instead —
+# that's the one artifact that only exists once reconciliation actually
+# succeeded with our S3 settings.
+- name: Find Quay's generated internal config secret
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get secret -n {{ quay_mirror_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o name | grep -- '-quay-config-secret-' | head -1
+  register: _quay_generated_config_secret
+  changed_when: false
+  failed_when: false
+  until: _quay_generated_config_secret.stdout | default('') != ''
+  retries: 10
+  delay: 10
+  when: not (_quay_already_on_s3 | bool)
+
+- name: Wait for Quay's generated config to actually pick up S3 storage
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get {{ _quay_generated_config_secret.stdout }}
+    -n {{ quay_mirror_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.data.config\.yaml}' | base64 -d | grep -c S3Storage || true
+  args:
+    executable: /bin/bash
+  register: _quay_generated_config_check
+  changed_when: false
+  until: (_quay_generated_config_check.stdout | default('0') | trim | int) > 0
+  retries: 20
+  delay: 15
+  when:
+    - not (_quay_already_on_s3 | bool)
+    - _quay_generated_config_secret.stdout | default('') != ''
+
+- name: Fail if Quay never reconciled the S3 storage config
+  ansible.builtin.fail:
+    msg: >-
+      Quay's generated config secret still does not reference S3Storage
+      after patching init-config-bundle-secret and the objectstorage
+      component. The operator is likely stuck refusing to reconcile — check
+      `oc logs deploy/quay-operator-tng -n {{ quay_mirror_namespace }}` for
+      ConfigInvalid, and confirm the ArgoCD Application's ignoreDifferences
+      actually protected init-config-bundle-secret from being reverted
+      (`oc get secret init-config-bundle-secret -n {{ quay_mirror_namespace }}
+      -o jsonpath='{.data.config\.yaml}' | base64 -d`).
+  when:
+    - not (_quay_already_on_s3 | bool)
+    - _quay_generated_config_secret.stdout | default('') == ''
 
 - name: Wait for QuayRegistry to be Available
   ansible.builtin.shell: >

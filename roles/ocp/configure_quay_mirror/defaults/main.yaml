@@ -29,3 +29,10 @@ quay_backing_store_num_volumes: "{{ disconnected.quay_mirror.backing_store_num_v
 # The Cluster VPC already has an S3 gateway endpoint (aws/create_vpc_endpoints),
 # so this works even under network lockdown with no internet egress.
 quay_s3_storage_bucket: "{{ disconnected.quay_mirror.s3_bucket | default(ocp_cluster.name ~ '-quay-storage-' ~ aws.aws_region) }}"
+
+# Must match argo/apps_install_quay's own defaults of the same name — this
+# role patches that same live ArgoCD Application directly rather than
+# depending on apps_install_quay having (re-)run recently (see the
+# ignoreDifferences task above for why).
+quay_argocd_app_name: "quay-registry"
+quay_argocd_namespace: "openshift-gitops"
