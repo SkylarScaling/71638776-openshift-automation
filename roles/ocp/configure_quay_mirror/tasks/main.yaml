@@ -140,13 +140,22 @@
 # and remirror_to_quay failed with the exact same pv-pool OOM 500 as before
 # the S3 switch. Patch the live object directly so this role is never
 # dependent on apps_install_quay having run recently.
+#
+# ignoreDifferences alone only excludes a field from diff/OutOfSync
+# computation — it does NOT stop a sync operation from overwriting that
+# field. Confirmed live: ignoreDifferences correctly protected
+# /spec/components (git never declares that field, so apply never touches
+# it) but did nothing for the secret (git DOES declare config.yaml, so every
+# sync re-applied git's version over ours, 2 seconds after our edit).
+# RespectIgnoreDifferences=true is the sync option that actually makes sync
+# itself skip the ignored paths instead of just hiding them from the diff.
 - name: Ensure the Quay ArgoCD Application protects our storage secret edit from selfHeal
   ansible.builtin.command: >
     {{ bin_dir }}/oc patch applications.argoproj.io {{ quay_argocd_app_name }}
     -n {{ quay_argocd_namespace }}
     --kubeconfig {{ target_kubeconfig }}
     --type=merge
-    -p "{\"spec\":{\"ignoreDifferences\":[{\"group\":\"quay.redhat.com\",\"kind\":\"QuayRegistry\",\"jsonPointers\":[\"/spec/components\"]},{\"group\":\"\",\"kind\":\"Secret\",\"name\":\"init-config-bundle-secret\",\"jsonPointers\":[\"/data\",\"/stringData\"]}]}}"
+    -p "{\"spec\":{\"ignoreDifferences\":[{\"group\":\"quay.redhat.com\",\"kind\":\"QuayRegistry\",\"jsonPointers\":[\"/spec/components\"]},{\"group\":\"\",\"kind\":\"Secret\",\"name\":\"init-config-bundle-secret\",\"jsonPointers\":[\"/data\",\"/stringData\"]}]},\"syncPolicy\":{\"syncOptions\":[\"CreateNamespace=true\",\"SkipDryRunOnMissingResource=true\",\"RespectIgnoreDifferences=true\"]}}"
   register: _quay_argocd_app_patch
   changed_when: "'no change' not in _quay_argocd_app_patch.stdout"
   when: not (_quay_already_on_s3 | bool)
@@ -185,8 +194,8 @@
               's3_bucket': quay_s3_storage_bucket,
               's3_region': aws.aws_region,
               'storage_path': '/datastorage/registry',
-              'access_key': aws.aws_access_key_id,
-              'secret_key': aws.aws_secret_access_key
+              's3_access_key': aws.aws_access_key_id,
+              's3_secret_key': aws.aws_secret_access_key
             }
           ]
         },
@@ -212,6 +221,38 @@
   changed_when: true
   no_log: true
   when: not (_quay_already_on_s3 | bool)
+
+# Catch an ArgoCD revert within seconds instead of discovering it 5 minutes
+# later via the generated-config-secret poll further down — confirmed live
+# this actually happens (RespectIgnoreDifferences wasn't set on an earlier
+# run, and ArgoCD overwrote this secret 2 seconds after we applied it).
+- name: Verify the config bundle secret still has our S3 storage config
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get secret init-config-bundle-secret
+    -n {{ quay_mirror_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.data.config\.yaml}' | base64 -d | grep -c DISTRIBUTED_STORAGE_CONFIG || true
+  args:
+    executable: /bin/bash
+  register: _quay_secret_survived_check
+  changed_when: false
+  no_log: true
+  when: not (_quay_already_on_s3 | bool)
+
+- name: Fail if ArgoCD reverted the S3 storage config out of the secret
+  ansible.builtin.fail:
+    msg: >-
+      init-config-bundle-secret no longer contains DISTRIBUTED_STORAGE_CONFIG
+      right after we applied it — ArgoCD's selfHeal reverted it. Check that
+      the Application's syncPolicy.syncOptions actually includes
+      RespectIgnoreDifferences=true (`oc get applications.argoproj.io
+      {{ quay_argocd_app_name }} -n {{ quay_argocd_namespace }}
+      -o jsonpath='{.spec.syncPolicy.syncOptions}'`) — ignoreDifferences
+      alone only hides a field from the diff, it does not stop sync from
+      overwriting it.
+  when:
+    - not (_quay_already_on_s3 | bool)
+    - (_quay_secret_survived_check.stdout | default('0') | trim | int) == 0
 
 - name: Mark Quay objectstorage component as unmanaged (external S3)
   ansible.builtin.command: >

@@ -23,6 +23,13 @@ spec:
     syncOptions:
       - CreateNamespace=true
       - SkipDryRunOnMissingResource=true
+      # ignoreDifferences only hides a field from diff/OutOfSync computation —
+      # it does NOT stop a sync from overwriting it. Confirmed live: without
+      # this, a sync reverted ocp/configure_quay_mirror's in-place edit to
+      # init-config-bundle-secret (adding DISTRIBUTED_STORAGE_CONFIG) 2
+      # seconds after it was applied, even with that secret already listed in
+      # ignoreDifferences below.
+      - RespectIgnoreDifferences=true
     retry:
       limit: 5
       backoff:
