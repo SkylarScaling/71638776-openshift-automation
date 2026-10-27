@@ -205,27 +205,48 @@
   no_log: true
   when: not (_quay_already_on_s3 | bool)
 
+# Write the rendered YAML to its own file rather than embedding it as a
+# nested block scalar inside an oc-apply heredoc — confirmed live: hand
+# computing the indent() offset against the heredoc's own indentation got it
+# wrong (6 spaces too many on every line after the first), producing a
+# config.yaml that failed to parse ("mapping values are not allowed in this
+# context") with no complaint at apply time, since oc apply only validates
+# the Secret envelope, not the opaque string inside it. Building the secret
+# from a real file via `oc create --dry-run` sidesteps this whole class of
+# bug — the YAML is never nested inside another YAML document.
+- name: Write Quay config bundle content to a local file
+  ansible.builtin.copy:
+    content: "{{ _quay_merged_config | to_nice_yaml(indent=2) }}"
+    dest: "{{ quay_mirror_workspace | default('/tmp') }}/quay-init-config-bundle.yaml"
+    mode: '0600'
+  no_log: true
+  when: not (_quay_already_on_s3 | bool)
+
+- name: Validate the rendered config bundle is parseable YAML
+  ansible.builtin.command: >
+    python3 -c "import yaml; yaml.safe_load(open('{{ quay_mirror_workspace | default('/tmp') }}/quay-init-config-bundle.yaml'))"
+  changed_when: false
+  when: not (_quay_already_on_s3 | bool)
+
 - name: Apply updated Quay config bundle secret with S3 storage config
-  ansible.builtin.shell:
-    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
-    stdin: |
-      apiVersion: v1
-      kind: Secret
-      metadata:
-        name: init-config-bundle-secret
-        namespace: {{ quay_mirror_namespace }}
-      type: Opaque
-      stringData:
-        config.yaml: |
-          {{ (_quay_merged_config | to_nice_yaml(indent=2)) | indent(10) }}
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc create secret generic init-config-bundle-secret
+    -n {{ quay_mirror_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+    --from-file=config.yaml={{ quay_mirror_workspace | default('/tmp') }}/quay-init-config-bundle.yaml
+    --dry-run=client -o yaml
+    | {{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -
+  args:
+    executable: /bin/bash
   changed_when: true
   no_log: true
   when: not (_quay_already_on_s3 | bool)
 
-# Catch an ArgoCD revert within seconds instead of discovering it 5 minutes
-# later via the generated-config-secret poll further down — confirmed live
-# this actually happens (RespectIgnoreDifferences wasn't set on an earlier
-# run, and ArgoCD overwrote this secret 2 seconds after we applied it).
+# Catch an ArgoCD revert, or a config the operator rejects, within seconds
+# instead of discovering it 5 minutes later via the generated-config-secret
+# poll further down — confirmed live both failure modes actually happen
+# (ArgoCD overwriting this secret before RespectIgnoreDifferences was added;
+# a malformed config.yaml the operator silently rejected every 10s).
 - name: Verify the config bundle secret still has our S3 storage config
   ansible.builtin.shell: >
     {{ bin_dir }}/oc get secret init-config-bundle-secret
