@@ -130,19 +130,26 @@
 # fixed), and this guard treated that broken leftover as "already correct",
 # skipping the whole rewrite + verification chain below on every subsequent
 # run. Only trust it once it both parses and actually names our bucket.
+# Uses a literal (|) block, not folded (>) — a folded scalar joins
+# same-indentation lines with a single space, which would have collapsed
+# this entire indentation-sensitive Python script onto one line. Confirmed
+# live: this exact mistake is why the previous version of this task failed
+# outright (it had used ">").
 - name: Check whether Quay's config bundle already has valid S3 storage config for our bucket
-  ansible.builtin.shell: >
-    echo "{{ _quay_current_config.stdout | b64encode }}" | base64 -d |
-    python3 -c "
+  ansible.builtin.shell: |
+    echo "{{ _quay_current_config.stdout | b64encode }}" | base64 -d > /tmp/_quay_current_config.yaml
+    python3 - "{{ quay_s3_storage_bucket }}" <<'PYEOF'
     import sys, yaml
+    bucket = sys.argv[1]
     try:
-        cfg = yaml.safe_load(sys.stdin)
+        cfg = yaml.safe_load(open('/tmp/_quay_current_config.yaml'))
         driver, args = cfg['DISTRIBUTED_STORAGE_CONFIG']['default']
-        ok = driver == 'S3Storage' and args.get('s3_bucket') == '{{ quay_s3_storage_bucket }}'
+        ok = driver == 'S3Storage' and args.get('s3_bucket') == bucket
     except Exception:
         ok = False
     print('true' if ok else 'false')
-    "
+    PYEOF
+    rm -f /tmp/_quay_current_config.yaml
   args:
     executable: /bin/bash
   register: _quay_already_on_s3_check
