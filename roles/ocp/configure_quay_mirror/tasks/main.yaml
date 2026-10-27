@@ -124,9 +124,34 @@
   register: _quay_current_config
   changed_when: false
 
+# A plain substring check on "DISTRIBUTED_STORAGE_CONFIG" is not enough —
+# confirmed live: a prior run left behind a config.yaml with that string
+# present but the surrounding YAML corrupted (an indentation bug since
+# fixed), and this guard treated that broken leftover as "already correct",
+# skipping the whole rewrite + verification chain below on every subsequent
+# run. Only trust it once it both parses and actually names our bucket.
+- name: Check whether Quay's config bundle already has valid S3 storage config for our bucket
+  ansible.builtin.shell: >
+    echo "{{ _quay_current_config.stdout | b64encode }}" | base64 -d |
+    python3 -c "
+    import sys, yaml
+    try:
+        cfg = yaml.safe_load(sys.stdin)
+        driver, args = cfg['DISTRIBUTED_STORAGE_CONFIG']['default']
+        ok = driver == 'S3Storage' and args.get('s3_bucket') == '{{ quay_s3_storage_bucket }}'
+    except Exception:
+        ok = False
+    print('true' if ok else 'false')
+    "
+  args:
+    executable: /bin/bash
+  register: _quay_already_on_s3_check
+  changed_when: false
+  no_log: true
+
 - name: Set fact for whether Quay is already using S3 storage
   ansible.builtin.set_fact:
-    _quay_already_on_s3: "{{ 'DISTRIBUTED_STORAGE_CONFIG' in _quay_current_config.stdout }}"
+    _quay_already_on_s3: "{{ _quay_already_on_s3_check.stdout | trim == 'true' }}"
 
 # apps_install_quay (which templates this Application, including the
 # ignoreDifferences protecting this exact secret) only runs during the hub
@@ -295,6 +320,11 @@
 # storage config at all. Check the operator's own generated config instead —
 # that's the one artifact that only exists once reconciliation actually
 # succeeded with our S3 settings.
+# Deliberately not gated on _quay_already_on_s3 — that only tells us
+# whether the SOURCE secret looks right, not whether the operator actually
+# reconciled it (confirmed live it can fail to, e.g. stuck on a stale
+# ArgoCD revert or a malformed config from an older run). This is the real
+# verification and must always run.
 - name: Find Quay's generated internal config secret
   ansible.builtin.shell: >
     {{ bin_dir }}/oc get secret -n {{ quay_mirror_namespace }}
@@ -306,7 +336,6 @@
   until: _quay_generated_config_secret.stdout | default('') != ''
   retries: 10
   delay: 10
-  when: not (_quay_already_on_s3 | bool)
 
 - name: Wait for Quay's generated config to actually pick up S3 storage
   ansible.builtin.shell: >
@@ -321,9 +350,7 @@
   until: (_quay_generated_config_check.stdout | default('0') | trim | int) > 0
   retries: 20
   delay: 15
-  when:
-    - not (_quay_already_on_s3 | bool)
-    - _quay_generated_config_secret.stdout | default('') != ''
+  when: _quay_generated_config_secret.stdout | default('') != ''
 
 - name: Fail if Quay never reconciled the S3 storage config
   ansible.builtin.fail:
@@ -336,9 +363,7 @@
       actually protected init-config-bundle-secret from being reverted
       (`oc get secret init-config-bundle-secret -n {{ quay_mirror_namespace }}
       -o jsonpath='{.data.config\.yaml}' | base64 -d`).
-  when:
-    - not (_quay_already_on_s3 | bool)
-    - _quay_generated_config_secret.stdout | default('') == ''
+  when: _quay_generated_config_secret.stdout | default('') == ''
 
 - name: Wait for QuayRegistry to be Available
   ansible.builtin.shell: >
