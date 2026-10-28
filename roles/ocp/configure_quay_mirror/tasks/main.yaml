@@ -494,47 +494,6 @@
   register: _quay_app_pod
   changed_when: false
 
-# Switching the objectstorage backend changes the location name Quay writes
-# new blobs under ('default' for our S3Storage config) but does not purge
-# ImageStoragePlacement rows already pointing at the OLD location (NooBaa's
-# default is 'local_us') — confirmed live: 144 such rows survived the
-# switch, from blobs that partially uploaded to NooBaa before it OOMKilled
-# mid-run. A raw `DELETE FROM imagestorageplacement` (first attempt at this
-# fix) turned the resulting 500 (KeyError on the missing location) into a
-# 400 instead of actually fixing it: it orphaned the imagestorage/
-# manifestblob rows that pointed at those placements, and Quay's blob-exists
-# check then failed with InvalidImageException ("No storage found with
-# uuid") looking up a storage row with zero placements at all. Nothing in
-# this org was ever actually stored anywhere (every imagestorage row here
-# was mid-upload, uploading='t', when NooBaa OOMKilled it) — there's no real
-# data to preserve.
-#
-# Delete the repository rows themselves (standard Quay schema: `repository`
-# keyed by `namespace_user_id` -> `user.id`) rather than hand-editing
-# storage-internal tables a second time — Quay's own foreign keys cascade
-# the tag/manifest/manifestblob rows for a deleted repository, which is
-# exactly the association Quay's blob-exists check actually looks up
-# per-repository. Any now-unreferenced imagestorage/imagestorageplacement
-# rows left behind are harmless (nothing queries them outside a repository
-# context) and get swept up by Quay's own GC workers over time.
-#
-# Deliberately NOT gated on _quay_already_on_s3 — confirmed live that gate
-# made the original version of this fix dead code: the switch had already
-# completed successfully in an earlier run by the time it was added, so
-# every run since reported "already on S3" and skipped it, leaving the same
-# broken repository in place through another full attempt. Safe to run
-# every time: the org not existing (fresh install) or having zero
-# repositories is a normal no-op.
-- name: Delete mirror org repositories left with orphaned (placement-less) storage
-  ansible.builtin.shell: >
-    {{ bin_dir }}/oc exec -n {{ quay_mirror_namespace }}
-    --kubeconfig {{ target_kubeconfig }}
-    deploy/{{ quay_mirror_registry_name }}-quay-database -c postgres --
-    psql -U {{ quay_mirror_registry_name }}-quay-database -d {{ quay_mirror_registry_name }}-quay-database
-    -c "delete from repository where namespace_user_id = (select id from \"user\" where username = '{{ quay_mirror_org }}');"
-  register: _quay_mirror_repos_purge
-  changed_when: "'DELETE' in _quay_mirror_repos_purge.stdout"
-
 - name: Configure Quay admin user, mirror org, and robot account via Python model
   ansible.builtin.shell: |
     cat << 'PYEOF' | {{ bin_dir }}/oc exec -i -n {{ quay_mirror_namespace }} \
@@ -613,6 +572,56 @@
     executable: /bin/bash
   register: _quay_setup
   changed_when: true
+  no_log: true
+
+# Switching the objectstorage backend changes the location name Quay writes
+# new blobs under ('default' for our S3Storage config) but does not purge
+# ImageStoragePlacement rows already pointing at the OLD location (NooBaa's
+# default is 'local_us') — confirmed live: 144 such rows survived the
+# switch, from blobs that partially uploaded to NooBaa before it OOMKilled
+# mid-run. Raw SQL against the storage tables (first attempt) turned a 500
+# into a 400 by orphaning imagestorage/manifestblob rows instead of fixing
+# anything, and deleting `repository` directly hit a foreign key Quay
+# doesn't cascade on (blobupload.repository_id) — and there's no guarantee
+# that's the only non-cascading FK in this chain. Nothing in this org was
+# ever actually stored anywhere (every imagestorage row here was mid-upload,
+# uploading='t', when NooBaa OOMKilled it) — there's no real data to
+# preserve, so delete the repositories via Quay's own REST API instead of
+# guessing at its schema's FK graph: the API's repository delete already
+# knows how to tear down every dependent row correctly, which is the whole
+# reason it exists. Runs after admin/org setup above so the credentials
+# used here are guaranteed to exist and be current.
+#
+# Deliberately NOT gated on _quay_already_on_s3 — confirmed live that gate
+# made an earlier version of this fix dead code: the switch had already
+# completed successfully in an earlier run by the time it was added, so
+# every run since reported "already on S3" and skipped it, leaving the same
+# broken repositories in place through another full attempt. Safe to run
+# every time: the org having zero repositories is a normal no-op.
+- name: List mirror org repositories via Quay API
+  ansible.builtin.uri:
+    url: "https://{{ quay_registry_url }}/api/v1/repository?namespace={{ quay_mirror_org }}&last_modified=false"
+    method: GET
+    user: "{{ quay_mirror_admin_user }}"
+    password: "{{ quay_mirror_admin_password }}"
+    force_basic_auth: true
+    validate_certs: false
+    status_code: [200]
+  register: _quay_org_repos
+  no_log: true
+
+- name: Delete mirror org repositories left with orphaned (placement-less) storage
+  ansible.builtin.uri:
+    url: "https://{{ quay_registry_url }}/api/v1/repository/{{ quay_mirror_org }}/{{ item.name }}"
+    method: DELETE
+    user: "{{ quay_mirror_admin_user }}"
+    password: "{{ quay_mirror_admin_password }}"
+    force_basic_auth: true
+    validate_certs: false
+    status_code: [204]
+  loop: "{{ _quay_org_repos.json.repositories | default([]) }}"
+  loop_control:
+    label: "{{ item.name }}"
   no_log: true
 
 - name: Parse robot account credentials from Quay setup output
