@@ -10,66 +10,17 @@
 # calling Quay's internal model functions directly in the container.
 # ==============================================================================
 
-# Quay's blob storage (NooBaa/MCG default pv-pool) only ever gets a single
-# 50Gi volume from ODF out of the box — far too small for the full OCP
-# release+operator mirror payload (confirmed live: 82G on the jumphost's own
-# registry), and the single agent pod backing it gets OOMKilled mid-upload
-# under that load (NooBaa hardcodes 400Mi per agent; not configurable via
-# this CRD). Quay then returns a 500 on blob writes that no retry in
-# ocp/remirror_to_quay can recover from, since it's a capacity problem, not
-# a transient race. Scale out before Quay/oc-mirror ever touch it.
-- name: Wait for the default NooBaa backing store to exist
-  ansible.builtin.command: >
-    {{ bin_dir }}/oc get backingstore noobaa-default-backing-store
-    -n openshift-storage
-    --kubeconfig {{ target_kubeconfig }}
-    -o jsonpath='{.metadata.name}'
-  register: _noobaa_backingstore_check
-  changed_when: false
-  failed_when: false
-  until: _noobaa_backingstore_check.rc == 0
-  retries: 30
-  delay: 20
-
-- name: Scale the NooBaa default backing store pv-pool
-  ansible.builtin.command: >
-    {{ bin_dir }}/oc patch backingstore noobaa-default-backing-store
-    -n openshift-storage
-    --kubeconfig {{ target_kubeconfig }}
-    --type=merge
-    -p "{\"spec\":{\"pvPool\":{\"numVolumes\": {{ quay_backing_store_num_volumes }} }}}"
-  register: _noobaa_backingstore_patch
-  changed_when: "'no change' not in _noobaa_backingstore_patch.stdout"
-  when: _noobaa_backingstore_check.rc == 0
-
-# Non-fatal: this is a best-effort readiness wait, not a hard gate. If the
-# pod-listing heuristic below ever breaks (e.g. a NooBaa version changes
-# naming), remirror_to_quay's own failure message already points at the
-# right place to look, so don't block the whole run on this probe.
-- name: Wait for NooBaa pv-pool agent pods to scale up and stabilize
-  ansible.builtin.shell: >
-    {{ bin_dir }}/oc get pods -n openshift-storage
-    --kubeconfig {{ target_kubeconfig }}
-    --no-headers 2>/dev/null
-    | grep noobaa-default-backing-store
-    | grep -c Running
-  register: _noobaa_running_count
-  changed_when: false
-  failed_when: false
-  until: (_noobaa_running_count.stdout | default('0') | trim | int) >= (quay_backing_store_num_volumes | int)
-  retries: 30
-  delay: 20
-  when: _noobaa_backingstore_check.rc == 0
-
-# The pv-pool scaling above only raises total capacity — confirmed live
-# (two separate ocp-debug investigations) it still OOMKills under the full
-# mirror payload regardless of numVolumes or oc-mirror client concurrency,
-# because NooBaa hardcodes each agent to 400Mi and Quay's server-side
-# multipart assembly (UploadPartCopy) runs independently of the client.
-# There's no supported knob to raise that limit. Move Quay's storage off
-# the pv-pool entirely onto a real AWS S3 bucket instead — the Cluster VPC
-# already has an S3 gateway endpoint (aws/create_vpc_endpoints), so this
-# works under network lockdown with no internet egress required.
+# ODF's default NooBaa/MCG pv-pool backing store can't hold or serve the
+# full OCP release+operator mirror payload: it hardcodes each pv-pool agent
+# pod to a 400Mi memory limit with no CRD knob to raise it, and Quay's
+# server-side multipart blob assembly OOMKills that agent regardless of
+# pv-pool size or client-side concurrency (confirmed live via two separate
+# ocp-debug investigations). ODF also skips deploying Ceph RGW (which would
+# give an S3-compatible in-cluster alternative) on cloud platforms, so
+# there's no in-cluster object-storage option at all on AWS. Use a real AWS
+# S3 bucket instead — the Cluster VPC already has an S3 gateway endpoint
+# (aws/create_vpc_endpoints), so this works under network lockdown with no
+# internet egress required.
 - name: Ensure AWS CLI is available
   ansible.builtin.include_role:
     name: aws/ensure_aws_cli
