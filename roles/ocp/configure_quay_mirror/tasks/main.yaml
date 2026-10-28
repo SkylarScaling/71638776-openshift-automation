@@ -507,6 +507,15 @@
 # it into the new S3 bucket either (NooBaa never finished storing them), so
 # there's no real data to lose — just stale bookkeeping pointing at a
 # location Quay no longer knows about.
+#
+# Deliberately NOT gated on _quay_already_on_s3 — confirmed live that gate
+# made this a one-shot fix that only ever runs on the single run where the
+# switch itself happens. The switch had already completed successfully in
+# an earlier run by the time this task was added, so every run since
+# reported "already on S3" and skipped it, leaving the same stale rows (and
+# the exact same failing digest) in place through another full attempt.
+# This delete is a no-op once the stale rows are gone, so running it every
+# time is free.
 - name: Purge stale object storage placement rows left over from a prior storage backend
   ansible.builtin.shell: >
     {{ bin_dir }}/oc exec -n {{ quay_mirror_namespace }}
@@ -516,7 +525,6 @@
     -c "delete from imagestorageplacement where location_id in (select id from imagestoragelocation where name != 'default');"
   register: _quay_storage_placement_purge
   changed_when: "'DELETE' in _quay_storage_placement_purge.stdout"
-  when: not (_quay_already_on_s3 | bool)
 
 - name: Configure Quay admin user, mirror org, and robot account via Python model
   ansible.builtin.shell: |
