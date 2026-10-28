@@ -499,32 +499,41 @@
 # ImageStoragePlacement rows already pointing at the OLD location (NooBaa's
 # default is 'local_us') — confirmed live: 144 such rows survived the
 # switch, from blobs that partially uploaded to NooBaa before it OOMKilled
-# mid-run. Quay's distributedstorage wrapper does `self._storages[location]`
-# with no KeyError handling, so any blob-exists/HEAD check against one of
-# those rows crashes the whole request with a 500 — which oc-mirror hits on
-# literally the first image it checks ("trying to reuse blob ... at
-# destination"), aborting the entire push. The underlying bytes never made
-# it into the new S3 bucket either (NooBaa never finished storing them), so
-# there's no real data to lose — just stale bookkeeping pointing at a
-# location Quay no longer knows about.
+# mid-run. A raw `DELETE FROM imagestorageplacement` (first attempt at this
+# fix) turned the resulting 500 (KeyError on the missing location) into a
+# 400 instead of actually fixing it: it orphaned the imagestorage/
+# manifestblob rows that pointed at those placements, and Quay's blob-exists
+# check then failed with InvalidImageException ("No storage found with
+# uuid") looking up a storage row with zero placements at all. Nothing in
+# this org was ever actually stored anywhere (every imagestorage row here
+# was mid-upload, uploading='t', when NooBaa OOMKilled it) — there's no real
+# data to preserve.
+#
+# Delete the repository rows themselves (standard Quay schema: `repository`
+# keyed by `namespace_user_id` -> `user.id`) rather than hand-editing
+# storage-internal tables a second time — Quay's own foreign keys cascade
+# the tag/manifest/manifestblob rows for a deleted repository, which is
+# exactly the association Quay's blob-exists check actually looks up
+# per-repository. Any now-unreferenced imagestorage/imagestorageplacement
+# rows left behind are harmless (nothing queries them outside a repository
+# context) and get swept up by Quay's own GC workers over time.
 #
 # Deliberately NOT gated on _quay_already_on_s3 — confirmed live that gate
-# made this a one-shot fix that only ever runs on the single run where the
-# switch itself happens. The switch had already completed successfully in
-# an earlier run by the time this task was added, so every run since
-# reported "already on S3" and skipped it, leaving the same stale rows (and
-# the exact same failing digest) in place through another full attempt.
-# This delete is a no-op once the stale rows are gone, so running it every
-# time is free.
-- name: Purge stale object storage placement rows left over from a prior storage backend
+# made the original version of this fix dead code: the switch had already
+# completed successfully in an earlier run by the time it was added, so
+# every run since reported "already on S3" and skipped it, leaving the same
+# broken repository in place through another full attempt. Safe to run
+# every time: the org not existing (fresh install) or having zero
+# repositories is a normal no-op.
+- name: Delete mirror org repositories left with orphaned (placement-less) storage
   ansible.builtin.shell: >
     {{ bin_dir }}/oc exec -n {{ quay_mirror_namespace }}
     --kubeconfig {{ target_kubeconfig }}
     deploy/{{ quay_mirror_registry_name }}-quay-database -c postgres --
     psql -U {{ quay_mirror_registry_name }}-quay-database -d {{ quay_mirror_registry_name }}-quay-database
-    -c "delete from imagestorageplacement where location_id in (select id from imagestoragelocation where name != 'default');"
-  register: _quay_storage_placement_purge
-  changed_when: "'DELETE' in _quay_storage_placement_purge.stdout"
+    -c "delete from repository where namespace_user_id = (select id from \"user\" where username = '{{ quay_mirror_org }}');"
+  register: _quay_mirror_repos_purge
+  changed_when: "'DELETE' in _quay_mirror_repos_purge.stdout"
 
 - name: Configure Quay admin user, mirror org, and robot account via Python model
   ansible.builtin.shell: |
