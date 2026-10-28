@@ -214,10 +214,35 @@
     seconds: 15
   when: not (_quay_already_on_s3 | bool)
 
+# The live secret can still be the corrupted leftover from an older,
+# since-fixed bug (invalid YAML) — confirmed live this isn't hypothetical.
+# from_yaml on that would hard-fail this task with no useful error under
+# no_log. Fall back to the known-good GitOps baseline (gitops-install-quay's
+# 04-init-config-bundle-secret.yaml) rather than crash, so a corrupted
+# leftover self-heals on the next run instead of wedging it permanently.
+- name: Parse current Quay config bundle
+  ansible.builtin.set_fact:
+    _quay_current_config_parsed: "{{ _quay_current_config.stdout | from_yaml }}"
+  ignore_errors: true
+  no_log: true
+  when: not (_quay_already_on_s3 | bool)
+
+- name: Fall back to the known GitOps baseline if the current config bundle failed to parse
+  ansible.builtin.set_fact:
+    _quay_current_config_parsed:
+      FEATURE_USER_INITIALIZE: true
+      BROWSER_API_CALLS_XHR_ONLY: false
+      SUPER_USERS: ["quayadmin"]
+      FEATURE_USER_CREATION: true
+      FEATURE_SUPERUSERS_FULL_ACCESS: true
+  when:
+    - not (_quay_already_on_s3 | bool)
+    - _quay_current_config_parsed is not defined
+
 - name: Merge S3 storage config into Quay config bundle
   ansible.builtin.set_fact:
     _quay_merged_config: >-
-      {{ (_quay_current_config.stdout | from_yaml) | combine({
+      {{ _quay_current_config_parsed | combine({
         'DISTRIBUTED_STORAGE_CONFIG': {
           'default': [
             'S3Storage',
