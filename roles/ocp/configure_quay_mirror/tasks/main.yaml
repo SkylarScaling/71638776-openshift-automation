@@ -357,24 +357,20 @@
 # reconciled it (confirmed live it can fail to, e.g. stuck on a stale
 # ArgoCD revert or a malformed config from an older run). This is the real
 # verification and must always run.
-- name: Find Quay's generated internal config secret
-  ansible.builtin.shell: >
-    {{ bin_dir }}/oc get secret -n {{ quay_mirror_namespace }}
-    --kubeconfig {{ target_kubeconfig }}
-    -o name | grep -- '-quay-config-secret-' | head -1
-  register: _quay_generated_config_secret
-  changed_when: false
-  failed_when: false
-  until: _quay_generated_config_secret.stdout | default('') != ''
-  retries: 10
-  delay: 10
-
+# Re-resolve the secret's name on every attempt rather than finding it once
+# up front — confirmed live: once reconciliation actually succeeds, the
+# operator replaces the generated secret with a NEW name/hash rather than
+# updating it in place, so a name captured before that point goes stale and
+# flips from "found, wrong content" straight to NotFound mid-poll.
 - name: Wait for Quay's generated config to actually pick up S3 storage
   ansible.builtin.shell: >
-    {{ bin_dir }}/oc get {{ _quay_generated_config_secret.stdout }}
-    -n {{ quay_mirror_namespace }}
+    SECRET=$({{ bin_dir }}/oc get secret -n {{ quay_mirror_namespace }}
     --kubeconfig {{ target_kubeconfig }}
-    -o jsonpath='{.data.config\.yaml}' | base64 -d | grep -c S3Storage || true
+    -o name | grep -- '-quay-config-secret-' | head -1);
+    [ -z "$SECRET" ] && exit 0;
+    {{ bin_dir }}/oc get "$SECRET" -n {{ quay_mirror_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.data.config\.yaml}' 2>/dev/null | base64 -d 2>/dev/null | grep -c S3Storage || true
   args:
     executable: /bin/bash
   register: _quay_generated_config_check
@@ -382,7 +378,6 @@
   until: (_quay_generated_config_check.stdout | default('0') | trim | int) > 0
   retries: 20
   delay: 15
-  when: _quay_generated_config_secret.stdout | default('') != ''
 
 - name: Fail if Quay never reconciled the S3 storage config
   ansible.builtin.fail:
@@ -395,7 +390,7 @@
       actually protected init-config-bundle-secret from being reverted
       (`oc get secret init-config-bundle-secret -n {{ quay_mirror_namespace }}
       -o jsonpath='{.data.config\.yaml}' | base64 -d`).
-  when: _quay_generated_config_secret.stdout | default('') == ''
+  when: (_quay_generated_config_check.stdout | default('0') | trim | int) == 0
 
 - name: Wait for QuayRegistry to be Available
   ansible.builtin.shell: >
