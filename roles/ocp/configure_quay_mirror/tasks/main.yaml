@@ -494,6 +494,30 @@
   register: _quay_app_pod
   changed_when: false
 
+# Switching the objectstorage backend changes the location name Quay writes
+# new blobs under ('default' for our S3Storage config) but does not purge
+# ImageStoragePlacement rows already pointing at the OLD location (NooBaa's
+# default is 'local_us') — confirmed live: 144 such rows survived the
+# switch, from blobs that partially uploaded to NooBaa before it OOMKilled
+# mid-run. Quay's distributedstorage wrapper does `self._storages[location]`
+# with no KeyError handling, so any blob-exists/HEAD check against one of
+# those rows crashes the whole request with a 500 — which oc-mirror hits on
+# literally the first image it checks ("trying to reuse blob ... at
+# destination"), aborting the entire push. The underlying bytes never made
+# it into the new S3 bucket either (NooBaa never finished storing them), so
+# there's no real data to lose — just stale bookkeeping pointing at a
+# location Quay no longer knows about.
+- name: Purge stale object storage placement rows left over from a prior storage backend
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc exec -n {{ quay_mirror_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+    deploy/{{ quay_mirror_registry_name }}-quay-database -c postgres --
+    psql -U {{ quay_mirror_registry_name }}-quay-database -d {{ quay_mirror_registry_name }}-quay-database
+    -c "delete from imagestorageplacement where location_id in (select id from imagestoragelocation where name != 'default');"
+  register: _quay_storage_placement_purge
+  changed_when: "'DELETE' in _quay_storage_placement_purge.stdout"
+  when: not (_quay_already_on_s3 | bool)
+
 - name: Configure Quay admin user, mirror org, and robot account via Python model
   ansible.builtin.shell: |
     cat << 'PYEOF' | {{ bin_dir }}/oc exec -i -n {{ quay_mirror_namespace }} \
