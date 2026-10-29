@@ -549,30 +549,48 @@
 # every run since reported "already on S3" and skipped it, leaving the same
 # broken repositories in place through another full attempt. Safe to run
 # every time: the org having zero repositories is a normal no-op.
-- name: List mirror org repositories via Quay API
-  ansible.builtin.uri:
-    url: "https://{{ quay_registry_url }}/api/v1/repository?namespace={{ quay_mirror_org }}&last_modified=false"
-    method: GET
-    user: "{{ quay_mirror_admin_user }}"
-    password: "{{ quay_mirror_admin_password }}"
-    force_basic_auth: true
-    validate_certs: false
-    status_code: [200]
-  register: _quay_org_repos
-  no_log: true
+#
+# The REST list API (`GET /api/v1/repository?namespace=...`) is NOT a valid
+# enumeration source here — confirmed live it silently returned an empty
+# repositories list for two consecutive runs. That endpoint filters through
+# `repositorypermission` rows, but repos auto-created by a robot's push (as
+# oc-mirror does) only grant access via the robot's org `owners` team
+# membership — no per-repository permission row is ever created, so the
+# permission-filtered list can't see them even for an org owner/superuser.
+# The DELETE loop was then looping over an empty list every run and silently
+# reporting "skipping", masking the bug across multiple attempts. Enumerate
+# via Quay's own model instead (same in-pod approach as the admin/org/robot
+# setup above) and purge via `data.model.gc.purge_repository` — the same GC
+# entrypoint the REST delete endpoint itself calls — which sees every repo
+# regardless of permission rows and tears down all dependent rows correctly.
+- name: Purge mirror org repositories left with orphaned (placement-less) storage
+  ansible.builtin.shell: |
+    cat << 'PYEOF' | {{ bin_dir }}/oc exec -i -n {{ quay_mirror_namespace }} \
+      --kubeconfig {{ target_kubeconfig }} \
+      {{ _quay_app_pod.stdout | trim }} \
+      -- python3 -
+    import sys, os
+    sys.path.insert(0, '/quay-registry')
+    os.chdir('/quay-registry')
+    from app import app
+    from data.database import Repository, User
+    from data.model.gc import purge_repository
 
-- name: Delete mirror org repositories left with orphaned (placement-less) storage
-  ansible.builtin.uri:
-    url: "https://{{ quay_registry_url }}/api/v1/repository/{{ quay_mirror_org }}/{{ item.name }}"
-    method: DELETE
-    user: "{{ quay_mirror_admin_user }}"
-    password: "{{ quay_mirror_admin_password }}"
-    force_basic_auth: true
-    validate_certs: false
-    status_code: [204]
-  loop: "{{ _quay_org_repos.json.repositories | default([]) }}"
-  loop_control:
-    label: "{{ item.name }}"
+    with app.app_context():
+        repos = list(
+            Repository.select()
+            .join(User, on=Repository.namespace_user)
+            .where(User.username == '{{ quay_mirror_org }}')
+        )
+        for repo in repos:
+            purge_repository(repo, force=True)
+        print('PURGED_COUNT=' + str(len(repos)))
+    PYEOF
+  args:
+    executable: /bin/bash
+  register: _quay_repos_purge
+  changed_when: "'PURGED_COUNT=0' not in _quay_repos_purge.stdout"
+  failed_when: "'PURGED_COUNT=' not in _quay_repos_purge.stdout"
   no_log: true
 
 - name: Parse robot account credentials from Quay setup output
