@@ -90,17 +90,55 @@
         cs_dir = '{{ quay_mirror_workspace }}/working-dir/cluster-resources'
         quay = '{{ quay_registry_url }}'
         valid = False
+        repo_path = ''
+        reference = ''
         for f in glob.glob(cs_dir + '/cs-*.yaml'):
             for doc in yaml.safe_load_all(open(f)):
                 if doc and doc.get('kind') == 'CatalogSource':
                     img = doc.get('spec', {}).get('image', '')
                     if img and quay in img:
                         valid = True
+                        # CatalogSource images may be tag-based
+                        # (registry/path:tag) or digest-based
+                        # (registry/path@sha256:digest) -- confirmed live
+                        # this repo's is tag-based, not digest-based.
+                        if '@' in img:
+                            path, reference = img.split('@', 1)
+                        else:
+                            path, reference = img.rsplit(':', 1)
+                        repo_path = path.split('/', 1)[1] if '/' in path else ''
         print('valid' if valid else 'invalid')
+        print(repo_path)
+        print(reference)
         "
       register: _quay_cs_image_valid
       changed_when: false
       failed_when: false
+
+# Every input above (IDMS/ITMS files, CatalogSource files, the version
+# sentinel, and even the CatalogSource image path check) only ever reads
+# files left on THIS jumphost's local disk -- none of them ask Quay whether
+# the content they describe still actually exists there. Confirmed live:
+# after configure_quay_mirror's repository purge emptied the mirror org,
+# this flag still came back "complete" from stale local files, the entire
+# re-push was skipped, and IDMS/ITMS pointing at an empty registry got
+# rolled out to every node, which then jammed drains cluster-wide on
+# ImagePullBackOff. Actually ask the registry.
+- name: Verify the CatalogSource image is actually present in Quay (not just recorded locally)
+  ansible.builtin.uri:
+    url: "https://{{ quay_registry_url }}/v2/{{ _quay_cs_image_valid.stdout_lines[1] }}/manifests/{{ _quay_cs_image_valid.stdout_lines[2] }}"
+    method: HEAD
+    url_username: "{{ quay_robot_username }}"
+    url_password: "{{ quay_robot_token }}"
+    force_basic_auth: true
+    validate_certs: false
+    headers:
+      Accept: "application/vnd.docker.distribution.manifest.v2+json"
+    status_code: [200]
+  register: _quay_registry_content_check
+  failed_when: false
+  when: _quay_cs_image_valid.stdout_lines[1] | default('') != ''
+  no_log: true
 
 - name: Set Quay oc-mirror completion flag
   ansible.builtin.set_fact:
@@ -109,7 +147,8 @@
          and _quay_existing_cs.files | default([]) | length > 0
          and (_quay_mirror_version.content | default('') | b64decode | trim)
              == (openshift_version ~ '.' ~ ocp_patch_version)
-         and _quay_cs_image_valid.stdout | default('invalid') == 'valid' }}
+         and _quay_cs_image_valid.stdout_lines[0] | default('invalid') == 'valid'
+         and _quay_registry_content_check.status | default(0) == 200 }}
 
 - name: Clean stale Quay oc-mirror workspace for fresh re-run
   ansible.builtin.file:

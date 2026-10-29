@@ -534,21 +534,52 @@
 # into a 400 by orphaning imagestorage/manifestblob rows instead of fixing
 # anything, and deleting `repository` directly hit a foreign key Quay
 # doesn't cascade on (blobupload.repository_id) — and there's no guarantee
-# that's the only non-cascading FK in this chain. Nothing in this org was
-# ever actually stored anywhere (every imagestorage row here was mid-upload,
-# uploading='t', when NooBaa OOMKilled it) — there's no real data to
-# preserve, so delete the repositories via Quay's own REST API instead of
-# guessing at its schema's FK graph: the API's repository delete already
-# knows how to tear down every dependent row correctly, which is the whole
-# reason it exists. Runs after admin/org setup above so the credentials
-# used here are guaranteed to exist and be current.
+# that's the only non-cascading FK in this chain. Delete via Quay's own
+# model purge instead of guessing at its schema's FK graph.
 #
+# CRITICAL SCOPE BUG, confirmed live and fixed here: an earlier version of
+# this task purged EVERY repository in the mirror org unconditionally, with
+# no check for whether a repo actually had any valid (placed) storage. That
+# was only safe the very first time, right after the NooBaa OOMKill left
+# every repo's storage mid-upload with zero real content. Once oc-mirror
+# successfully re-pushed real content to S3, this same task wiped that
+# content out again on every subsequent run — deleting a mirror org that was
+# already serving images to the live cluster. That, combined with
+# ocp/remirror_to_quay's completion check only ever reading stale local
+# files (now also fixed), meant the push was silently skipped right after
+# the org was emptied, IDMS/ITMS pointing at the now-empty registry got
+# applied, and every node drain cluster-wide jammed on ImagePullBackOff.
+#
+# Scope the purge to repositories with zero valid (placed) storage anywhere
+# — i.e. genuinely orphaned leftovers, never anything with real content —
+# determined via a read-only SQL query against the same schema confirmed
+# live during the original investigation (manifestblob -> imagestorage ->
+# imagestoragelocation via imagestorageplacement).
+- name: Find mirror org repositories with zero valid blob storage placements
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc exec -n {{ quay_mirror_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+    deploy/{{ quay_mirror_registry_name }}-quay-database -c postgres --
+    psql -U {{ quay_mirror_registry_name }}-quay-database -d {{ quay_mirror_registry_name }}-quay-database
+    -t -A -c "select r.name from repository r join \"user\" u on r.namespace_user_id = u.id
+    where u.username = '{{ quay_mirror_org }}' and not exists
+    (select 1 from manifestblob mb join imagestorageplacement isp on isp.storage_id = mb.blob_id
+    where mb.repository_id = r.id);"
+  register: _quay_orphan_repo_check
+  changed_when: false
+
+- name: Set orphaned mirror org repository name list
+  ansible.builtin.set_fact:
+    _quay_orphan_repo_names: "{{ _quay_orphan_repo_check.stdout_lines | select('trim') | list }}"
+
 # Deliberately NOT gated on _quay_already_on_s3 — confirmed live that gate
 # made an earlier version of this fix dead code: the switch had already
 # completed successfully in an earlier run by the time it was added, so
 # every run since reported "already on S3" and skipped it, leaving the same
 # broken repositories in place through another full attempt. Safe to run
-# every time: the org having zero repositories is a normal no-op.
+# every time now that the purge is scoped to the SQL-verified orphan list
+# above: an empty list (the normal case once the org has real content) is a
+# no-op, not a full-org wipe.
 #
 # The REST list API (`GET /api/v1/repository?namespace=...`) is NOT a valid
 # enumeration source here — confirmed live it silently returned an empty
@@ -557,24 +588,25 @@
 # oc-mirror does) only grant access via the robot's org `owners` team
 # membership — no per-repository permission row is ever created, so the
 # permission-filtered list can't see them even for an org owner/superuser.
-# The DELETE loop was then looping over an empty list every run and silently
-# reporting "skipping", masking the bug across multiple attempts. Enumerate
-# via Quay's own model instead (same in-pod approach as the admin/org/robot
-# setup above) and purge via `data.model.gc.purge_repository` — the same GC
-# entrypoint the REST delete endpoint itself calls — which sees every repo
-# regardless of permission rows and tears down all dependent rows correctly.
+# Enumerate via Quay's own model instead (same in-pod approach as the
+# admin/org/robot setup above) and purge via `data.model.gc.purge_repository`
+# — the same GC entrypoint the REST delete endpoint itself calls — which
+# sees every repo regardless of permission rows and tears down all
+# dependent rows correctly. Restricted to the orphan name list from above.
 - name: Purge mirror org repositories left with orphaned (placement-less) storage
   ansible.builtin.shell: |
     cat << 'PYEOF' | {{ bin_dir }}/oc exec -i -n {{ quay_mirror_namespace }} \
       --kubeconfig {{ target_kubeconfig }} \
       {{ _quay_app_pod.stdout | trim }} \
       -- python3 -
-    import sys, os
+    import sys, os, json
     sys.path.insert(0, '/quay-registry')
     os.chdir('/quay-registry')
     from app import app
     from data.database import Repository, User
     from data.model.gc import purge_repository
+
+    orphan_names = set(json.loads('{{ _quay_orphan_repo_names | to_json }}'))
 
     with app.app_context():
         repos = list(
@@ -582,9 +614,12 @@
             .join(User, on=Repository.namespace_user)
             .where(User.username == '{{ quay_mirror_org }}')
         )
+        purged = 0
         for repo in repos:
-            purge_repository(repo, force=True)
-        print('PURGED_COUNT=' + str(len(repos)))
+            if repo.name in orphan_names:
+                purge_repository(repo, force=True)
+                purged += 1
+        print('PURGED_COUNT=' + str(purged))
     PYEOF
   args:
     executable: /bin/bash
