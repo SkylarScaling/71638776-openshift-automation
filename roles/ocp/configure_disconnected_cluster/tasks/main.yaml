@@ -29,20 +29,34 @@
   register: _existing_idms
   changed_when: false
 
+# ImageTagMirrorSet is required alongside IDMS for tag-based image pulls
+# (e.g. the ODF console-patch Job's `:latest` reference) -- IDMS only ever
+# redirects pulls that already resolve to a digest. Checked separately so a
+# cluster that somehow has IDMS but not ITMS (e.g. an older run, before this
+# was added) doesn't get skipped as "already configured".
+- name: Check if cluster already has an ImageTagMirrorSet
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get imagetagmirrorset
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true
+  register: _existing_itms
+  changed_when: false
+
 - name: Set cluster already configured flag
   ansible.builtin.set_fact:
     _disconnected_cluster_already_configured: >-
       {{ (mirror_registry_url in _existing_catalogsources.stdout)
-         and (_existing_idms.stdout | trim != '') }}
+         and (_existing_idms.stdout | trim != '')
+         and (_existing_itms.stdout | trim != '') }}
 
-- name: Apply ImageDigestMirrorSet / ImageContentSourcePolicy manifests
+- name: Apply ImageDigestMirrorSet / ImageTagMirrorSet / ImageContentSourcePolicy manifests
   ansible.builtin.shell:
     cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
     stdin: "{{ item }}"
   loop: "{{ oc_mirror_idms_manifests }}"
   loop_control:
     index_var: _idms_idx
-    label: "IDMS manifest {{ _idms_idx + 1 }}"
+    label: "IDMS/ITMS manifest {{ _idms_idx + 1 }}"
   changed_when: true
   when: not _disconnected_cluster_already_configured
 

@@ -19,12 +19,14 @@
 # exist. A partial rc=14 failure writes the IDMS but not the CatalogSource, so
 # checking only for the IDMS causes re-runs to skip mirroring while leaving
 # oc_mirror_catalogsource_manifests empty.
-- name: Check for existing oc-mirror v2 IDMS results
+- name: Check for existing oc-mirror v2 IDMS/ITMS results
   ansible.builtin.find:
     paths: "{{ oc_mirror_workspace }}/working-dir/cluster-resources"
     patterns:
       - "idms-*.yaml"
       - "imageDigestMirrorSet*.yaml"
+      - "itms-*.yaml"
+      - "imageTagMirrorSet*.yaml"
     file_type: file
   register: existing_idms
   failed_when: false
@@ -274,13 +276,22 @@
     - oc_mirror_regen_result.finished
     - oc_mirror_regen_result.rc not in [0, 4]
 
-- name: Find IDMS files in oc-mirror v2 cluster-resources output
+# ImageDigestMirrorSet only redirects pulls that already resolve to a
+# digest. Tag-based pulls (e.g. the ODF console-patch Job's `:latest`
+# reference) are never rewritten by IDMS at all -- the kubelet resolves the
+# tag against the original registry first, which fails outright under
+# network lockdown. oc-mirror v2 generates a separate ImageTagMirrorSet
+# (itms-*.yaml) for exactly this case; collect it alongside IDMS/ICSP so
+# tag-based additionalImages actually get redirected once applied.
+- name: Find IDMS/ITMS files in oc-mirror v2 cluster-resources output
   ansible.builtin.find:
     paths: "{{ oc_mirror_workspace }}/working-dir/cluster-resources"
     patterns:
       - "idms-*.yaml"
       - "imageDigestMirrorSet*.yaml"
       - "imageContentSourcePolicy*.yaml"
+      - "itms-*.yaml"
+      - "imageTagMirrorSet*.yaml"
     file_type: file
   register: idms_files
 

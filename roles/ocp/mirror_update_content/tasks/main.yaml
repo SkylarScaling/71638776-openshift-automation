@@ -125,13 +125,15 @@
     loop_var: _converge_pass
   when: not _update_mirror_complete
 
-- name: Find IDMS files in update mirror output
+- name: Find IDMS/ITMS files in update mirror output
   ansible.builtin.find:
     paths: "{{ update_mirror_workspace }}/working-dir/cluster-resources"
     patterns:
       - "idms-*.yaml"
       - "imageDigestMirrorSet*.yaml"
       - "imageContentSourcePolicy*.yaml"
+      - "itms-*.yaml"
+      - "imageTagMirrorSet*.yaml"
     file_type: file
   register: _update_idms_files
 

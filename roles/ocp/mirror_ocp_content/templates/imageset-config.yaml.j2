@@ -47,6 +47,12 @@ mirror:
 {% endif %}
   additionalImages:
     - name: docker.io/gitea/gitea:1.22-rootless
+    # The ODF/OCS operator's console-plugin patch Job hardcodes this image by
+    # tag (not digest) and isn't part of the release/operator payload we
+    # mirror above. Without mirroring it and applying the ITMS oc-mirror
+    # generates for it, that Job ImagePullBackOffs forever under network
+    # lockdown trying to reach quay.io directly (confirmed live).
+    - name: quay.io/openshift/origin-cli:latest
 {% if disconnected.additional_images is defined and disconnected.additional_images | length > 0 %}
 {% for image in disconnected.additional_images %}
     - name: {{ image }}

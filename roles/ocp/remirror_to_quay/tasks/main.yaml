@@ -51,12 +51,14 @@
 
 - name: Check for existing Quay oc-mirror results
   block:
-    - name: Check for existing Quay IDMS results
+    - name: Check for existing Quay IDMS/ITMS results
       ansible.builtin.find:
         paths: "{{ quay_mirror_workspace }}/working-dir/cluster-resources"
         patterns:
           - "idms-*.yaml"
           - "imageDigestMirrorSet*.yaml"
+          - "itms-*.yaml"
+          - "imageTagMirrorSet*.yaml"
         file_type: file
       register: _quay_existing_idms
       failed_when: false
@@ -329,14 +331,20 @@
     loop_var: _converge_pass
   when: not _quay_mirror_complete
 
-# Read generated manifests from Quay workspace
-- name: Find IDMS files in Quay oc-mirror output
+# Read generated manifests from Quay workspace. ITMS (not just IDMS) is
+# required for tag-based additionalImages like the ODF console-patch Job's
+# `quay.io/openshift/origin-cli:latest` -- IDMS only ever redirects pulls
+# that already resolve to a digest, so a pure tag-based pull needs the
+# separate ImageTagMirrorSet oc-mirror v2 generates for it.
+- name: Find IDMS/ITMS files in Quay oc-mirror output
   ansible.builtin.find:
     paths: "{{ quay_mirror_workspace }}/working-dir/cluster-resources"
     patterns:
       - "idms-*.yaml"
       - "imageDigestMirrorSet*.yaml"
       - "imageContentSourcePolicy*.yaml"
+      - "itms-*.yaml"
+      - "imageTagMirrorSet*.yaml"
     file_type: file
   register: _quay_idms_files
 
@@ -455,13 +463,15 @@
   register: _quay_clean_retry_cs
   when: _quay_needs_clean_retry | bool
 
-- name: Find IDMS files after clean retry
+- name: Find IDMS/ITMS files after clean retry
   ansible.builtin.find:
     paths: "{{ quay_mirror_workspace }}/working-dir/cluster-resources"
     patterns:
       - "idms-*.yaml"
       - "imageDigestMirrorSet*.yaml"
       - "imageContentSourcePolicy*.yaml"
+      - "itms-*.yaml"
+      - "imageTagMirrorSet*.yaml"
     file_type: file
   register: _quay_clean_retry_idms
   when: _quay_needs_clean_retry | bool
