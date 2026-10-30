@@ -667,7 +667,7 @@
 
 - name: Set orphaned mirror org repository name list
   ansible.builtin.set_fact:
-    _quay_orphan_repo_names: "{{ _quay_orphan_repo_check.stdout_lines | select('trim') | list }}"
+    _quay_orphan_repo_names: "{{ _quay_orphan_repo_check.stdout_lines | map('trim') | reject('equalto', '') | list }}"
 
 # Deliberately NOT gated on _quay_already_on_s3 — confirmed live that gate
 # made an earlier version of this fix dead code: the switch had already
