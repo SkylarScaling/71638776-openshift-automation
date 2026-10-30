@@ -445,6 +445,51 @@
   register: _quay_app_pod
   changed_when: false
 
+# Check whether the cluster's pull secret already has working Quay robot
+# credentials BEFORE touching the robot account at all. Confirmed live:
+# unconditionally deleting and recreating the robot on every run (as this
+# task used to do) is harmless on a genuinely fresh install, where nothing
+# depends on the registry yet -- but this role is also called by
+# disconnected-update.yaml's routine Day 2 flow, which explicitly runs
+# against a cluster where "Quay on the hub is the live mirror registry".
+# Rotating a robot that nodes are actively pulling through opens a window
+# where in-flight pulls fail with "Could not find robot"/"invalid password"
+# until the new pull secret rolls out -- which jammed a MachineConfigPool
+# node drain for hours when it happened here. Only rotate when the existing
+# credentials are actually missing or broken.
+- name: Check current pull secret Quay credentials (if any)
+  ansible.builtin.shell: |
+    set -e
+    CURRENT=$({{ bin_dir }}/oc get secret pull-secret \
+      -n openshift-config \
+      --kubeconfig {{ target_kubeconfig }} \
+      -o jsonpath='{.data.\.dockerconfigjson}' | base64 -d)
+    echo "$CURRENT" | jq -r '.auths["{{ quay_registry_url }}"].auth // ""'
+  args:
+    executable: /bin/bash
+  register: _quay_existing_pull_secret_auth
+  changed_when: false
+  no_log: true
+
+- name: Test whether existing pull secret Quay credentials still authenticate
+  ansible.builtin.uri:
+    url: "https://{{ quay_registry_url }}/v2/auth?service={{ quay_registry_url }}"
+    url_username: "{{ (_quay_existing_pull_secret_auth.stdout | trim | b64decode).split(':', 1)[0] }}"
+    url_password: "{{ (_quay_existing_pull_secret_auth.stdout | trim | b64decode).split(':', 1)[1] }}"
+    force_basic_auth: true
+    validate_certs: false
+    status_code: [200]
+  register: _quay_existing_creds_check
+  failed_when: false
+  when: _quay_existing_pull_secret_auth.stdout | trim != ''
+  no_log: true
+
+- name: Determine whether the Quay robot token needs rotating
+  ansible.builtin.set_fact:
+    _quay_robot_needs_rotation: >-
+      {{ (_quay_existing_pull_secret_auth.stdout | default('') | trim == '')
+         or (_quay_existing_creds_check.status | default(0) != 200) }}
+
 - name: Configure Quay admin user, mirror org, and robot account via Python model
   ansible.builtin.shell: |
     cat << 'PYEOF' | {{ bin_dir }}/oc exec -i -n {{ quay_mirror_namespace }} \
@@ -496,11 +541,16 @@
             )
 
         # ---- Robot account ----
+        robot_fullname = '{{ quay_mirror_org }}+{{ quay_mirror_robot_account }}'
+    {% if _quay_robot_needs_rotation %}
         # Delete existing robot if present and recreate — avoids reading the
         # encrypted token field (which requires Quay-version-specific internals
-        # to decode and silently produces a wrong token on re-runs).
+        # to decode and silently produces a wrong token on re-runs). Only
+        # reached when the credentials currently in the cluster's pull secret
+        # are missing or no longer authenticate (see the check task above) —
+        # i.e. there is no live consumer whose in-flight pulls this rotation
+        # could break.
         robot_token = None
-        robot_fullname = '{{ quay_mirror_org }}+{{ quay_mirror_robot_account }}'
         try:
             existing = User.get(User.username == robot_fullname)
             existing.delete_instance(recursive=True)
@@ -518,6 +568,12 @@
             pass  # Already a member
 
         print('ROBOT_TOKEN=' + robot_token)
+    {% else %}
+        # Existing pull-secret credentials already authenticate — reuse them
+        # as-is rather than rotating a robot the cluster may be actively
+        # pulling through right now.
+        print('ROBOT_TOKEN={{ (_quay_existing_pull_secret_auth.stdout | trim | b64decode).split(":", 1)[1] }}')
+    {% endif %}
     PYEOF
   args:
     executable: /bin/bash
