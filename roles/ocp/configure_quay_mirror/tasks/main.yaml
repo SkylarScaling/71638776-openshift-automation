@@ -94,7 +94,7 @@
     bucket = sys.argv[1]
     try:
         cfg = yaml.safe_load(open('/tmp/_quay_current_config.yaml'))
-        driver, args = cfg['DISTRIBUTED_STORAGE_CONFIG']['default']
+        driver, args = cfg['DISTRIBUTED_STORAGE_CONFIG']['local_us']
         ok = driver == 'S3Storage' and args.get('s3_bucket') == bucket
     except Exception:
         ok = False
@@ -190,12 +190,26 @@
     - not (_quay_already_on_s3 | bool)
     - _quay_current_config_parsed is not defined
 
+# Named 'local_us' rather than 'default' -- confirmed live this is the exact
+# location name the Quay operator's own managed (pre-switch) objectstorage
+# backend used. The operator rolls new quay-app pods after the
+# "Mark Quay objectstorage component as unmanaged" patch below asynchronously
+# -- old pods can still be live and serving requests for a short window while
+# new ones start. Confirmed live: a blob pushed through an old pod during
+# that window got its imagestoragelocation row written under the operator's
+# location name while this config named its own location 'default', so that
+# one row pointed at a location our DISTRIBUTED_STORAGE_CONFIG never defined
+# -- every subsequent lookup for that blob hit a KeyError server-side,
+# surfacing to oc-mirror as a permanent 500 that no retry could clear (it's a
+# row in Postgres, not a transient condition). Matching the name makes any
+# blob written on either side of the rollout resolve to the same S3 location
+# instead of one of them becoming permanently unreachable.
 - name: Merge S3 storage config into Quay config bundle
   ansible.builtin.set_fact:
     _quay_merged_config: >-
       {{ _quay_current_config_parsed | combine({
         'DISTRIBUTED_STORAGE_CONFIG': {
-          'default': [
+          'local_us': [
             'S3Storage',
             {
               'host': 's3.' ~ aws.aws_region ~ '.amazonaws.com',
@@ -207,8 +221,8 @@
             }
           ]
         },
-        'DISTRIBUTED_STORAGE_DEFAULT_LOCATIONS': ['default'],
-        'DISTRIBUTED_STORAGE_PREFERENCE': ['default']
+        'DISTRIBUTED_STORAGE_DEFAULT_LOCATIONS': ['local_us'],
+        'DISTRIBUTED_STORAGE_PREFERENCE': ['local_us']
       }) }}
   no_log: true
   when: not (_quay_already_on_s3 | bool)
@@ -342,6 +356,33 @@
       (`oc get secret init-config-bundle-secret -n {{ quay_mirror_namespace }}
       -o jsonpath='{.data.config\.yaml}' | base64 -d`).
   when: (_quay_generated_config_check.stdout | default('0') | trim | int) == 0
+
+# The generated-config check above only proves the operator rendered the new
+# config -- it says nothing about whether the quay-app pods actually serving
+# traffic have rolled onto it yet. Confirmed live: oc-mirror started pushing
+# ~17s after the objectstorage patch, while pods from the pre-switch
+# ReplicaSet were still Running and still in the Service's endpoints for
+# roughly 90s. A blob got load-balanced to an old pod mid-rollout and had its
+# storage location written under the operator-managed backend's name, which
+# the live config doesn't define -- a permanent 500 on every later lookup
+# for that one blob, immune to any oc-mirror retry since it's a row in
+# Postgres, not a transient failure. Block until every old pod is actually
+# gone, not just until the config looks right.
+- name: Wait for Quay app deployment to finish rolling onto the new storage config
+  ansible.builtin.command: >
+    {{ bin_dir }}/oc rollout status deployment/{{ quay_mirror_registry_name }}-quay-app
+    -n {{ quay_mirror_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+    --timeout=10m
+  changed_when: false
+
+- name: Wait for Quay mirror-worker deployment to finish rolling onto the new storage config
+  ansible.builtin.command: >
+    {{ bin_dir }}/oc rollout status deployment/{{ quay_mirror_registry_name }}-quay-mirror
+    -n {{ quay_mirror_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+    --timeout=10m
+  changed_when: false
 
 - name: Wait for QuayRegistry to be Available
   ansible.builtin.shell: >
