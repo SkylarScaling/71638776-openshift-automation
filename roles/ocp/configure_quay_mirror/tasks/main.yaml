@@ -546,7 +546,7 @@
         # Delete existing robot if present and recreate — avoids reading the
         # encrypted token field (which requires Quay-version-specific internals
         # to decode and silently produces a wrong token on re-runs). Only
-        # reached when the credentials currently in the cluster's pull secret
+        # reached when the credentials currently in the cluster pull secret
         # are missing or no longer authenticate (see the check task above) —
         # i.e. there is no live consumer whose in-flight pulls this rotation
         # could break.
