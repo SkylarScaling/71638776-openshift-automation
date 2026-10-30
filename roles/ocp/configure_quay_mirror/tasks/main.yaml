@@ -740,9 +740,43 @@
     EOF
   args:
     executable: /bin/bash
+  register: _quay_pull_secret_merge
   changed_when: true
   no_log: true
   when: _quay_pull_secret_check.stdout | trim == "missing"
+
+# A pull-secret rotation is only actually complete once every node has
+# rolled the MachineConfig carrying it -- not when the Secret object is
+# written. Confirmed live: writing the Secret and moving on left most of the
+# fleet pulling through Quay with a stale, no-longer-valid token, because
+# the MachineConfigPool rollout that delivers it to nodes takes much longer
+# than this task and can itself stall (e.g. on an unrelated stuck drain).
+# Block here until it actually lands everywhere, so later phases (and
+# disconnected-update.yaml's routine re-runs of this same role) never
+# proceed while part of the fleet is still on an old credential.
+- name: Wait for master MachineConfigPool to finish updating after pull secret rotation
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get mcp master
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.conditions[?(@.type=="Updated")].status}'
+  register: _quay_pull_secret_master_mcp
+  until: _quay_pull_secret_master_mcp.stdout == "True"
+  retries: 60
+  delay: 30
+  changed_when: false
+  when: _quay_pull_secret_merge is changed
+
+- name: Wait for worker MachineConfigPool to finish updating after pull secret rotation
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get mcp worker
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.conditions[?(@.type=="Updated")].status}'
+  register: _quay_pull_secret_worker_mcp
+  until: _quay_pull_secret_worker_mcp.stdout == "True"
+  retries: 60
+  delay: 30
+  changed_when: false
+  when: _quay_pull_secret_merge is changed
 
 - name: Display Quay mirror configuration summary
   ansible.builtin.debug:
