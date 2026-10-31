@@ -723,7 +723,6 @@
   register: _quay_repos_purge
   changed_when: "'PURGED_COUNT=0' not in _quay_repos_purge.stdout"
   failed_when: "'PURGED_COUNT=' not in _quay_repos_purge.stdout"
-  no_log: true
 
 - name: Parse robot account credentials from Quay setup output
   ansible.builtin.set_fact:
