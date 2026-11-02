@@ -319,6 +319,30 @@
     oc_mirror_idms_manifests: "{{ idms_contents.results | map(attribute='content') | map('b64decode') | list }}"
     oc_mirror_catalogsource_manifests: "{{ catalogsource_contents.results | map(attribute='content') | map('b64decode') | list }}"
 
+# oc-mirror can exit with an "allowed" rc (0/4/12/14) yet have mirrored
+# nothing at all -- e.g. a total collection-phase abort (invalid operator
+# channel for the target index) finishes in seconds with rc=4, which the
+# partial-failure handling above treats as "some images failed, retried".
+# Catch that here instead of silently writing the sentinel and reporting
+# success: downstream roles (create_manual_cloud_credentials,
+# configure_disconnected_cluster) then fail much later against an empty
+# registry with an opaque "unauthorized" error.
+- name: Fail if oc-mirror produced no mirrored content at all
+  ansible.builtin.assert:
+    that:
+      - idms_files.files | length > 0
+      - catalogsource_files.files | length > 0
+    fail_msg: >-
+      oc-mirror produced zero IDMS/ITMS and zero CatalogSource manifests --
+      nothing was actually mirrored to the registry, even though it exited
+      with an allowed return code. This usually means a total collection
+      failure (e.g. a channel in disconnected.operators[] that doesn't exist
+      in the target catalog index) rather than a partial image failure.
+      Check {{ oc_mirror_workspace }}/working-dir/logs/ for a "collection
+      error" near the start of the run, fix disconnected.operators[] in the
+      inventory, and re-run -- the sentinel has not been written so this
+      step will retry.
+
 - name: Write mirror version sentinel
   ansible.builtin.copy:
     content: "{{ openshift_version }}.{{ ocp_patch_version }}"

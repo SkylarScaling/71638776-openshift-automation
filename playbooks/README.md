@@ -433,44 +433,44 @@ all:
           channels:
             - name: "stable-2.17"             # must match ACM version (ACM 2.17 ships with MCE 2.17)
         # ODF meta-operator + all sub-operators it installs automatically.
-        # ODF 4.22 uses a meta-operator pattern: odf-operator reads a ConfigMap and
+        # ODF 4.20 uses a meta-operator pattern: odf-operator reads a ConfigMap and
         # installs each sub-operator from the catalog. All sub-packages must be mirrored.
         - name: odf-operator
           channels:
-            - name: "stable-4.22"
+            - name: "stable-4.20"
         - name: ocs-operator
           channels:
-            - name: "stable-4.22"
+            - name: "stable-4.20"
         - name: mcg-operator
           channels:
-            - name: "stable-4.22"
+            - name: "stable-4.20"
         - name: rook-ceph-operator
           channels:
-            - name: "stable-4.22"
+            - name: "stable-4.20"
         - name: odf-csi-addons-operator
           channels:
-            - name: "stable-4.22"
+            - name: "stable-4.20"
         - name: cephcsi-operator
           channels:
-            - name: "stable-4.22"
+            - name: "stable-4.20"
         - name: odf-dependencies
           channels:
-            - name: "stable-4.22"
+            - name: "stable-4.20"
         - name: odf-prometheus-operator
           channels:
-            - name: "stable-4.22"
+            - name: "stable-4.20"
         - name: recipe
           channels:
-            - name: "stable-4.22"
+            - name: "stable-4.20"
         - name: ocs-client-operator
           channels:
-            - name: "stable-4.22"
+            - name: "stable-4.20"
         - name: ocs-tls-profiles
           channels:
-            - name: "stable-4.22"
+            - name: "stable-4.20"
         - name: odf-external-snapshotter-operator
           channels:
-            - name: "stable-4.22"
+            - name: "stable-4.20"
         # GitOps operator — channel drives install_openshift_gitops and policy_install_openshift_gitops roles
         - name: openshift-gitops-operator
           channels:
