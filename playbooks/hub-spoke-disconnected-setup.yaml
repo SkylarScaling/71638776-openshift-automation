@@ -912,7 +912,7 @@
              'Browser console access (from your own machine):',
              '  1. Open a SOCKS proxy to this jumphost over the same SSH',
              '     connection you used to reach it:',
-             '       ssh -D 8080 -N <user>@<this-jumphost-host-or-IP>',
+             '       ssh -D 8080 -N ' ~ (jumphost_ssh_user | default('ec2-user')) ~ '@' ~ (jumphost_public_ip | default('<this jumphost public IP -- not known this run, check your AWS console or how you originally reached it>')),
              '  2. Point your browser at localhost:8080 as a SOCKS5 proxy with',
              '     remote/proxy DNS resolution enabled (required -- the console',
              '     hostnames only resolve inside this VPC). In Firefox:',
