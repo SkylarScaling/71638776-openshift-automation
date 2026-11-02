@@ -54,4 +54,13 @@
   # pre-emptively wedges cluster-bootstrap's asset loop forever ("namespaces
   # ... not found"), which keeps the bootstrap node (and its MCS) alive and
   # starves workers whose ignition requests land on it instead of a master.
-  when: "'release.openshift.io/feature-gate' not in (_cr.metadata.annotations | default({}))"
+  #
+  # The payload has used both `release.openshift.io/feature-gate` (older
+  # releases) and `release.openshift.io/feature-set` (confirmed live on
+  # 4.20.43) to mark these -- checking only the former let the 4.20 CAPA
+  # CredentialsRequest (feature-set: CustomNoUpgrade,TechPreviewNoUpgrade)
+  # through and wedged bootstrap. Match either annotation key.
+  when: >-
+    not (_cr.metadata.annotations | default({}) | list
+         | select('match', '^release\.openshift\.io/feature-(gate|set)$')
+         | list)
