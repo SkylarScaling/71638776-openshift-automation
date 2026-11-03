@@ -11,8 +11,15 @@ data:
    default-featureSet cluster. Including their Secret here wedges
    cluster-bootstrap's asset loop forever ("namespaces ... not found"),
    which keeps the bootstrap node's MCS alive and starves workers whose
-   ignition requests land on it instead of a master. #}
-{% if 'release.openshift.io/feature-gate' not in (cr.metadata.annotations | default({})) %}
+   ignition requests land on it instead of a master.
+   The payload has used both `release.openshift.io/feature-gate` (older
+   releases) and `release.openshift.io/feature-set` (confirmed live on
+   4.20.43) to mark these -- checking only the former let the 4.20 CAPA
+   CredentialsRequest (feature-set: CustomNoUpgrade,TechPreviewNoUpgrade)
+   through and wedged a spoke's bootstrap the same way it once did the
+   hub's (see roles/ocp/create_manual_cloud_credentials, fixed the same
+   way). Match either annotation key. #}
+{% if not (cr.metadata.annotations | default({}) | list | select('match', '^release\.openshift\.io/feature-(gate|set)$') | list) %}
   {{ cr.spec.secretRef.namespace }}-{{ cr.spec.secretRef.name }}-credentials.yaml: |
     apiVersion: v1
     kind: Secret
