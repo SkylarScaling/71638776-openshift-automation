@@ -381,9 +381,25 @@
 # and no jumphost-VPC zone association at all — structurally doomed
 # regardless of why the first attempt failed (confirmed live: a fresh hosted
 # zone appeared for attempt 2 with no corresponding DNS work ever done for
-# it). Loop once per allowed attempt (plus one spare iteration in case
-# ProvisionStopped lands just after the last attempt's ProvisionFailed),
-# redoing PHZ/DNS whenever the infra ID actually changes.
+# it).
+#
+# An earlier version of this loop was keyed on "one iteration per Hive
+# attempt", using ProvisionFailed=True to decide an attempt was over and move
+# to the next one. That reintroduced exactly the race the original single-task
+# comment below already warned about: ProvisionFailed=True lingers from the
+# attempt that just ended until Hive resets it once the NEXT attempt starts,
+# so the loop advanced to "attempt N+1" instantly, before attempt N+1 (or even
+# the real attempt N) had done anything — confirmed live: the loop reached its
+# spare iteration still looking at the SAME infra ID an earlier iteration had
+# already handled, with ProvisionStopped still False (Hive genuinely still
+# mid-attempt), and timed out waiting for a change that was never coming that
+# soon.
+#
+# Poll on a fixed interval instead: every cycle, read infra ID and conditions
+# together in one call. The infra ID is a fact Hive sets once per attempt's
+# AWS infrastructure (not a racy status condition) — redo PHZ/DNS whenever it
+# changes from the last one we handled, independent of what the conditions
+# say. Stop once Provisioned=True or ProvisionStopped=True appears.
 - name: Ensure local working directory exists for the spoke
   ansible.builtin.file:
     path: "{{ install_dir }}/{{ ocp_cluster.name }}"
@@ -391,25 +407,27 @@
     mode: '0755'
   when: disconnected.network_lockdown.enabled | default(true)
 
-- name: Initialize per-attempt provisioning tracking facts
+- name: Initialize provisioning poll tracking facts
   ansible.builtin.set_fact:
     _spoke_last_infra_id: ''
     _spoke_install_done: false
   when: disconnected.network_lockdown.enabled | default(true)
 
-- name: Wait for each Hive provisioning attempt in turn, redoing DNS when the infra ID changes
+- name: Poll Hive provisioning until it finishes, redoing DNS whenever the infra ID changes
   ansible.builtin.include_tasks: wait_and_configure_spoke_attempt.yml
-  loop: "{{ range(1, spoke_install_attempts_limit + 2) | list }}"
+  loop: "{{ range(0, spoke_provision_poll_max_iterations) | list }}"
   loop_control:
-    loop_var: _spoke_attempt_num
+    loop_var: _spoke_poll_iteration
+    label: "poll {{ _spoke_poll_iteration }}"
   when: disconnected.network_lockdown.enabled | default(true)
 
-- name: Fail if no provisioning attempt reached a terminal state
+- name: Fail if provisioning never reached a terminal state within the time budget
   ansible.builtin.fail:
     msg: >-
-      None of the {{ spoke_install_attempts_limit }} allowed provisioning
-      attempts for {{ ocp_cluster.name }} reached Provisioned or
-      ProvisionStopped within their time budget.
+      ClusterDeployment {{ ocp_cluster.name }} never reached Provisioned or
+      ProvisionStopped after {{ spoke_provision_poll_max_iterations }} polls
+      ({{ (spoke_provision_poll_max_iterations * spoke_provision_poll_interval / 60) | round(1) }}
+      minutes). Check `oc get clusterdeployment -n {{ ocp_cluster.name }}` manually.
   when:
     - disconnected.network_lockdown.enabled | default(true)
     - not (_spoke_install_done | default(false))

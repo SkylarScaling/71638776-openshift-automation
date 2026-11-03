@@ -2,7 +2,17 @@
 parent_clusterset: "default"
 mirror_base_path: "{{ disconnected.mirror_base_path | default('ocp4') }}"
 
-# Must match installAttemptsLimit in templates/04-cluster-deployment.yaml.j2 —
-# the per-attempt wait loop in tasks/main.yaml needs to know how many Hive
-# attempts to watch for.
+# installAttemptsLimit on the ClusterDeployment (templates/04-cluster-deployment.yaml.j2).
 spoke_install_attempts_limit: 2
+
+# How the provisioning poll loop (tasks/wait_and_configure_spoke_attempt.yml)
+# paces itself: it polls every spoke_provision_poll_interval seconds, up to
+# spoke_provision_poll_max_iterations times, redoing PHZ/DNS whenever the
+# ClusterDeployment's infra ID changes (a new Hive attempt) and stopping once
+# Provisioned=True or ProvisionStopped=True appears. 240 * 30s = 120 minutes
+# of poll sleep budget; the PHZ-association and wildcard-DNS role calls each
+# block further (up to ~10 and ~60 minutes respectively) on top of that
+# whenever a new infra ID actually triggers them, which is expected — that's
+# real work, not wasted polling.
+spoke_provision_poll_interval: 30
+spoke_provision_poll_max_iterations: 240
