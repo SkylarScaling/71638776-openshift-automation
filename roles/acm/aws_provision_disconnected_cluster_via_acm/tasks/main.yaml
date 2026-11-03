@@ -432,13 +432,19 @@
     - disconnected.network_lockdown.enabled | default(true)
     - not (_spoke_install_done | default(false))
 
+# `register` always sets its variable, even on a skipped task (to a
+# {skipped: true, ...} dict with no `stdout` key) -- registering straight
+# into `_cd_conditions` here would clobber the real value the lockdown poll
+# loop above already set, every time this task is skipped (i.e. whenever
+# network lockdown is enabled). Register separately and only fold it into
+# `_cd_conditions` when this task actually ran.
 - name: Wait for OpenShift cluster installation to complete or fail (Takes 35-45+ minutes) [non-lockdown]
   ansible.builtin.shell: >
     {{ bin_dir }}/oc get clusterdeployment {{ ocp_cluster.name }}
     -n {{ ocp_cluster.name }}
     --kubeconfig {{ target_kubeconfig }}
     -o jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}' 2>/dev/null || true
-  register: _cd_conditions
+  register: _cd_conditions_nonlockdown
   changed_when: false
   # ProvisionFailed=True is per-attempt and gets reset when a retry starts — using it
   # as the exit condition causes a race: Ansible exits between attempt N failing and
@@ -446,10 +452,15 @@
   # ProvisionStopped=True is only set after all retry attempts are exhausted (or
   # installAttemptsLimit is reached), making it the correct final-failure signal.
   until: >
-    ('Provisioned=True' in _cd_conditions.stdout) or
-    ('ProvisionStopped=True' in _cd_conditions.stdout)
+    ('Provisioned=True' in _cd_conditions_nonlockdown.stdout) or
+    ('ProvisionStopped=True' in _cd_conditions_nonlockdown.stdout)
   retries: 90
   delay: 60
+  when: not (disconnected.network_lockdown.enabled | default(true))
+
+- name: Set conditions fact from the non-lockdown wait
+  ansible.builtin.set_fact:
+    _cd_conditions: {"stdout": "{{ _cd_conditions_nonlockdown.stdout }}"}
   when: not (disconnected.network_lockdown.enabled | default(true))
 
 - name: Get provisioning failure details
