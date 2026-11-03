@@ -103,9 +103,24 @@
              ~ ':' ~ (disconnected.mirror_registry.port | default(8443)) }}
       when: mirror_registry_url is not defined
 
+    # mirror-registry only generates quay-rootCA/rootCA.pem when it issues its
+    # own cert for a real hostname. Under network lockdown the registry's
+    # hostname is always jumphost_private_ip (a bare IP), which forces
+    # roles/ocp/setup_mirror_registry to supply a custom self-signed IP-SAN
+    # cert instead (custom-ssl/ssl.cert, serving as both leaf and trust
+    # anchor) -- mirror-registry never writes a rootCA.pem in that case.
+    # Mirror that same branching here, not just a hardcoded rootCA.pem path.
+    - name: Determine whether the mirror registry hostname is a bare IP
+      ansible.builtin.set_fact:
+        _hub_mirror_hostname_is_ip: "{{ mirror_registry_url.split(':')[0] is match('^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$') }}"
+      when: mirror_registry_ca_bundle is not defined
+
     - name: Read mirror registry CA certificate from disk
       ansible.builtin.slurp:
-        src: "{{ mirror_registry_dir }}/quay-rootCA/rootCA.pem"
+        src: >-
+          {{ (mirror_registry_dir ~ '/custom-ssl/ssl.cert')
+             if _hub_mirror_hostname_is_ip
+             else (mirror_registry_dir ~ '/quay-rootCA/rootCA.pem') }}
       register: _ca_raw
       when: mirror_registry_ca_bundle is not defined
 
@@ -464,9 +479,20 @@
                         else disconnected.mirror_registry.hostname)
                        ~ ':' ~ (disconnected.mirror_registry.port | default(8443))) }}
 
+    # See the matching comment on the Hub play's equivalent task — mirror-registry
+    # never writes quay-rootCA/rootCA.pem when the registry hostname is a bare
+    # IP (always true under network lockdown); it's custom-ssl/ssl.cert instead.
+    - name: Determine whether the mirror registry hostname is a bare IP
+      ansible.builtin.set_fact:
+        _spokes_mirror_hostname_is_ip: "{{ mirror_registry_url.split(':')[0] is match('^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$') }}"
+      when: hostvars[groups['hub_cluster'][0]]['mirror_registry_ca_bundle'] is not defined
+
     - name: Read mirror registry CA certificate from disk
       ansible.builtin.slurp:
-        src: "{{ mirror_registry_dir }}/quay-rootCA/rootCA.pem"
+        src: >-
+          {{ (mirror_registry_dir ~ '/custom-ssl/ssl.cert')
+             if _spokes_mirror_hostname_is_ip
+             else (mirror_registry_dir ~ '/quay-rootCA/rootCA.pem') }}
       register: _spokes_ca_raw
       when: hostvars[groups['hub_cluster'][0]]['mirror_registry_ca_bundle'] is not defined
 
