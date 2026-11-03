@@ -1,3 +1,8 @@
 ---
 parent_clusterset: "default"
 mirror_base_path: "{{ disconnected.mirror_base_path | default('ocp4') }}"
+
+# Must match installAttemptsLimit in templates/04-cluster-deployment.yaml.j2 —
+# the per-attempt wait loop in tasks/main.yaml needs to know how many Hive
+# attempts to watch for.
+spoke_install_attempts_limit: 2

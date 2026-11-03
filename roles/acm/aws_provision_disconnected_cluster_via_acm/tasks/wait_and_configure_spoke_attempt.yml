@@ -1,0 +1,97 @@
+---
+# One invocation = one Hive provisioning attempt. Looped from main.yaml, once
+# per installAttemptsLimit (plus one spare iteration — see the including
+# task). See the comment on the including task for why PHZ association and
+# the *.apps record must be redone per attempt, not just once overall.
+
+- name: "Attempt {{ _spoke_attempt_num }}: wait for this attempt's infra ID (or early ProvisionStopped)"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get clusterdeployment {{ ocp_cluster.name }}
+    -n {{ ocp_cluster.name }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.spec.clusterMetadata.infraID}|{.status.conditions[?(@.type=="ProvisionStopped")].status}'
+    2>/dev/null || true
+  register: _spoke_infra_id
+  changed_when: false
+  until: >
+    ((_spoke_infra_id.stdout.split('|')[0] | trim != '') and
+     (_spoke_infra_id.stdout.split('|')[0] | trim != _spoke_last_infra_id)) or
+    (_spoke_infra_id.stdout.split('|')[1] | default('') | trim == 'True')
+  retries: 60
+  delay: 10
+  when: not (_spoke_install_done | default(false))
+
+- name: "Attempt {{ _spoke_attempt_num }}: record this attempt's infra ID"
+  ansible.builtin.set_fact:
+    _spoke_current_infra_id: "{{ _spoke_infra_id.stdout.split('|')[0] | default('') | trim }}"
+  when: not (_spoke_install_done | default(false))
+
+- name: "Attempt {{ _spoke_attempt_num }}: associate this attempt's private DNS zone with the jumphost VPC"
+  ansible.builtin.include_role:
+    name: aws/associate_private_zone_with_jumphost
+  vars:
+    private_zone_domain: "{{ ocp_cluster.name }}.{{ base_domain }}"
+    _pz_infra_id: "{{ _spoke_current_infra_id }}"
+  when:
+    - not (_spoke_install_done | default(false))
+    - _spoke_current_infra_id != ''
+    - _spoke_current_infra_id != _spoke_last_infra_id
+
+- name: "Attempt {{ _spoke_attempt_num }}: write synthetic metadata.json carrying this attempt's infra ID"
+  ansible.builtin.copy:
+    dest: "{{ install_dir }}/{{ ocp_cluster.name }}/metadata-infraid-only.json"
+    mode: '0644'
+    content: "{{ {'infraID': _spoke_current_infra_id} | to_json }}"
+  when:
+    - not (_spoke_install_done | default(false))
+    - _spoke_current_infra_id != ''
+    - _spoke_current_infra_id != _spoke_last_infra_id
+
+- name: "Attempt {{ _spoke_attempt_num }}: create this attempt's *.apps wildcard DNS record"
+  ansible.builtin.include_role:
+    name: aws/create_apps_wildcard_dns_record
+  vars:
+    _metadata_json_path: "{{ install_dir }}/{{ ocp_cluster.name }}/metadata-infraid-only.json"
+    _awd_clusterdeployment_kubeconfig: "{{ target_kubeconfig }}"
+    _awd_clusterdeployment_name: "{{ ocp_cluster.name }}"
+    _awd_clusterdeployment_namespace: "{{ ocp_cluster.name }}"
+  when:
+    - not (_spoke_install_done | default(false))
+    - _spoke_current_infra_id != ''
+    - _spoke_current_infra_id != _spoke_last_infra_id
+
+- name: "Attempt {{ _spoke_attempt_num }}: remember this attempt's infra ID as handled"
+  ansible.builtin.set_fact:
+    _spoke_last_infra_id: "{{ _spoke_current_infra_id }}"
+  when:
+    - not (_spoke_install_done | default(false))
+    - _spoke_current_infra_id != ''
+    - _spoke_current_infra_id != _spoke_last_infra_id
+
+# ProvisionFailed=True is per-attempt (it resets when Hive starts a retry) —
+# used here only to stop waiting on a doomed attempt early so the next loop
+# iteration can pick up the retry's new infra ID promptly. The authoritative
+# finish/give-up signals are Provisioned=True / ProvisionStopped=True, set by
+# the fact below.
+- name: "Attempt {{ _spoke_attempt_num }}: wait for this attempt to finish, fail, or for Hive to give up"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get clusterdeployment {{ ocp_cluster.name }}
+    -n {{ ocp_cluster.name }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}' 2>/dev/null || true
+  register: _cd_conditions
+  changed_when: false
+  until: >
+    ('Provisioned=True' in _cd_conditions.stdout) or
+    ('ProvisionStopped=True' in _cd_conditions.stdout) or
+    ('ProvisionFailed=True' in _cd_conditions.stdout)
+  retries: 50
+  delay: 60
+  when: not (_spoke_install_done | default(false))
+
+- name: "Attempt {{ _spoke_attempt_num }}: mark provisioning complete if this attempt succeeded or Hive gave up"
+  ansible.builtin.set_fact:
+    _spoke_install_done: true
+  when:
+    - not (_spoke_install_done | default(false))
+    - "('Provisioned=True' in _cd_conditions.stdout) or ('ProvisionStopped=True' in _cd_conditions.stdout)"

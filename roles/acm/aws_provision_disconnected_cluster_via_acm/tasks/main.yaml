@@ -371,61 +371,19 @@
 # its own additionalPrinterColumns; status.infraID doesn't exist on this
 # object at all, so the old path could never have succeeded regardless of
 # how long it polled.
-- name: Wait for Hive to report the spoke's infra ID (or stop early on ProvisionStopped)
-  ansible.builtin.shell: >
-    {{ bin_dir }}/oc get clusterdeployment {{ ocp_cluster.name }}
-    -n {{ ocp_cluster.name }}
-    --kubeconfig {{ target_kubeconfig }}
-    -o jsonpath='{.spec.clusterMetadata.infraID}|{.status.conditions[?(@.type=="ProvisionStopped")].status}'
-    2>/dev/null || true
-  register: _spoke_infra_id
-  changed_when: false
-  until: >
-    (_spoke_infra_id.stdout.split('|')[0] | trim != '') or
-    (_spoke_infra_id.stdout.split('|')[1] | default('') | trim == 'True')
-  retries: 60
-  delay: 10
-  when: disconnected.network_lockdown.enabled | default(true)
-
-# Fail fast instead of letting Ansible keep polling a ClusterDeployment that
-# Hive already gave up on — surface the failed provisioner pod's logs
-# directly instead of a generic timeout (this is exactly how the NO_PROXY
-# scoping bug for the install pod's in-cluster API calls first surfaced:
-# ProvisionStopped within ~1 minute, but the old loop polled for 10).
-- name: Collect diagnostics if Hive stopped provisioning before reporting an infra ID
-  when:
-    - disconnected.network_lockdown.enabled | default(true)
-    - (_spoke_infra_id.stdout.split('|')[1] | default('') | trim) == 'True'
-    - (_spoke_infra_id.stdout.split('|')[0] | trim) == ''
-  block:
-    - name: Get the most recent ClusterProvision's provisioner pod name
-      ansible.builtin.shell: >
-        {{ bin_dir }}/oc get pod -n {{ ocp_cluster.name }}
-        --kubeconfig {{ target_kubeconfig }}
-        -l hive.openshift.io/cluster-deployment-name={{ ocp_cluster.name }}
-        -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null || true
-      register: _early_fail_pod_name
-      changed_when: false
-
-    - name: Collect that pod's logs
-      ansible.builtin.shell: >
-        {{ bin_dir }}/oc logs {{ _early_fail_pod_name.stdout }}
-        -n {{ ocp_cluster.name }}
-        --kubeconfig {{ target_kubeconfig }}
-        --all-containers --tail=100 2>&1 || true
-      register: _early_fail_pod_logs
-      changed_when: false
-      when: _early_fail_pod_name.stdout | default('') != ''
-
-    - name: Fail — Hive stopped provisioning {{ ocp_cluster.name }} before it ever reported an infra ID
-      ansible.builtin.fail:
-        msg: >-
-          ClusterDeployment {{ ocp_cluster.name }} is ProvisionStopped and
-          never set spec.clusterMetadata.infraID — the install pod died
-          before it got far enough to create any AWS infrastructure. Most
-          recent provisioner pod logs:
-          {{ _early_fail_pod_logs.stdout_lines | default(['(no logs)']) }}
-
+#
+# Under network lockdown, Hive tears down and recreates ALL AWS
+# infrastructure for each retry attempt (installAttemptsLimit, see
+# 04-cluster-deployment.yaml.j2) — a new infra ID, a new private hosted zone,
+# and a new *.apps load balancer every time. Doing the infra-ID wait / PHZ
+# association / wildcard-DNS steps only once, before a single long wait for
+# the final outcome, left every retry after the first with no *.apps record
+# and no jumphost-VPC zone association at all — structurally doomed
+# regardless of why the first attempt failed (confirmed live: a fresh hosted
+# zone appeared for attempt 2 with no corresponding DNS work ever done for
+# it). Loop once per allowed attempt (plus one spare iteration in case
+# ProvisionStopped lands just after the last attempt's ProvisionFailed),
+# redoing PHZ/DNS whenever the infra ID actually changes.
 - name: Ensure local working directory exists for the spoke
   ansible.builtin.file:
     path: "{{ install_dir }}/{{ ocp_cluster.name }}"
@@ -433,42 +391,30 @@
     mode: '0755'
   when: disconnected.network_lockdown.enabled | default(true)
 
-- name: Write synthetic metadata.json carrying the spoke's infra ID
-  ansible.builtin.copy:
-    dest: "{{ install_dir }}/{{ ocp_cluster.name }}/metadata-infraid-only.json"
-    mode: '0644'
-    content: "{{ {'infraID': _spoke_infra_id.stdout.split('|')[0] | trim} | to_json }}"
+- name: Initialize per-attempt provisioning tracking facts
+  ansible.builtin.set_fact:
+    _spoke_last_infra_id: ''
+    _spoke_install_done: false
   when: disconnected.network_lockdown.enabled | default(true)
 
-# Hive's installer runs inside hive-controllers (in the Cluster VPC), so the
-# spoke's private hosted zone only ever gets associated with that VPC — same
-# gap as the hub (see aws/associate_private_zone_with_jumphost), except here
-# nothing associated it with the jumphost VPC at all. Every later task in this
-# play that runs `oc`/ansible against the spoke's own kubeconfig from the
-# jumphost (configure_disconnected_cluster, configure_ntp, configure_rbac,
-# etc.) needs to resolve api.<spoke>.<base_domain> to do so — confirmed live:
-# "no such host" from the jumphost even though the spoke's own installer
-# (running inside the Cluster VPC) wasn't affected. Do this before waiting for
-# install to complete so later tasks are never blocked on it.
-- name: Associate the spoke's private DNS zone with the jumphost VPC
-  ansible.builtin.include_role:
-    name: aws/associate_private_zone_with_jumphost
-  vars:
-    private_zone_domain: "{{ ocp_cluster.name }}.{{ base_domain }}"
-    _pz_infra_id: "{{ _spoke_infra_id.stdout.split('|')[0] | trim }}"
+- name: Wait for each Hive provisioning attempt in turn, redoing DNS when the infra ID changes
+  ansible.builtin.include_tasks: wait_and_configure_spoke_attempt.yml
+  loop: "{{ range(1, spoke_install_attempts_limit + 2) | list }}"
+  loop_control:
+    loop_var: _spoke_attempt_num
   when: disconnected.network_lockdown.enabled | default(true)
 
-- name: Create the spoke's *.apps wildcard DNS record
-  ansible.builtin.include_role:
-    name: aws/create_apps_wildcard_dns_record
-  vars:
-    _metadata_json_path: "{{ install_dir }}/{{ ocp_cluster.name }}/metadata-infraid-only.json"
-    _awd_clusterdeployment_kubeconfig: "{{ target_kubeconfig }}"
-    _awd_clusterdeployment_name: "{{ ocp_cluster.name }}"
-    _awd_clusterdeployment_namespace: "{{ ocp_cluster.name }}"
-  when: disconnected.network_lockdown.enabled | default(true)
+- name: Fail if no provisioning attempt reached a terminal state
+  ansible.builtin.fail:
+    msg: >-
+      None of the {{ spoke_install_attempts_limit }} allowed provisioning
+      attempts for {{ ocp_cluster.name }} reached Provisioned or
+      ProvisionStopped within their time budget.
+  when:
+    - disconnected.network_lockdown.enabled | default(true)
+    - not (_spoke_install_done | default(false))
 
-- name: Wait for OpenShift cluster installation to complete or fail (Takes 35-45+ minutes)
+- name: Wait for OpenShift cluster installation to complete or fail (Takes 35-45+ minutes) [non-lockdown]
   ansible.builtin.shell: >
     {{ bin_dir }}/oc get clusterdeployment {{ ocp_cluster.name }}
     -n {{ ocp_cluster.name }}
@@ -486,6 +432,7 @@
     ('ProvisionStopped=True' in _cd_conditions.stdout)
   retries: 90
   delay: 60
+  when: not (disconnected.network_lockdown.enabled | default(true))
 
 - name: Get provisioning failure details
   ansible.builtin.shell: >
