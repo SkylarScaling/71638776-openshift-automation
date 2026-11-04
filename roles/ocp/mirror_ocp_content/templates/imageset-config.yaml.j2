@@ -7,7 +7,12 @@ mirror:
         minVersion: {{ openshift_version }}.{{ ocp_patch_version }}
         maxVersion: {{ openshift_version }}.{{ ocp_patch_version }}
   operators:
-    - catalog: registry.redhat.io/redhat/redhat-operator-index:v{{ openshift_version }}
+    - catalog: >-
+        registry.redhat.io/redhat/redhat-operator-index{{
+          ('@sha256:' ~ redhat_operator_index_digest)
+          if redhat_operator_index_digest | default('') != ''
+          else (':v' ~ openshift_version)
+        }}
       packages:
 {% for operator in disconnected.operators %}
         - name: {{ operator.name }}
@@ -26,7 +31,12 @@ mirror:
 {% endif %}
 {% endfor %}
 {% if disconnected.community_operators is defined and disconnected.community_operators | length > 0 %}
-    - catalog: registry.redhat.io/redhat/community-operator-index:v{{ openshift_version }}
+    - catalog: >-
+        registry.redhat.io/redhat/community-operator-index{{
+          ('@sha256:' ~ community_operator_index_digest)
+          if community_operator_index_digest | default('') != ''
+          else (':v' ~ openshift_version)
+        }}
       packages:
 {% for operator in disconnected.community_operators %}
         - name: {{ operator.name }}

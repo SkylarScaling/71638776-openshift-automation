@@ -5,6 +5,45 @@
     path: "{{ oc_mirror_workspace }}"
     mode: '0755'
 
+# Pin the operator catalog(s) by digest once resolved (see the discovery/
+# persist tasks near the end of this file) so a later, separate oc-mirror
+# invocation against this same imageset-config.yaml (ocp/remirror_to_quay
+# copies this file verbatim, possibly hours or days later) resolves the
+# EXACT same catalog content, instead of whatever registry.redhat.io's
+# floating `:v{{ openshift_version }}` tag happens to point at by then.
+# Confirmed live: the floating tag moved between the initial jumphost
+# mirror and a later migrate_mirror run, pushing openshift-gitops-operator
+# 1.21.7 into Quay while the cluster had already installed 1.21.6 from the
+# jumphost mirror -- the installed CSV's image digests were never pushed to
+# Quay, breaking the already-running operator once the IDMS repointed it.
+- name: Read persisted redhat-operator-index catalog digest if already pinned
+  ansible.builtin.slurp:
+    src: "{{ oc_mirror_workspace }}/.redhat-operator-index-digest"
+  register: _redhat_operator_index_digest_raw
+  failed_when: false
+
+- name: Set redhat-operator-index catalog digest fact
+  ansible.builtin.set_fact:
+    redhat_operator_index_digest: >-
+      {{ (_redhat_operator_index_digest_raw.content | b64decode | trim)
+         if _redhat_operator_index_digest_raw.content is defined
+         else '' }}
+
+- name: Read persisted community-operator-index catalog digest if already pinned
+  ansible.builtin.slurp:
+    src: "{{ oc_mirror_workspace }}/.community-operator-index-digest"
+  register: _community_operator_index_digest_raw
+  failed_when: false
+  when: disconnected.community_operators is defined and disconnected.community_operators | length > 0
+
+- name: Set community-operator-index catalog digest fact
+  ansible.builtin.set_fact:
+    community_operator_index_digest: >-
+      {{ (_community_operator_index_digest_raw.content | b64decode | trim)
+         if _community_operator_index_digest_raw.content is defined
+         else '' }}
+  when: disconnected.community_operators is defined and disconnected.community_operators | length > 0
+
 - name: Template ImageSetConfiguration
   ansible.builtin.template:
     src: "{{ role_path }}/templates/imageset-config.yaml.j2"
@@ -318,6 +357,63 @@
   ansible.builtin.set_fact:
     oc_mirror_idms_manifests: "{{ idms_contents.results | map(attribute='content') | map('b64decode') | list }}"
     oc_mirror_catalogsource_manifests: "{{ catalogsource_contents.results | map(attribute='content') | map('b64decode') | list }}"
+
+# oc-mirror caches the catalog it actually pulled under a directory named for
+# the resolved manifest-list digest -- read that back (rather than resolving
+# it ourselves against the registry, which would need extra tooling/auth
+# handling) and persist it so imageset-config.yaml ends up pinned by digest
+# on disk, not just in this run's facts. Runs unconditionally (not gated on
+# a fresh mirror this run) so re-running this role against an
+# already-mirrored workspace retroactively pins an existing unpinned file.
+- name: Discover the resolved redhat-operator-index catalog digest
+  ansible.builtin.find:
+    paths: "{{ oc_mirror_workspace }}/working-dir/operator-catalogs/redhat-operator-index"
+    file_type: directory
+  register: _redhat_operator_index_digest_dirs
+
+- name: Persist the resolved redhat-operator-index catalog digest
+  ansible.builtin.copy:
+    content: "{{ (_redhat_operator_index_digest_dirs.files | sort(attribute='mtime') | last).path | basename }}"
+    dest: "{{ oc_mirror_workspace }}/.redhat-operator-index-digest"
+    mode: '0644'
+  when: _redhat_operator_index_digest_dirs.files | default([]) | length > 0
+
+- name: Discover the resolved community-operator-index catalog digest
+  ansible.builtin.find:
+    paths: "{{ oc_mirror_workspace }}/working-dir/operator-catalogs/community-operator-index"
+    file_type: directory
+  register: _community_operator_index_digest_dirs
+  when: disconnected.community_operators is defined and disconnected.community_operators | length > 0
+
+- name: Persist the resolved community-operator-index catalog digest
+  ansible.builtin.copy:
+    content: "{{ (_community_operator_index_digest_dirs.files | sort(attribute='mtime') | last).path | basename }}"
+    dest: "{{ oc_mirror_workspace }}/.community-operator-index-digest"
+    mode: '0644'
+  when:
+    - disconnected.community_operators is defined and disconnected.community_operators | length > 0
+    - _community_operator_index_digest_dirs.files | default([]) | length > 0
+
+- name: Re-read catalog digest facts after discovery
+  ansible.builtin.set_fact:
+    redhat_operator_index_digest: >-
+      {{ (_redhat_operator_index_digest_dirs.files | sort(attribute='mtime') | last).path | basename
+         if _redhat_operator_index_digest_dirs.files | default([]) | length > 0
+         else redhat_operator_index_digest }}
+    community_operator_index_digest: >-
+      {{ (_community_operator_index_digest_dirs.files | sort(attribute='mtime') | last).path | basename
+         if (_community_operator_index_digest_dirs.files | default([]) | length > 0)
+         else community_operator_index_digest | default('') }}
+
+# Re-templates the same file written at the top of this role, now with the
+# catalog digest(s) pinned -- a no-op on repeat runs once already pinned
+# (same digest rediscovered, same content re-rendered). This is the file
+# ocp/remirror_to_quay copies verbatim for its own, later oc-mirror pass.
+- name: Re-template ImageSetConfiguration now that the catalog digest is pinned
+  ansible.builtin.template:
+    src: "{{ role_path }}/templates/imageset-config.yaml.j2"
+    dest: "{{ oc_mirror_workspace }}/imageset-config.yaml"
+    mode: '0644'
 
 # oc-mirror can exit with an "allowed" rc (0/4/12/14) yet have mirrored
 # nothing at all -- e.g. a total collection-phase abort (invalid operator
