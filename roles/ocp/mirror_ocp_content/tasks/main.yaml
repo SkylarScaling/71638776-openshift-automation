@@ -220,6 +220,12 @@
   changed_when: false
   failed_when: false
 
+# Destination MUST carry an explicit :sha256-<digest> tag -- without one, oc
+# image mirror pushes to the bare repository with no tag at all, which is
+# invisible to anything that looks the image up by tag (as the verification
+# gate below, and any manual inspection, does) even though the manifest/blob
+# content did land. Match the `sha256-<digest>` tag convention oc-mirror v2
+# itself uses for every successfully mirrored image in this registry.
 - name: Retry failed images with oc image mirror (linux/amd64 only)
   ansible.builtin.shell: >
     {{ bin_dir }}/oc image mirror
@@ -227,15 +233,18 @@
     --insecure=true
     -a {{ oc_mirror_workspace }}/containers/auth.json
     {{ item | regex_replace('^docker://', '') }}
-    {{ mirror_registry_url }}/{{ mirror_base_path }}/{{ item | regex_replace('^docker://[^/]+/', '') | regex_replace('@sha256:[a-f0-9]+$', '') }}
+    {{ mirror_registry_url }}/{{ mirror_base_path }}/{{ item | regex_replace('^docker://[^/]+/', '') | regex_replace('@sha256:[a-f0-9]+$', '') }}:{{ item | regex_replace('^.*@sha256:', 'sha256-') }}
   loop: "{{ failed_images_raw.stdout_lines | default([]) }}"
   loop_control:
     label: "{{ item | regex_replace('^docker://', '') | truncate(80, True, '...') }}"
   when:
     - failed_images_raw is defined
     - failed_images_raw.stdout_lines | default([]) | length > 0
+  register: _retry_failed_images
   changed_when: true
-  failed_when: false
+  retries: 3
+  delay: 10
+  until: _retry_failed_images.rc == 0
 
 - name: Extract failed operator bundle image refs from error log
   ansible.builtin.shell: >
@@ -249,21 +258,29 @@
   changed_when: false
   failed_when: false
 
+# Same explicit-tag fix as the non-bundle retry above, plus retries -- these
+# are large multi-GB manifest-list images (e.g. quay-builder-qemu-rhcos) and
+# a single attempt timing out against the mirror registry under load (seen
+# live as a ~1.5s "success" that silently pushed nothing) must not be
+# swallowed by failed_when: false anymore.
 - name: Retry failed operator bundle images with oc image mirror
   ansible.builtin.shell: >
     {{ bin_dir }}/oc image mirror
     --insecure=true
     -a {{ oc_mirror_workspace }}/containers/auth.json
     {{ item | regex_replace('^docker://', '') }}
-    {{ mirror_registry_url }}/{{ mirror_base_path }}/{{ item | regex_replace('^docker://[^/]+/', '') | regex_replace('@sha256:[a-f0-9]+$', '') }}
+    {{ mirror_registry_url }}/{{ mirror_base_path }}/{{ item | regex_replace('^docker://[^/]+/', '') | regex_replace('@sha256:[a-f0-9]+$', '') }}:{{ item | regex_replace('^.*@sha256:', 'sha256-') }}
   loop: "{{ failed_bundles_raw.stdout_lines | default([]) }}"
   loop_control:
     label: "{{ item | regex_replace('^docker://', '') | truncate(80, True, '...') }}"
   when:
     - failed_bundles_raw is defined
     - failed_bundles_raw.stdout_lines | default([]) | length > 0
+  register: _retry_failed_bundles
   changed_when: true
-  failed_when: false
+  retries: 3
+  delay: 10
+  until: _retry_failed_bundles.rc == 0
 
 - name: Display oc-mirror partial failure summary
   ansible.builtin.debug:
@@ -276,6 +293,42 @@
     - oc_mirror_result is defined
     - oc_mirror_result.rc is defined
     - oc_mirror_result.rc in [4, 12, 14]
+
+# Both retry tasks above can report "changed" while having pushed nothing --
+# confirmed live: a ~1.5s "successful" oc image mirror run against a ~2GB
+# manifest-list image, with the destination digest a flat 404 afterward.
+# Don't trust the shell rc alone; HEAD each retried image's digest against
+# the mirror registry and fail the whole mirror phase if any are still
+# missing, rather than letting a silent gap reach cluster install (where it
+# surfaces hours later as an opaque ImagePullBackOff/BundleUnpackFailed).
+- name: Verify retried images actually landed in the mirror registry
+  ansible.builtin.command: >
+    {{ bin_dir }}/oc image info
+    --insecure=true
+    --registry-config={{ oc_mirror_workspace }}/containers/auth.json
+    {{ mirror_registry_url }}/{{ mirror_base_path }}/{{ item | regex_replace('^docker://[^/]+/', '') | regex_replace('@sha256:[a-f0-9]+$', '') }}@{{ item | regex_replace('^.*@', '') }}
+  loop: "{{ (failed_images_raw.stdout_lines | default([])) + (failed_bundles_raw.stdout_lines | default([])) }}"
+  loop_control:
+    label: "{{ item | regex_replace('^docker://', '') | truncate(80, True, '...') }}"
+  register: _retried_image_verify
+  changed_when: false
+  failed_when: false
+
+- name: Fail if any retried image is still missing from the mirror registry
+  ansible.builtin.fail:
+    msg: >-
+      The following images were reported mirrored by the 'oc image mirror'
+      retry above but are NOT retrievable by digest from the mirror
+      registry: {{ _retried_image_verify.results
+        | selectattr('rc', 'ne', 0)
+        | map(attribute='item')
+        | list }}.
+      This usually means the push silently timed out on a large multi-arch
+      blob. Re-run this role (mirror_ocp_content) to retry, or inspect
+      {{ oc_mirror_workspace }}/working-dir/logs/ for the original error.
+  when:
+    - _retried_image_verify.results is defined
+    - _retried_image_verify.results | selectattr('rc', 'ne', 0) | list | length > 0
 
 # When rc=14 oc-mirror exits before generating the CatalogSource (cs-*.yaml)
 # because 0 operator images were mirrored. The oc image mirror retry above

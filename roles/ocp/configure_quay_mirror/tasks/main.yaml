@@ -73,18 +73,53 @@
 # that *was* defined (just to None) -- surfacing as an opaque no_log-censored
 # failure in the merge task further down instead of a clear wait/timeout here.
 - name: Wait for gitops-install-quay to create the init config bundle secret
-  ansible.builtin.shell: >
-    {{ bin_dir }}/oc get secret init-config-bundle-secret
-    -n {{ quay_mirror_namespace }}
-    --kubeconfig {{ target_kubeconfig }}
-    -o jsonpath='{.data.config\.yaml}' 2>/dev/null | base64 -d | wc -c
-  args:
-    executable: /bin/bash
-  register: _quay_init_secret_wait
-  changed_when: false
-  until: (_quay_init_secret_wait.stdout | default('0') | trim | int) > 0
-  retries: 40
-  delay: 15
+  block:
+    - ansible.builtin.shell: >
+        {{ bin_dir }}/oc get secret init-config-bundle-secret
+        -n {{ quay_mirror_namespace }}
+        --kubeconfig {{ target_kubeconfig }}
+        -o jsonpath='{.data.config\.yaml}' 2>/dev/null | base64 -d | wc -c
+      args:
+        executable: /bin/bash
+      register: _quay_init_secret_wait
+      changed_when: false
+      until: (_quay_init_secret_wait.stdout | default('0') | trim | int) > 0
+      retries: 40
+      delay: 15
+  rescue:
+    # A timeout here is a wave-ordering block, not a slow-but-progressing
+    # sync -- confirmed live: the quay-operator Subscription can be stuck
+    # BundleUnpackFailed (its bundle image missing from the mirror registry),
+    # which holds the wave-0 Subscription Degraded forever, which ArgoCD
+    # never advances past to apply the wave-1 secret. Surface that state
+    # directly instead of just "0 after 40 retries", so this doesn't need a
+    # fresh live investigation every time it recurs.
+    - name: Dump Quay Subscription and ArgoCD Application status for diagnosis
+      ansible.builtin.shell: >
+        echo '--- quay-operator Subscription ---';
+        {{ bin_dir }}/oc get subscription quay-operator -n {{ quay_mirror_namespace }}
+        --kubeconfig {{ target_kubeconfig }}
+        -o jsonpath='{.status.conditions}' 2>/dev/null || true;
+        echo;
+        echo '--- {{ quay_argocd_app_name }} Application ---';
+        {{ bin_dir }}/oc get application {{ quay_argocd_app_name }} -n {{ quay_argocd_namespace }}
+        --kubeconfig {{ target_kubeconfig }}
+        -o jsonpath='{.status.sync.status} {.status.health.status} {.status.operationState.message}' 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      register: _quay_init_secret_diagnosis
+      changed_when: false
+      failed_when: false
+
+    - name: Fail with diagnosis
+      ansible.builtin.fail:
+        msg: >-
+          init-config-bundle-secret never got non-empty content after 10
+          minutes of polling. This usually means the quay-operator
+          Subscription is stuck (e.g. BundleUnpackFailed because its bundle
+          image is missing from the mirror registry), which blocks ArgoCD's
+          sync-wave ordering before the secret's wave ever applies. Live
+          status: {{ _quay_init_secret_diagnosis.stdout | default('(unavailable)') }}
 
 # Read-modify-write so we don't clobber FEATURE_USER_INITIALIZE/SUPER_USERS/
 # etc. already set by gitops-install-quay's 04-init-config-bundle-secret.yaml.
