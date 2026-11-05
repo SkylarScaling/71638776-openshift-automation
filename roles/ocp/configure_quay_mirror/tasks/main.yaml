@@ -62,6 +62,30 @@
   when: _quay_s3_bucket_check.rc != 0
   changed_when: true
 
+# gitops-install-quay's 04-init-config-bundle-secret.yaml is sync-wave 1,
+# behind the QuayRegistry/Subscription at wave 0 -- on a fresh build the
+# secret (or its config.yaml key) can genuinely not exist yet when this role
+# starts. Confirmed live: the quay-registry Application sat
+# Progressing/OutOfSync while the CSV installed, the secret was never
+# created, `oc get ... | base64 -d` still exited 0 with empty stdout (no
+# pipefail, no failed_when), `from_yaml('')` parsed that to None rather than
+# raising, and the next task's "is not defined" guard didn't catch a fact
+# that *was* defined (just to None) -- surfacing as an opaque no_log-censored
+# failure in the merge task further down instead of a clear wait/timeout here.
+- name: Wait for gitops-install-quay to create the init config bundle secret
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get secret init-config-bundle-secret
+    -n {{ quay_mirror_namespace }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.data.config\.yaml}' 2>/dev/null | base64 -d | wc -c
+  args:
+    executable: /bin/bash
+  register: _quay_init_secret_wait
+  changed_when: false
+  until: (_quay_init_secret_wait.stdout | default('0') | trim | int) > 0
+  retries: 40
+  delay: 15
+
 # Read-modify-write so we don't clobber FEATURE_USER_INITIALIZE/SUPER_USERS/
 # etc. already set by gitops-install-quay's 04-init-config-bundle-secret.yaml.
 - name: Read current Quay config bundle secret
@@ -178,6 +202,10 @@
   no_log: true
   when: not (_quay_already_on_s3 | bool)
 
+# Guards against both "set_fact never ran" (undefined, the ignore_errors
+# case) and "set_fact ran but produced None or a non-dict" (defined but not
+# usable -- confirmed live: from_yaml('') on an empty/not-yet-created secret
+# returns None without raising, which "is not defined" alone does not catch).
 - name: Fall back to the known GitOps baseline if the current config bundle failed to parse
   ansible.builtin.set_fact:
     _quay_current_config_parsed:
@@ -188,7 +216,7 @@
       FEATURE_SUPERUSERS_FULL_ACCESS: true
   when:
     - not (_quay_already_on_s3 | bool)
-    - _quay_current_config_parsed is not defined
+    - (_quay_current_config_parsed is not defined) or (_quay_current_config_parsed is not mapping)
 
 # Named 'local_us' rather than 'default' -- confirmed live this is the exact
 # location name the Quay operator's own managed (pre-switch) objectstorage
