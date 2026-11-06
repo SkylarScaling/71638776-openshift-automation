@@ -703,6 +703,24 @@
       vars:
         target_kubeconfig: "{{ hub_kubeconfig }}"
 
+    # Verify Quay is actually healthy BEFORE cutting off the jumphost --
+    # confirmed live this ordering matters: revoking jumphost egress right
+    # after patch_cluster_idms, without ever confirming Quay came up clean,
+    # left no recovery path the one time Quay's own operand pods (postgres/
+    # redis/clair/quay-app) needed to re-pull their images shortly after
+    # (self-hosting deadlock: Quay can't serve its own images while it's
+    # down, and jumphost was already both unreferenced in the IDMS and
+    # unreachable by then). This doesn't fully close that risk for a LATER
+    # event (e.g. an operator upgrade long after this play has finished) --
+    # that's an inherent tradeoff of fully cutting off jumphost egress by
+    # design (see DISCONNECTED-NETWORK-LOCKDOWN.md) -- but it does catch the
+    # common case of Quay never coming up cleanly from the migration itself.
+    - name: Verify Quay mirror is healthy before revoking jumphost access
+      ansible.builtin.include_role:
+        name: ocp/verify_mirror_health
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
+
     # The jumphost is no longer required once Quay on the hub is the live
     # mirror — finish the lockdown by cutting off the jumphost peering egress
     # entirely. The clusters already have everything they need.

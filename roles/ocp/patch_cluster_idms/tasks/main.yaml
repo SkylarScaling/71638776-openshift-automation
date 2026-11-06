@@ -49,15 +49,47 @@
 
 # ------------------------------------------------------------------------------
 # HUB CLUSTER: apply new IDMS + CatalogSource
-# ------------------------------------------------------------------------------
+#
+# oc-mirror v2 always names its generated IDMS/ITMS objects the same way
+# (idms-release-0, idms-operator-0, ...) regardless of destination -- confirmed
+# live: the jumphost's initial mirror and this later Quay re-mirror produced
+# objects with IDENTICAL names. `oc apply`-ing Quay's manifests as-is replaces
+# the jumphost's objects outright (same name = same object) instead of adding
+# a second mirror source, leaving registry.redhat.io resolving to Quay ONLY.
+# That's a self-hosting deadlock waiting to happen: if anything later forces
+# Quay's own operand pods (postgres/redis/clair/quay-app itself) to re-pull
+# their images -- an operator upgrade, node replacement, eviction -- there is
+# no other source left once jumphost egress is also revoked (see below),
+# because Quay can't serve its own images while it's down. Confirmed live:
+# exactly this happened days after a successful migrate_mirror run.
+#
+# Rename every Quay IDMS/ITMS object before applying so it coexists
+# alongside the jumphost's original, unrenamed one instead of replacing it --
+# OCP merges the mirrors from ALL ImageDigestMirrorSet/ImageTagMirrorSet
+# objects for a given source into one registries.conf, so this makes the
+# jumphost a live fallback mirror for as long as it remains reachable
+# (i.e. until the lockdown step further down actually revokes it).
+- name: Flatten Quay IDMS/ITMS manifests into individual documents
+  ansible.builtin.set_fact:
+    _quay_idms_docs: "{{ quay_idms_manifests | map('from_yaml_all') | list | sum(start=[]) }}"
+
+- name: Rename each Quay IDMS/ITMS document to avoid colliding with the jumphost's same-named mirror objects
+  ansible.builtin.set_fact:
+    _quay_idms_docs_renamed: >-
+      {{ (_quay_idms_docs_renamed | default([])) + [
+        item | combine({'metadata': item.metadata | combine({'name': item.metadata.name ~ '-quay'})}, recursive=True)
+      ] }}
+  loop: "{{ _quay_idms_docs }}"
+  loop_control:
+    label: "{{ item.metadata.name }}-quay"
+
 - name: Apply Quay IDMS manifests to hub cluster
   ansible.builtin.shell:
     cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
-    stdin: "{{ item }}"
-  loop: "{{ quay_idms_manifests }}"
+    stdin: "{{ item | to_nice_yaml }}"
+  loop: "{{ _quay_idms_docs_renamed }}"
   loop_control:
-    index_var: _idx
-    label: "Quay IDMS manifest {{ _idx + 1 }}"
+    label: "{{ item.metadata.name }}"
   changed_when: true
 
 - name: Disable default OperatorHub catalog sources on hub
@@ -94,11 +126,13 @@
 
 # ------------------------------------------------------------------------------
 # SPOKE CLUSTERS: propagate via ManifestWork
+#
+# Same same-name collision risk as the hub above: configure_disconnected_cluster
+# applied the jumphost's unrenamed idms-release-0/idms-operator-0 directly to
+# each spoke during its own bootstrap, so pushing Quay's manifests under those
+# same names here would replace them instead of adding a second mirror source.
+# Reuse the already-renamed documents from the hub apply above.
 # ------------------------------------------------------------------------------
-- name: Build combined IDMS manifest string for ManifestWork
-  ansible.builtin.set_fact:
-    _quay_idms_combined: "{{ quay_idms_manifests | join('\n---\n') }}"
-
 - name: Push updated IDMS to spokes via ManifestWork
   ansible.builtin.shell:
     cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
@@ -110,7 +144,7 @@
         namespace: "{{ hostvars[item].ocp_cluster.name }}"
       spec:
         workload:
-          manifests: {{ quay_idms_manifests | map('from_yaml_all') | flatten | to_json }}
+          manifests: {{ _quay_idms_docs_renamed | to_json }}
   loop: "{{ groups['managed_clusters'] | default([]) }}"
   loop_control:
     label: "{{ hostvars[item].ocp_cluster.name }}"
