@@ -26,11 +26,12 @@ graph and are out of scope here.
 - **Reuse proven, bug-fixed logic** rather than re-implementing it: the new mirror
   role shares the `ImageSetConfiguration` template with `mirror_ocp_content` and
   the Quay repo-creation race workaround (`remirror_to_quay/tasks/converge_unauthorized.yml`,
-  see [[project_disconnected_bugs]] Bug 7) rather than duplicating it.
+  a concurrent first-push token race in Quay's auth path — see commit `df58ea1`)
+  rather than duplicating it.
 - **MCO-safe waits everywhere.** Every MachineConfigPool wait uses the two-step
   "wait for Updating=True, then wait for Updated=True" pattern. A bare
   `Updated=True` wait can pass against a stale condition left over from a prior
-  roll (see [[project_disconnected_bugs]] Bug 6) — this bit the initial-install
+  roll (see commit `eb0f9f0`) — this bit the initial-install
   playbook once already and the update playbook performs the same class of
   MachineConfig-triggering operations (new IDMS, new CatalogSource digest).
 
@@ -97,4 +98,4 @@ Phases (tags), run in order by default:
   whatever the operator's own OLM channel/replaces graph allows — this playbook
   only mirrors content and approves pending `InstallPlan`s, it does not change
   Subscription channel itself (that's defined in the external `gitops-install-*`
-  repos per [[CLAUDE.md]]'s ArgoCD-first Day 2 pattern).
+  repos per CLAUDE.md's ArgoCD-first Day 2 pattern).

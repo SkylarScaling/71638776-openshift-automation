@@ -132,10 +132,10 @@ the existing jumphost-mirrors-then-migrate-to-hub workflow. Set
   role revokes that and replaces it with VPC-CIDR-only (plus jumphost-VPC-CIDR
   until `migrate_mirror`).
 - **Telemetry/Insights**: disabled on every cluster regardless of version (no
-  OCP capability-list hardcoding — see [[project_disconnected_bugs]] for why
-  this codebase avoids version-pinned assumptions) by removing
-  `cloud.openshift.com` from the pull secret and scaling down the Insights
-  Operator.
+  OCP capability-list hardcoding — this codebase avoids version-pinned
+  assumptions since different OCP releases have shipped different default
+  capability sets) by removing `cloud.openshift.com` from the pull secret and
+  scaling down the Insights Operator.
 
 ## New roles
 
