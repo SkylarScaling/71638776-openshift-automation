@@ -185,14 +185,20 @@
 # manifest format while preserving digests. This leaves required operator
 # images out of the mirror and causes downstream operator install failures.
 #
-# Workaround: after rc=4, parse the error log and retry failed images using
-# `oc image mirror --filter-by-os=linux/amd64`, which copies only the
-# linux/amd64 layer and avoids the manifest format constraint.
+# Workaround: after rc=4, parse the error log and retry failed images with
+# `skopeo copy --all`, which copies every platform sub-manifest AND writes
+# the manifest list itself under its ORIGINAL digest.
 #
-# NOTE: This produces a single-arch image with a different digest than the
-# original multi-arch manifest. The IDMS from oc-mirror references the
-# original multi-arch digest, so the cluster will fall through to the mirror
-# via tag rather than digest. This is acceptable for operator images.
+# `oc image mirror --filter-by-os=linux/amd64` (the previous approach here)
+# does NOT do this -- confirmed live, twice, on quay-builder-qemu-rhcos-rhel8:
+# it flattens the list down to a single platform's sub-manifest, pushed under
+# a DIFFERENT digest than the list. The operator bundle's relatedImages (and
+# the cluster's installed CSV/pods, for any image affected this way) pin the
+# ORIGINAL list digest, so a pull by that digest 404s forever even though the
+# flattened content did land successfully under a different name. This
+# surfaced downstream as BundleUnpackFailed / ImagePullBackOff with no
+# indication the mirror step itself was the cause. skopeo preserves the
+# digest so pulls-by-original-digest actually resolve.
 #
 # REMOVE THIS BLOCK when the upstream oc-mirror v2 bug is fixed:
 # https://github.com/openshift/oc-mirror/issues (search: "preserve digests manifest list")
@@ -220,32 +226,6 @@
   changed_when: false
   failed_when: false
 
-# Destination MUST carry an explicit :sha256-<digest> tag -- without one, oc
-# image mirror pushes to the bare repository with no tag at all, which is
-# invisible to anything that looks the image up by tag (as the verification
-# gate below, and any manual inspection, does) even though the manifest/blob
-# content did land. Match the `sha256-<digest>` tag convention oc-mirror v2
-# itself uses for every successfully mirrored image in this registry.
-- name: Retry failed images with oc image mirror (linux/amd64 only)
-  ansible.builtin.shell: >
-    {{ bin_dir }}/oc image mirror
-    --filter-by-os=linux/amd64
-    --insecure=true
-    -a {{ oc_mirror_workspace }}/containers/auth.json
-    {{ item | regex_replace('^docker://', '') }}
-    {{ mirror_registry_url }}/{{ mirror_base_path }}/{{ item | regex_replace('^docker://[^/]+/', '') | regex_replace('@sha256:[a-f0-9]+$', '') }}:{{ item | regex_replace('^.*@sha256:', 'sha256-') }}
-  loop: "{{ failed_images_raw.stdout_lines | default([]) }}"
-  loop_control:
-    label: "{{ item | regex_replace('^docker://', '') | truncate(80, True, '...') }}"
-  when:
-    - failed_images_raw is defined
-    - failed_images_raw.stdout_lines | default([]) | length > 0
-  register: _retry_failed_images
-  changed_when: true
-  retries: 3
-  delay: 10
-  until: _retry_failed_images.rc == 0
-
 - name: Extract failed operator bundle image refs from error log
   ansible.builtin.shell: >
     grep -oP 'docker://\S+' {{ (oc_mirror_error_logs.files | sort(attribute='path') | last).path }}
@@ -258,18 +238,47 @@
   changed_when: false
   failed_when: false
 
-# Same explicit-tag fix as the non-bundle retry above, plus retries -- these
-# are large multi-GB manifest-list images (e.g. quay-builder-qemu-rhcos) and
-# a single attempt timing out against the mirror registry under load (seen
-# live as a ~1.5s "success" that silently pushed nothing) must not be
-# swallowed by failed_when: false anymore.
-- name: Retry failed operator bundle images with oc image mirror
+- name: Ensure skopeo is available for manifest-list-preserving retries
+  ansible.builtin.package:
+    name: skopeo
+    state: present
+  become: true
+  when: >-
+    (failed_images_raw.stdout_lines | default([]) | length > 0)
+    or (failed_bundles_raw.stdout_lines | default([]) | length > 0)
+
+# Destination carries an explicit :sha256-<digest> tag purely for human
+# browsability (matching oc-mirror's own convention) -- the pull path that
+# actually matters is by digest, which `skopeo copy --all` preserves as the
+# ORIGINAL manifest-list digest regardless of what tag is given.
+- name: Retry failed images with skopeo (preserves manifest-list digest)
   ansible.builtin.shell: >
-    {{ bin_dir }}/oc image mirror
-    --insecure=true
-    -a {{ oc_mirror_workspace }}/containers/auth.json
-    {{ item | regex_replace('^docker://', '') }}
-    {{ mirror_registry_url }}/{{ mirror_base_path }}/{{ item | regex_replace('^docker://[^/]+/', '') | regex_replace('@sha256:[a-f0-9]+$', '') }}:{{ item | regex_replace('^.*@sha256:', 'sha256-') }}
+    skopeo copy --all
+    --src-registry-config={{ oc_mirror_workspace }}/containers/auth.json
+    --dest-registry-config={{ oc_mirror_workspace }}/containers/auth.json
+    --dest-tls-verify=false
+    docker://{{ item | regex_replace('^docker://', '') }}
+    docker://{{ mirror_registry_url }}/{{ mirror_base_path }}/{{ item | regex_replace('^docker://[^/]+/', '') | regex_replace('@sha256:[a-f0-9]+$', '') }}:{{ item | regex_replace('^.*@sha256:', 'sha256-') }}
+  loop: "{{ failed_images_raw.stdout_lines | default([]) }}"
+  loop_control:
+    label: "{{ item | regex_replace('^docker://', '') | truncate(80, True, '...') }}"
+  when:
+    - failed_images_raw is defined
+    - failed_images_raw.stdout_lines | default([]) | length > 0
+  register: _retry_failed_images
+  changed_when: true
+  retries: 3
+  delay: 10
+  until: _retry_failed_images.rc == 0
+
+- name: Retry failed operator bundle images with skopeo (preserves manifest-list digest)
+  ansible.builtin.shell: >
+    skopeo copy --all
+    --src-registry-config={{ oc_mirror_workspace }}/containers/auth.json
+    --dest-registry-config={{ oc_mirror_workspace }}/containers/auth.json
+    --dest-tls-verify=false
+    docker://{{ item | regex_replace('^docker://', '') }}
+    docker://{{ mirror_registry_url }}/{{ mirror_base_path }}/{{ item | regex_replace('^docker://[^/]+/', '') | regex_replace('@sha256:[a-f0-9]+$', '') }}:{{ item | regex_replace('^.*@sha256:', 'sha256-') }}
   loop: "{{ failed_bundles_raw.stdout_lines | default([]) }}"
   loop_control:
     label: "{{ item | regex_replace('^docker://', '') | truncate(80, True, '...') }}"
@@ -285,7 +294,7 @@
 - name: Display oc-mirror partial failure summary
   ansible.builtin.debug:
     msg:
-      - "WARNING: oc-mirror rc={{ oc_mirror_result.rc }} — some images failed and were retried with 'oc image mirror'."
+      - "WARNING: oc-mirror rc={{ oc_mirror_result.rc }} — some images failed and were retried with 'skopeo copy --all'."
       - "rc=4: manifest format incompatibility; rc=14: transient network failure."
       - "See {{ oc_mirror_workspace }}/working-dir/logs/ for details."
       - "Remove the workaround block in mirror_ocp_content/tasks/main.yaml when oc-mirror v2 fixes the manifest preservation bug."
@@ -301,9 +310,18 @@
 # the mirror registry and fail the whole mirror phase if any are still
 # missing, rather than letting a silent gap reach cluster install (where it
 # surfaces hours later as an opaque ImagePullBackOff/BundleUnpackFailed).
+#
+# `oc image info` ALWAYS errors on a manifest list with no platform chosen
+# ("the image is a manifest list ... use --filter-by-os") regardless of
+# whether it was pushed correctly -- confirmed live this made the verify
+# step itself always "fail" against a properly skopeo-preserved list.
+# --filter-by-os=linux/amd64 works for both a plain single-arch image and a
+# full preserved list (oc extracts that platform's sub-manifest from it), so
+# it correctly verifies either shape of destination content.
 - name: Verify retried images actually landed in the mirror registry
   ansible.builtin.command: >
     {{ bin_dir }}/oc image info
+    --filter-by-os=linux/amd64
     --insecure=true
     --registry-config={{ oc_mirror_workspace }}/containers/auth.json
     {{ mirror_registry_url }}/{{ mirror_base_path }}/{{ item | regex_replace('^docker://[^/]+/', '') | regex_replace('@sha256:[a-f0-9]+$', '') }}@{{ item | regex_replace('^.*@', '') }}
@@ -317,8 +335,8 @@
 - name: Fail if any retried image is still missing from the mirror registry
   ansible.builtin.fail:
     msg: >-
-      The following images were reported mirrored by the 'oc image mirror'
-      retry above but are NOT retrievable by digest from the mirror
+      The following images were reported mirrored by the retry above but
+      are NOT retrievable by digest from the mirror
       registry: {{ _retried_image_verify.results
         | selectattr('rc', 'ne', 0)
         | map(attribute='item')

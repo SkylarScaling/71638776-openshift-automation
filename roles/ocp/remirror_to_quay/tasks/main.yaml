@@ -258,18 +258,32 @@
   changed_when: false
   failed_when: false
 
+- name: Ensure skopeo is available for manifest-list-preserving retries (Quay run)
+  ansible.builtin.package:
+    name: skopeo
+    state: present
+  become: true
+  when: _quay_failed_images.stdout_lines | default([]) | length > 0
+
 # Quay's blob-delete GC lock can collide with a concurrent upload of the same
 # shared digest (common base-image layers), returning a transient 503 after
 # ~3s. A single retry can land in the same lock window under high oc-mirror
 # parallelism, so retry a few times with a short backoff rather than once.
-- name: Retry failed images to Quay with oc image mirror (linux/amd64 only)
+#
+# `skopeo copy --all` (not `oc image mirror --filter-by-os`) -- the latter
+# flattens a multi-arch manifest list to a single platform's sub-manifest
+# under a DIFFERENT digest than the list, which breaks any pull by the
+# original digest (confirmed live, see the identical fix and rationale in
+# ocp/mirror_ocp_content). skopeo preserves the list under its original
+# digest. Tag is for human browsability only; the digest is what matters.
+- name: Retry failed images to Quay with skopeo (preserves manifest-list digest)
   ansible.builtin.command: >
-    {{ bin_dir }}/oc image mirror
-    --filter-by-os=linux/amd64
-    --insecure=true
-    -a {{ quay_mirror_workspace }}/containers/auth.json
-    {{ item | regex_replace('^docker://', '') }}
-    {{ quay_registry_url }}/{{ quay_mirror_org }}/{{ item | regex_replace('^docker://[^/]+/', '') | regex_replace('@sha256:[a-f0-9]+$', '') }}
+    skopeo copy --all
+    --src-registry-config={{ quay_mirror_workspace }}/containers/auth.json
+    --dest-registry-config={{ quay_mirror_workspace }}/containers/auth.json
+    --dest-tls-verify=false
+    docker://{{ item | regex_replace('^docker://', '') }}
+    docker://{{ quay_registry_url }}/{{ quay_mirror_org }}/{{ item | regex_replace('^docker://[^/]+/', '') | regex_replace('@sha256:[a-f0-9]+$', '') }}:{{ item | regex_replace('^.*@sha256:', 'sha256-') }}
   loop: "{{ _quay_failed_images.stdout_lines | default([]) }}"
   loop_control:
     label: "{{ item | regex_replace('^docker://', '') | truncate(80, True, '...') }}"
@@ -281,7 +295,6 @@
     - _quay_failed_images is defined
     - _quay_failed_images.stdout_lines | default([]) | length > 0
   changed_when: true
-  failed_when: false
 
 - name: Extract failed operator bundle refs from Quay error log
   ansible.builtin.shell: >
@@ -295,14 +308,23 @@
   changed_when: false
   failed_when: false
 
-# See the lock-race comment above the non-bundle retry task — same rationale.
-- name: Retry failed bundle images to Quay with oc image mirror
+- name: Ensure skopeo is available for manifest-list-preserving retries (Quay bundle run)
+  ansible.builtin.package:
+    name: skopeo
+    state: present
+  become: true
+  when: _quay_failed_bundles.stdout_lines | default([]) | length > 0
+
+# See the lock-race and manifest-list-preservation comments above the
+# non-bundle retry task — same rationale applies here.
+- name: Retry failed bundle images to Quay with skopeo (preserves manifest-list digest)
   ansible.builtin.command: >
-    {{ bin_dir }}/oc image mirror
-    --insecure=true
-    -a {{ quay_mirror_workspace }}/containers/auth.json
-    {{ item | regex_replace('^docker://', '') }}
-    {{ quay_registry_url }}/{{ quay_mirror_org }}/{{ item | regex_replace('^docker://[^/]+/', '') | regex_replace('@sha256:[a-f0-9]+$', '') }}
+    skopeo copy --all
+    --src-registry-config={{ quay_mirror_workspace }}/containers/auth.json
+    --dest-registry-config={{ quay_mirror_workspace }}/containers/auth.json
+    --dest-tls-verify=false
+    docker://{{ item | regex_replace('^docker://', '') }}
+    docker://{{ quay_registry_url }}/{{ quay_mirror_org }}/{{ item | regex_replace('^docker://[^/]+/', '') | regex_replace('@sha256:[a-f0-9]+$', '') }}:{{ item | regex_replace('^.*@sha256:', 'sha256-') }}
   loop: "{{ _quay_failed_bundles.stdout_lines | default([]) }}"
   loop_control:
     label: "{{ item | regex_replace('^docker://', '') | truncate(80, True, '...') }}"
@@ -314,7 +336,39 @@
     - _quay_failed_bundles is defined
     - _quay_failed_bundles.stdout_lines | default([]) | length > 0
   changed_when: true
+
+# Don't trust the shell rc alone -- see the identical check and rationale in
+# ocp/mirror_ocp_content (confirmed live there a "successful" retry can
+# silently push nothing). --filter-by-os=linux/amd64 works whether the
+# destination ended up as a plain single-arch image or a full preserved
+# manifest list.
+- name: Verify retried Quay images actually landed in the registry
+  ansible.builtin.command: >
+    {{ bin_dir }}/oc image info
+    --filter-by-os=linux/amd64
+    --insecure=true
+    --registry-config={{ quay_mirror_workspace }}/containers/auth.json
+    {{ quay_registry_url }}/{{ quay_mirror_org }}/{{ item | regex_replace('^docker://[^/]+/', '') | regex_replace('@sha256:[a-f0-9]+$', '') }}@{{ item | regex_replace('^.*@', '') }}
+  loop: "{{ (_quay_failed_images.stdout_lines | default([])) + (_quay_failed_bundles.stdout_lines | default([])) }}"
+  loop_control:
+    label: "{{ item | regex_replace('^docker://', '') | truncate(80, True, '...') }}"
+  register: _quay_retried_image_verify
+  changed_when: false
   failed_when: false
+
+- name: Fail if any retried Quay image is still missing from the registry
+  ansible.builtin.fail:
+    msg: >-
+      The following images were reported mirrored to Quay by the retry
+      above but are NOT retrievable by digest: {{ _quay_retried_image_verify.results
+        | selectattr('rc', 'ne', 0)
+        | map(attribute='item')
+        | list }}.
+      Re-run this role (remirror_to_quay) to retry, or inspect
+      {{ quay_mirror_workspace }}/working-dir/logs/ for the original error.
+  when:
+    - _quay_retried_image_verify.results is defined
+    - _quay_retried_image_verify.results | selectattr('rc', 'ne', 0) | list | length > 0
 
 # After all image retries, check if CatalogSource was generated. A missing
 # CatalogSource means the catalog index image failed during the oc-mirror
