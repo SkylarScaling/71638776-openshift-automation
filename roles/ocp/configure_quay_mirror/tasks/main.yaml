@@ -91,35 +91,103 @@
     # sync -- confirmed live: the quay-operator Subscription can be stuck
     # BundleUnpackFailed (its bundle image missing from the mirror registry),
     # which holds the wave-0 Subscription Degraded forever, which ArgoCD
-    # never advances past to apply the wave-1 secret. Surface that state
-    # directly instead of just "0 after 40 retries", so this doesn't need a
-    # fresh live investigation every time it recurs.
-    - name: Dump Quay Subscription and ArgoCD Application status for diagnosis
+    # never advances past to apply the wave-1 secret.
+    #
+    # "subscription"/"application" as bare resource names are ambiguous on
+    # this cluster -- confirmed live: `oc get subscription` without the API
+    # group resolves to apps.open-cluster-management.io's Subscription (ACM),
+    # and `oc get application` resolves to app.k8s.io's Application, neither
+    # of which is the OLM/ArgoCD object we actually want. Always qualify with
+    # the full group.
+    - name: Check whether the quay-operator Subscription is stuck on a failed bundle unpack
       ansible.builtin.shell: >
-        echo '--- quay-operator Subscription ---';
-        {{ bin_dir }}/oc get subscription quay-operator -n {{ quay_mirror_namespace }}
+        {{ bin_dir }}/oc get subscriptions.operators.coreos.com quay-operator -n {{ quay_mirror_namespace }}
         --kubeconfig {{ target_kubeconfig }}
-        -o jsonpath='{.status.conditions}' 2>/dev/null || true;
-        echo;
-        echo '--- {{ quay_argocd_app_name }} Application ---';
-        {{ bin_dir }}/oc get application {{ quay_argocd_app_name }} -n {{ quay_argocd_namespace }}
-        --kubeconfig {{ target_kubeconfig }}
-        -o jsonpath='{.status.sync.status} {.status.health.status} {.status.operationState.message}' 2>/dev/null || true
+        -o jsonpath='{range .status.conditions[?(@.type=="BundleUnpackFailed")]}{.status}{end}' 2>/dev/null || true
       args:
         executable: /bin/bash
-      register: _quay_init_secret_diagnosis
+      register: _quay_bundle_unpack_failed_check
       changed_when: false
       failed_when: false
 
-    - name: Fail with diagnosis
-      ansible.builtin.fail:
-        msg: >-
-          init-config-bundle-secret never got non-empty content after 10
-          minutes of polling. This usually means the quay-operator
-          Subscription is stuck (e.g. BundleUnpackFailed because its bundle
-          image is missing from the mirror registry), which blocks ArgoCD's
-          sync-wave ordering before the secret's wave ever applies. Live
-          status: {{ _quay_init_secret_diagnosis.stdout | default('(unavailable)') }}
+    # OLM will not retry a bundle unpack while the Job from the failed
+    # attempt still exists -- confirmed live: re-mirroring the missing bundle
+    # image and re-triggering an ArgoCD sync did nothing until the stale
+    # Failed Job in openshift-marketplace was deleted too. Only touch Jobs
+    # that are actually Failed (never Running/Complete), and only when we've
+    # confirmed BundleUnpackFailed=True, so this can't disturb an unrelated
+    # operator's in-progress unpack.
+    - name: Delete stale failed bundle-unpack jobs so OLM retries
+      ansible.builtin.shell: >
+        {{ bin_dir }}/oc get jobs -n openshift-marketplace --kubeconfig {{ target_kubeconfig }}
+        -o jsonpath='{range .items[?(@.status.failed==1)]}{.metadata.name}{"\n"}{end}'
+        | xargs -r -n1 {{ bin_dir }}/oc delete job -n openshift-marketplace --kubeconfig {{ target_kubeconfig }}
+      args:
+        executable: /bin/bash
+      register: _quay_bundle_unpack_job_cleanup
+      changed_when: "'deleted' in _quay_bundle_unpack_job_cleanup.stdout"
+      failed_when: false
+      when: "'True' in _quay_bundle_unpack_failed_check.stdout | default('')"
+
+    # Re-triggering a sync is also needed even when nothing was stuck on a
+    # job: ArgoCD's automated.selfHeal stops retrying entirely once
+    # syncPolicy.retry's budget is exhausted, and does not resume on its own
+    # just because the underlying problem (e.g. a missing mirrored image) got
+    # fixed later -- confirmed live, the Application sat Degraded/Failed for
+    # almost a full day after the mirror gap was closed, with no further
+    # attempts, until nudged here.
+    - name: Force ArgoCD to refresh and retry syncing the Quay Application
+      ansible.builtin.shell: >
+        {{ bin_dir }}/oc annotate application.argoproj.io {{ quay_argocd_app_name }} -n {{ quay_argocd_namespace }}
+        --kubeconfig {{ target_kubeconfig }}
+        argocd.argoproj.io/refresh=hard --overwrite;
+        {{ bin_dir }}/oc patch application.argoproj.io {{ quay_argocd_app_name }} -n {{ quay_argocd_namespace }}
+        --kubeconfig {{ target_kubeconfig }}
+        --type=merge
+        -p '{"operation":{"initiatedBy":{"username":"configure_quay_mirror"},"sync":{"revision":"HEAD","prune":true}}}'
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Wait again for the init config bundle secret after remediation
+      block:
+        - ansible.builtin.shell: >
+            {{ bin_dir }}/oc get secret init-config-bundle-secret
+            -n {{ quay_mirror_namespace }}
+            --kubeconfig {{ target_kubeconfig }}
+            -o jsonpath='{.data.config\.yaml}' 2>/dev/null | base64 -d | wc -c
+          args:
+            executable: /bin/bash
+          register: _quay_init_secret_wait_retry
+          changed_when: false
+          until: (_quay_init_secret_wait_retry.stdout | default('0') | trim | int) > 0
+          retries: 20
+          delay: 15
+      rescue:
+        - name: Dump Quay Subscription and ArgoCD Application status for diagnosis
+          ansible.builtin.shell: >
+            echo '--- quay-operator Subscription ---';
+            {{ bin_dir }}/oc get subscriptions.operators.coreos.com quay-operator -n {{ quay_mirror_namespace }}
+            --kubeconfig {{ target_kubeconfig }}
+            -o jsonpath='{.status.conditions}' 2>/dev/null || true;
+            echo;
+            echo '--- {{ quay_argocd_app_name }} Application ---';
+            {{ bin_dir }}/oc get application.argoproj.io {{ quay_argocd_app_name }} -n {{ quay_argocd_namespace }}
+            --kubeconfig {{ target_kubeconfig }}
+            -o jsonpath='{.status.sync.status} {.status.health.status} {.status.operationState.message}' 2>/dev/null || true
+          args:
+            executable: /bin/bash
+          register: _quay_init_secret_diagnosis
+          changed_when: false
+          failed_when: false
+
+        - name: Fail with diagnosis
+          ansible.builtin.fail:
+            msg: >-
+              init-config-bundle-secret never got non-empty content, even
+              after deleting any failed bundle-unpack jobs and forcing an
+              ArgoCD resync. Live status:
+              {{ _quay_init_secret_diagnosis.stdout | default('(unavailable)') }}
 
 # Read-modify-write so we don't clobber FEATURE_USER_INITIALIZE/SUPER_USERS/
 # etc. already set by gitops-install-quay's 04-init-config-bundle-secret.yaml.
