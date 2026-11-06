@@ -12,14 +12,36 @@
 # (sets update_idms_manifests, update_catalog_image).
 # ==============================================================================
 
+# patch_cluster_idms (migrate_mirror) renames Quay's IDMS/ITMS objects with a
+# `-quay` suffix so they coexist with the jumphost's identically-named
+# originals instead of replacing them (see that role for why). oc-mirror
+# names objects from THIS mirror pass the same default way
+# (idms-release-0, idms-operator-0, ...) -- applying them as-is here would
+# create a second, unrenamed set alongside the steady-state `-quay` ones
+# instead of converging onto them, defeating the "one steady-state object
+# per update" intent this role documents. Apply the same rename so Day 2
+# catalog updates land on the exact objects migrate_mirror already created.
+- name: Flatten updated IDMS/ITMS manifests into individual documents
+  ansible.builtin.set_fact:
+    _update_idms_docs: "{{ update_idms_manifests | map('from_yaml_all') | list | sum(start=[]) }}"
+
+- name: Rename each updated IDMS/ITMS document to match migrate_mirror's steady-state objects
+  ansible.builtin.set_fact:
+    _update_idms_docs_renamed: >-
+      {{ (_update_idms_docs_renamed | default([])) + [
+        item | combine({'metadata': item.metadata | combine({'name': item.metadata.name ~ '-quay'})}, recursive=True)
+      ] }}
+  loop: "{{ _update_idms_docs }}"
+  loop_control:
+    label: "{{ item.metadata.name }}-quay"
+
 - name: Apply updated IDMS manifests to hub cluster
   ansible.builtin.shell:
     cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
-    stdin: "{{ item }}"
-  loop: "{{ update_idms_manifests }}"
+    stdin: "{{ item | to_nice_yaml }}"
+  loop: "{{ _update_idms_docs_renamed }}"
   loop_control:
-    index_var: _idx
-    label: "Updated IDMS manifest {{ _idx + 1 }}"
+    label: "{{ item.metadata.name }}"
   changed_when: true
 
 - name: Disable default OperatorHub catalog sources on hub
@@ -80,7 +102,7 @@
         namespace: "{{ hostvars[item].ocp_cluster.name }}"
       spec:
         workload:
-          manifests: {{ update_idms_manifests | map('from_yaml_all') | flatten | to_json }}
+          manifests: {{ _update_idms_docs_renamed | to_json }}
   loop: "{{ groups['managed_clusters'] | default([]) }}"
   loop_control:
     label: "{{ hostvars[item].ocp_cluster.name }}"
