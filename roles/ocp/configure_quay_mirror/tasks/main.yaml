@@ -608,13 +608,31 @@
     quay_registry_url: "{{ _quay_route_raw.stdout | trim }}"
     quay_mirror_push_url: "{{ _quay_route_raw.stdout | trim }}/{{ quay_mirror_org }}"
 
+# `oc rollout status` only confirms the NEW ReplicaSet reached desired
+# availability -- old pods can still be listed, Ready-but-draining, for up
+# to terminationGracePeriodSeconds after that. Confirmed live: a plain
+# `-l quay-component=quay-app | head -1` picked a pod from the just-scaled-
+# down OLD ReplicaSet (lower name sorts first alphabetically), whose
+# container was killed seconds into the grace period -- `oc exec` into it
+# for the admin/org/robot setup script below silently ran against a dying
+# interpreter with no traceback, leaving Quay's database untouched. Filter
+# to pods that are actually Running with no deletionTimestamp, and retry
+# until at least one shows up, rather than trusting the first name sorted.
 - name: Get Quay app pod name
   ansible.builtin.shell: >
     {{ bin_dir }}/oc get pod -n {{ quay_mirror_namespace }}
     --kubeconfig {{ target_kubeconfig }}
     -l quay-component=quay-app
-    --no-headers -o custom-columns=NAME:.metadata.name | head -1
+    --field-selector=status.phase=Running
+    -o json
+    | jq -r '.items[] | select(.metadata.deletionTimestamp == null) | .metadata.name'
+    | head -1
+  args:
+    executable: /bin/bash
   register: _quay_app_pod
+  until: _quay_app_pod.stdout | trim != ''
+  retries: 10
+  delay: 6
   changed_when: false
 
 # Check whether the cluster's pull secret already has working Quay robot
@@ -714,7 +732,7 @@
 
         # ---- Robot account ----
         robot_fullname = '{{ quay_mirror_org }}+{{ quay_mirror_robot_account }}'
-    {% if _quay_robot_needs_rotation %}
+    {% if _quay_robot_needs_rotation | bool %}
         # Delete existing robot if present and recreate — avoids reading the
         # encrypted token field (which requires Quay-version-specific internals
         # to decode and silently produces a wrong token on re-runs). Only
