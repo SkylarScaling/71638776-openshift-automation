@@ -129,6 +129,113 @@
     (_spoke_image_cr_patch.results | selectattr('item', 'equalto', item) | map(attribute='changed') | first) | default(false)
 
 # ------------------------------------------------------------------------------
+# SPOKE CLUSTERS: Quay pull credentials
+#
+# configure_quay_mirror merges the Quay robot account into the global
+# pull-secret, but only ever against target_kubeconfig (the hub) -- spokes
+# never got it. Confirmed live: even after the CatalogSource correctly
+# pointed at Quay and the insecureRegistries/TLS trust was fixed, the
+# spoke's catalog pod still failed with "unauthorized: access to the
+# requested resource is not authorized" pulling the Quay-hosted index image,
+# because the spoke's own openshift-config/pull-secret had no auth entry for
+# the Quay route at all. quay_robot_username/quay_robot_token are set as
+# facts by configure_quay_mirror earlier in this same play, so they're
+# already available here. Same per-spoke direct-kubeconfig pattern as the
+# insecureRegistries patch above.
+# ------------------------------------------------------------------------------
+- name: Check if Quay robot credentials already exist in each spoke's global pull secret
+  ansible.builtin.shell: |
+    set -e
+    CURRENT=$({{ bin_dir }}/oc get secret pull-secret \
+      -n openshift-config \
+      --kubeconfig {{ install_dir }}/{{ hostvars[item].ocp_cluster.name }}/auth/kubeconfig \
+      -o jsonpath='{.data.\.dockerconfigjson}' | base64 -d)
+    EXISTING_AUTH=$(echo "$CURRENT" | jq -r '.auths["{{ quay_registry_url }}"].auth // ""')
+    if [ "$EXISTING_AUTH" = "{{ (quay_robot_username ~ ':' ~ quay_robot_token) | b64encode }}" ]; then
+      echo "present"
+    else
+      echo "missing"
+    fi
+  args:
+    executable: /bin/bash
+  loop: "{{ groups['managed_clusters'] | default([]) }}"
+  loop_control:
+    label: "{{ hostvars[item].ocp_cluster.name }}"
+  register: _spoke_quay_pull_secret_check
+  changed_when: false
+  no_log: true
+
+- name: Merge Quay robot credentials into each spoke's global pull secret
+  ansible.builtin.shell: |
+    set -e
+    KCFG="{{ install_dir }}/{{ hostvars[item].ocp_cluster.name }}/auth/kubeconfig"
+    MERGED=$({{ bin_dir }}/oc get secret pull-secret \
+      -n openshift-config \
+      --kubeconfig "$KCFG" \
+      -o jsonpath='{.data.\.dockerconfigjson}' \
+      | base64 -d \
+      | jq -c \
+          --arg host "{{ quay_registry_url }}" \
+          --arg auth "{{ (quay_robot_username ~ ':' ~ quay_robot_token) | b64encode }}" \
+          '.auths[$host] = {"auth": $auth, "email": ""}')
+
+    {{ bin_dir }}/oc apply --kubeconfig "$KCFG" -f - <<EOF
+    apiVersion: v1
+    kind: Secret
+    metadata:
+      name: pull-secret
+      namespace: openshift-config
+    type: kubernetes.io/dockerconfigjson
+    data:
+      .dockerconfigjson: "$(echo -n "$MERGED" | base64 -w 0)"
+    EOF
+  args:
+    executable: /bin/bash
+  loop: "{{ groups['managed_clusters'] | default([]) }}"
+  loop_control:
+    label: "{{ hostvars[item].ocp_cluster.name }}"
+  when: >-
+    (_spoke_quay_pull_secret_check.results | selectattr('item', 'equalto', item) | map(attribute='stdout') | first | default('') | trim) == "missing"
+  register: _spoke_quay_pull_secret_merge
+  changed_when: true
+  no_log: true
+
+# A pull-secret rotation is only complete once every node rolls the
+# MachineConfig carrying it, same reasoning as configure_quay_mirror's
+# identical wait on the hub.
+- name: Wait for each spoke's master MachineConfigPool to finish updating after pull secret rotation
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get mcp master
+    --kubeconfig {{ install_dir }}/{{ hostvars[item].ocp_cluster.name }}/auth/kubeconfig
+    -o jsonpath='{.status.conditions[?(@.type=="Updated")].status}'
+  loop: "{{ groups['managed_clusters'] | default([]) }}"
+  loop_control:
+    label: "{{ hostvars[item].ocp_cluster.name }}"
+  register: _spoke_quay_pull_secret_master_mcp
+  until: _spoke_quay_pull_secret_master_mcp.stdout == "True"
+  retries: 60
+  delay: 30
+  changed_when: false
+  when: >-
+    (_spoke_quay_pull_secret_merge.results | selectattr('item', 'equalto', item) | map(attribute='changed') | first) | default(false)
+
+- name: Wait for each spoke's worker MachineConfigPool to finish updating after pull secret rotation
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get mcp worker
+    --kubeconfig {{ install_dir }}/{{ hostvars[item].ocp_cluster.name }}/auth/kubeconfig
+    -o jsonpath='{.status.conditions[?(@.type=="Updated")].status}'
+  loop: "{{ groups['managed_clusters'] | default([]) }}"
+  loop_control:
+    label: "{{ hostvars[item].ocp_cluster.name }}"
+  register: _spoke_quay_pull_secret_worker_mcp
+  until: _spoke_quay_pull_secret_worker_mcp.stdout == "True"
+  retries: 60
+  delay: 30
+  changed_when: false
+  when: >-
+    (_spoke_quay_pull_secret_merge.results | selectattr('item', 'equalto', item) | map(attribute='changed') | first) | default(false)
+
+# ------------------------------------------------------------------------------
 # HUB CLUSTER: apply new IDMS + CatalogSource
 #
 # oc-mirror v2 always names its generated IDMS/ITMS objects the same way
