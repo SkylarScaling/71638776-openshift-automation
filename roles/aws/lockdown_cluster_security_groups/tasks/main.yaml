@@ -57,7 +57,7 @@
   register: _nl_jumphost_vpc_cidr
   changed_when: false
 
-- name: Find all security groups created for this cluster
+- name: Find security groups tagged by the installer (load balancers, etc.)
   ansible.builtin.command: >
     {{ bin_dir }}/aws ec2 describe-security-groups
     --filters Name=tag-key,Values=kubernetes.io/cluster/{{ _nl_infra_name.stdout | trim }}
@@ -65,15 +65,39 @@
     --output text
     --region {{ network_lockdown_region }}
   environment: "{{ _aws_env }}"
-  register: _nl_cluster_sgs
+  register: _nl_cluster_sgs_k8s
   changed_when: false
+
+# CAPA (cluster-api-provider-aws) tags node security groups with this key
+# instead of kubernetes.io/cluster/<infra> -- the installer's own
+# kubernetes.io/cluster tag only ever lands on load-balancer SGs it creates
+# directly. Confirmed live: filtering on kubernetes.io/cluster alone silently
+# missed every node SG (acm-hub-*-node, managed-cluster-1-*-node), leaving
+# their default 0.0.0.0/0 egress untouched while verify_network_isolation
+# still reported success (its curl-based check passed for the wrong reason --
+# no route to the internet, not no permission).
+- name: Find node security groups tagged by cluster-api-provider-aws
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-security-groups
+    --filters Name=tag-key,Values=sigs.k8s.io/cluster-api-provider-aws/cluster/{{ _nl_infra_name.stdout | trim }}
+    --query 'SecurityGroups[].GroupId'
+    --output text
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  register: _nl_cluster_sgs_capa
+  changed_when: false
+
+- name: Combine and de-duplicate discovered security group IDs
+  ansible.builtin.set_fact:
+    _nl_cluster_sgs_list: "{{ (_nl_cluster_sgs_k8s.stdout.split() + _nl_cluster_sgs_capa.stdout.split()) | unique }}"
 
 - name: Fail if no cluster-tagged security groups were found
   ansible.builtin.fail:
     msg: >-
       No security groups tagged kubernetes.io/cluster/{{ _nl_infra_name.stdout | trim }}
+      or sigs.k8s.io/cluster-api-provider-aws/cluster/{{ _nl_infra_name.stdout | trim }}
       were found — nothing to lock down.
-  when: _nl_cluster_sgs.stdout | trim == ''
+  when: _nl_cluster_sgs_list | length == 0
 
 - name: Revoke the installer's default all-traffic egress-to-anywhere rule
   ansible.builtin.command: >
@@ -82,7 +106,7 @@
     --ip-permissions '[{"IpProtocol":"-1","IpRanges":[{"CidrIp":"0.0.0.0/0"}]}]'
     --region {{ network_lockdown_region }}
   environment: "{{ _aws_env }}"
-  loop: "{{ _nl_cluster_sgs.stdout.split() }}"
+  loop: "{{ _nl_cluster_sgs_list }}"
   register: _nl_revoke_default
   failed_when:
     - _nl_revoke_default.rc != 0
@@ -96,7 +120,7 @@
     --ip-permissions '[{"IpProtocol":"-1","IpRanges":[{"CidrIp":"{{ _nl_cluster_vpc_cidr.stdout | trim }}"}]}]'
     --region {{ network_lockdown_region }}
   environment: "{{ _aws_env }}"
-  loop: "{{ _nl_cluster_sgs.stdout.split() }}"
+  loop: "{{ _nl_cluster_sgs_list }}"
   register: _nl_allow_cluster_cidr
   failed_when:
     - _nl_allow_cluster_cidr.rc != 0
@@ -110,7 +134,7 @@
     --ip-permissions '[{"IpProtocol":"-1","IpRanges":[{"CidrIp":"{{ _nl_jumphost_vpc_cidr.stdout | trim }}"}]}]'
     --region {{ network_lockdown_region }}
   environment: "{{ _aws_env }}"
-  loop: "{{ _nl_cluster_sgs.stdout.split() }}"
+  loop: "{{ _nl_cluster_sgs_list }}"
   register: _nl_allow_jumphost_cidr
   failed_when:
     - _nl_allow_jumphost_cidr.rc != 0
@@ -125,7 +149,7 @@
     --ip-permissions '[{"IpProtocol":"-1","IpRanges":[{"CidrIp":"{{ _nl_jumphost_vpc_cidr.stdout | trim }}"}]}]'
     --region {{ network_lockdown_region }}
   environment: "{{ _aws_env }}"
-  loop: "{{ _nl_cluster_sgs.stdout.split() }}"
+  loop: "{{ _nl_cluster_sgs_list }}"
   register: _nl_revoke_jumphost_cidr
   failed_when:
     - _nl_revoke_jumphost_cidr.rc != 0
@@ -145,7 +169,7 @@
     --ip-permissions '[{"IpProtocol":"tcp","FromPort":{{ item.1 }},"ToPort":{{ item.1 }},"IpRanges":[{"CidrIp":"{{ _nl_jumphost_vpc_cidr.stdout | trim }}"}]}]'
     --region {{ network_lockdown_region }}
   environment: "{{ _aws_env }}"
-  loop: "{{ _nl_cluster_sgs.stdout.split() | product(network_lockdown_jumphost_ingress_ports) | list }}"
+  loop: "{{ _nl_cluster_sgs_list | product(network_lockdown_jumphost_ingress_ports) | list }}"
   register: _nl_revoke_jumphost_ingress
   failed_when:
     - _nl_revoke_jumphost_ingress.rc != 0
@@ -156,5 +180,5 @@
 - name: Display lockdown summary
   ansible.builtin.debug:
     msg:
-      - "Security groups locked down for {{ _nl_infra_name.stdout | trim }}: {{ _nl_cluster_sgs.stdout.split() }}"
+      - "Security groups locked down for {{ _nl_infra_name.stdout | trim }}: {{ _nl_cluster_sgs_list }}"
       - "Egress allowed: {{ _nl_cluster_vpc_cidr.stdout | trim }}{{ (' and ' ~ _nl_jumphost_vpc_cidr.stdout | trim) if network_lockdown_allow_jumphost_egress | bool else '' }}"

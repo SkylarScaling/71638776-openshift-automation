@@ -63,7 +63,7 @@
     fail_msg: "Cluster subnets have a route to an Internet Gateway or NAT Gateway — isolation is not in effect"
     success_msg: "No route to an Internet Gateway or NAT Gateway on this cluster's subnets"
 
-- name: "[NetIso] Find this cluster's security groups"
+- name: "[NetIso] Find this cluster's security groups (installer-tagged, e.g. load balancers)"
   ansible.builtin.command: >
     {{ bin_dir }}/aws ec2 describe-security-groups
     --filters Name=tag-key,Values=kubernetes.io/cluster/{{ _niv_infra_name.stdout | trim }}
@@ -71,13 +71,29 @@
     --output json
     --region {{ network_lockdown_region }}
   environment: "{{ _aws_env }}"
-  register: _niv_sg_egress
+  register: _niv_sg_egress_k8s
+  changed_when: false
+
+# Node security groups are tagged by CAPA with this key instead of
+# kubernetes.io/cluster/<infra> -- see aws/lockdown_cluster_security_groups
+# for the full explanation. Without this, this check only ever inspects
+# load-balancer SGs and silently never catches a node SG still wide open to
+# 0.0.0.0/0, reporting isolation verified when it isn't.
+- name: "[NetIso] Find this cluster's node security groups (cluster-api-provider-aws-tagged)"
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-security-groups
+    --filters Name=tag-key,Values=sigs.k8s.io/cluster-api-provider-aws/cluster/{{ _niv_infra_name.stdout | trim }}
+    --query 'SecurityGroups[].IpPermissionsEgress[]'
+    --output json
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  register: _niv_sg_egress_capa
   changed_when: false
 
 - name: "[NetIso] Assert no security group allows egress to 0.0.0.0/0"
   ansible.builtin.assert:
     that: >-
-      (_niv_sg_egress.stdout | from_json
+      (((_niv_sg_egress_k8s.stdout | from_json) + (_niv_sg_egress_capa.stdout | from_json))
         | map(attribute='IpRanges') | flatten
         | selectattr('CidrIp', 'defined')
         | selectattr('CidrIp', 'equalto', '0.0.0.0/0')
