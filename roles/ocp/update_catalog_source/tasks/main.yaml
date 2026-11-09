@@ -90,7 +90,49 @@
 # ------------------------------------------------------------------------------
 # SPOKE CLUSTERS: propagate via the same ManifestWork names patch_cluster_idms
 # created, so this always converges to one steady-state object per concern.
+#
+# Defense in depth alongside patch_cluster_idms's own grant: re-apply here too
+# (idempotent) in case this Day 2 flow ever runs against a spoke that was
+# migrated before that fix existed, or whose ClusterRole/Binding was later
+# removed some other way. See patch_cluster_idms for the full klusterlet-work-sa
+# RBAC gap this works around.
 # ------------------------------------------------------------------------------
+- name: Grant klusterlet-work-sa permission to manage mirror/catalog config on each spoke
+  ansible.builtin.shell:
+    cmd: >-
+      {{ bin_dir }}/oc apply
+      --kubeconfig {{ install_dir }}/{{ hostvars[item].ocp_cluster.name }}/auth/kubeconfig
+      -f -
+    stdin: |
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRole
+      metadata:
+        name: klusterlet-work-mirror-config
+      rules:
+        - apiGroups: ["config.openshift.io"]
+          resources: ["imagedigestmirrorsets", "imagetagmirrorsets", "operatorhubs"]
+          verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+        - apiGroups: ["operators.coreos.com"]
+          resources: ["catalogsources"]
+          verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: klusterlet-work-mirror-config
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: klusterlet-work-mirror-config
+      subjects:
+        - kind: ServiceAccount
+          name: klusterlet-work-sa
+          namespace: open-cluster-management-agent
+  loop: "{{ groups['managed_clusters'] | default([]) }}"
+  loop_control:
+    label: "{{ hostvars[item].ocp_cluster.name }}"
+  changed_when: true
+
 - name: Push updated IDMS to spokes via ManifestWork
   ansible.builtin.shell:
     cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
@@ -143,6 +185,39 @@
   loop_control:
     label: "{{ hostvars[item].ocp_cluster.name }}"
   changed_when: true
+
+# Both ManifestWorks above can report "changed" from a successful `oc apply`
+# while OCM never actually manages to apply the workload onto the spoke --
+# see patch_cluster_idms for the confirmed-live RBAC gap this guards against.
+- name: Wait for IDMS ManifestWork to apply successfully on each spoke
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get manifestwork {{ hostvars[item].ocp_cluster.name }}-quay-idms
+    -n {{ hostvars[item].ocp_cluster.name }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.conditions[?(@.type=="Applied")].status}'
+  loop: "{{ groups['managed_clusters'] | default([]) }}"
+  loop_control:
+    label: "{{ hostvars[item].ocp_cluster.name }}"
+  register: _update_idms_manifestwork_applied
+  until: _update_idms_manifestwork_applied.stdout == "True"
+  retries: 12
+  delay: 15
+  changed_when: false
+
+- name: Wait for CatalogSource ManifestWork to apply successfully on each spoke
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get manifestwork {{ hostvars[item].ocp_cluster.name }}-quay-catalog
+    -n {{ hostvars[item].ocp_cluster.name }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.conditions[?(@.type=="Applied")].status}'
+  loop: "{{ groups['managed_clusters'] | default([]) }}"
+  loop_control:
+    label: "{{ hostvars[item].ocp_cluster.name }}"
+  register: _update_catalog_manifestwork_applied
+  until: _update_catalog_manifestwork_applied.stdout == "True"
+  retries: 12
+  delay: 15
+  changed_when: false
 
 - name: Display catalog update summary
   ansible.builtin.debug:

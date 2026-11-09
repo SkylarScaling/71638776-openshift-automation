@@ -132,7 +132,60 @@
 # each spoke during its own bootstrap, so pushing Quay's manifests under those
 # same names here would replace them instead of adding a second mirror source.
 # Reuse the already-renamed documents from the hub apply above.
+#
+# klusterlet-work-sa's only ClusterRoleBinding with cluster-wide reach binds
+# to the built-in `admin` ClusterRole, which only covers NAMESPACED resource
+# types aggregated into it -- it does NOT cover cluster-scoped
+# ImageDigestMirrorSet/ImageTagMirrorSet/OperatorHub (config.openshift.io),
+# and OLM's CatalogSource CRD isn't aggregate-to-admin labeled either.
+# Confirmed live: every ManifestWork pushing this config to a spoke silently
+# sat Applied=False/AppliedManifestWorkFailed ("cannot get resource
+# imagedigestmirrorsets/imagetagmirrorsets/operatorhubs ... cannot update
+# catalogsources") -- the spoke was still on the jumphost mirror with a
+# floating catalog tag, with nothing in this role (previously, no Applied
+# wait at all) catching it. Grant klusterlet-work-sa the missing permissions
+# directly against the spoke's own kubeconfig (this control node already has
+# every cluster's kubeconfig under install_dir -- same convention as
+# hub_kubeconfig elsewhere in this playbook) before pushing any ManifestWork
+# that needs them -- a ManifestWork itself can't grant the RBAC it needs to
+# apply, so this can't be done via ManifestWork.
 # ------------------------------------------------------------------------------
+- name: Grant klusterlet-work-sa permission to manage mirror/catalog config on each spoke
+  ansible.builtin.shell:
+    cmd: >-
+      {{ bin_dir }}/oc apply
+      --kubeconfig {{ install_dir }}/{{ hostvars[item].ocp_cluster.name }}/auth/kubeconfig
+      -f -
+    stdin: |
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRole
+      metadata:
+        name: klusterlet-work-mirror-config
+      rules:
+        - apiGroups: ["config.openshift.io"]
+          resources: ["imagedigestmirrorsets", "imagetagmirrorsets", "operatorhubs"]
+          verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+        - apiGroups: ["operators.coreos.com"]
+          resources: ["catalogsources"]
+          verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: klusterlet-work-mirror-config
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: klusterlet-work-mirror-config
+      subjects:
+        - kind: ServiceAccount
+          name: klusterlet-work-sa
+          namespace: open-cluster-management-agent
+  loop: "{{ groups['managed_clusters'] | default([]) }}"
+  loop_control:
+    label: "{{ hostvars[item].ocp_cluster.name }}"
+  changed_when: true
+
 - name: Push updated IDMS to spokes via ManifestWork
   ansible.builtin.shell:
     cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
@@ -185,6 +238,40 @@
   loop_control:
     label: "{{ hostvars[item].ocp_cluster.name }}"
   changed_when: true
+
+# Both ManifestWorks above can report "changed" from a successful `oc apply`
+# while OCM never actually manages to apply the workload onto the spoke --
+# confirmed live, this exact gap let a spoke sit on the jumphost mirror with
+# a floating catalog tag indefinitely with no failure anywhere in this role.
+- name: Wait for Quay IDMS ManifestWork to apply successfully on each spoke
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get manifestwork {{ hostvars[item].ocp_cluster.name }}-quay-idms
+    -n {{ hostvars[item].ocp_cluster.name }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.conditions[?(@.type=="Applied")].status}'
+  loop: "{{ groups['managed_clusters'] | default([]) }}"
+  loop_control:
+    label: "{{ hostvars[item].ocp_cluster.name }}"
+  register: _quay_idms_manifestwork_applied
+  until: _quay_idms_manifestwork_applied.stdout == "True"
+  retries: 12
+  delay: 15
+  changed_when: false
+
+- name: Wait for Quay CatalogSource ManifestWork to apply successfully on each spoke
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get manifestwork {{ hostvars[item].ocp_cluster.name }}-quay-catalog
+    -n {{ hostvars[item].ocp_cluster.name }}
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.conditions[?(@.type=="Applied")].status}'
+  loop: "{{ groups['managed_clusters'] | default([]) }}"
+  loop_control:
+    label: "{{ hostvars[item].ocp_cluster.name }}"
+  register: _quay_catalog_manifestwork_applied
+  until: _quay_catalog_manifestwork_applied.stdout == "True"
+  retries: 12
+  delay: 15
+  changed_when: false
 
 # ------------------------------------------------------------------------------
 # Wait for hub MachineConfigPools to roll out the new IDMS config
