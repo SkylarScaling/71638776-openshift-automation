@@ -279,8 +279,8 @@
 - name: Retry failed images to Quay with skopeo (preserves manifest-list digest)
   ansible.builtin.command: >
     skopeo copy --all
-    --src-registry-config={{ quay_mirror_workspace }}/containers/auth.json
-    --dest-registry-config={{ quay_mirror_workspace }}/containers/auth.json
+    --src-authfile={{ quay_mirror_workspace }}/containers/auth.json
+    --dest-authfile={{ quay_mirror_workspace }}/containers/auth.json
     --dest-tls-verify=false
     docker://{{ item | regex_replace('^docker://', '') }}
     docker://{{ quay_registry_url }}/{{ quay_mirror_org }}/{{ item | regex_replace('^docker://[^/]+/', '') | regex_replace('@sha256:[a-f0-9]+$', '') }}:{{ item | regex_replace('^.*@sha256:', 'sha256-') }}
@@ -320,8 +320,8 @@
 - name: Retry failed bundle images to Quay with skopeo (preserves manifest-list digest)
   ansible.builtin.command: >
     skopeo copy --all
-    --src-registry-config={{ quay_mirror_workspace }}/containers/auth.json
-    --dest-registry-config={{ quay_mirror_workspace }}/containers/auth.json
+    --src-authfile={{ quay_mirror_workspace }}/containers/auth.json
+    --dest-authfile={{ quay_mirror_workspace }}/containers/auth.json
     --dest-tls-verify=false
     docker://{{ item | regex_replace('^docker://', '') }}
     docker://{{ quay_registry_url }}/{{ quay_mirror_org }}/{{ item | regex_replace('^docker://[^/]+/', '') | regex_replace('@sha256:[a-f0-9]+$', '') }}:{{ item | regex_replace('^.*@sha256:', 'sha256-') }}

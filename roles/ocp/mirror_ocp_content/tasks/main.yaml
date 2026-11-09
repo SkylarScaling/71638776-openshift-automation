@@ -254,8 +254,8 @@
 - name: Retry failed images with skopeo (preserves manifest-list digest)
   ansible.builtin.shell: >
     skopeo copy --all
-    --src-registry-config={{ oc_mirror_workspace }}/containers/auth.json
-    --dest-registry-config={{ oc_mirror_workspace }}/containers/auth.json
+    --src-authfile={{ oc_mirror_workspace }}/containers/auth.json
+    --dest-authfile={{ oc_mirror_workspace }}/containers/auth.json
     --dest-tls-verify=false
     docker://{{ item | regex_replace('^docker://', '') }}
     docker://{{ mirror_registry_url }}/{{ mirror_base_path }}/{{ item | regex_replace('^docker://[^/]+/', '') | regex_replace('@sha256:[a-f0-9]+$', '') }}:{{ item | regex_replace('^.*@sha256:', 'sha256-') }}
@@ -274,8 +274,8 @@
 - name: Retry failed operator bundle images with skopeo (preserves manifest-list digest)
   ansible.builtin.shell: >
     skopeo copy --all
-    --src-registry-config={{ oc_mirror_workspace }}/containers/auth.json
-    --dest-registry-config={{ oc_mirror_workspace }}/containers/auth.json
+    --src-authfile={{ oc_mirror_workspace }}/containers/auth.json
+    --dest-authfile={{ oc_mirror_workspace }}/containers/auth.json
     --dest-tls-verify=false
     docker://{{ item | regex_replace('^docker://', '') }}
     docker://{{ mirror_registry_url }}/{{ mirror_base_path }}/{{ item | regex_replace('^docker://[^/]+/', '') | regex_replace('@sha256:[a-f0-9]+$', '') }}:{{ item | regex_replace('^.*@sha256:', 'sha256-') }}
