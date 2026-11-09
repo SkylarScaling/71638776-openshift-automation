@@ -22,7 +22,7 @@ spec:
 {% endif %}
           containers:
             - name: ldap-group-sync
-              image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+              image: "{{ _groupsync_cli_image.stdout | trim }}"
               command:
                 - /bin/bash
                 - -c

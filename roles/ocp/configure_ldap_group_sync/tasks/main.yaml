@@ -106,6 +106,49 @@
           | default([], true))
          | join('.') }}
 
+# The CronJob previously hardcoded
+# image-registry.openshift-image-registry.svc:5000/openshift/cli:latest,
+# assuming an `openshift/cli` imagestream tag exists on every cluster. It
+# only ever worked on the hub "by luck" -- spokes have no such imagestream,
+# so the CronJob pod permanently sat ImagePullBackOff and every hourly sync
+# was skipped with JobAlreadyActive. Resolve the cli image directly from
+# each cluster's own release payload instead: `oc adm release info
+# --image-for=cli` returns the canonical quay.io/openshift-release-dev/...
+# digest reference (not a mirrored one) -- that's fine, since that source is
+# already covered by the same ImageDigestMirrorSet/ITMS objects this
+# playbook applies for every other release/operator image, so CRI-O on the
+# node transparently redirects the actual pull to the mirror. Query using
+# the target cluster's own merged pull-secret (not local/jumphost auth) so
+# this resolves identically on hub and spoke.
+- name: Get target cluster's pull-secret for release-info lookup
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get secret pull-secret -n openshift-config
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.data.\.dockerconfigjson}' | base64 -d
+  register: _groupsync_pull_secret
+  changed_when: false
+  no_log: true
+
+- name: Write target cluster's pull-secret to a temp file
+  ansible.builtin.copy:
+    content: "{{ _groupsync_pull_secret.stdout }}"
+    dest: "/tmp/groupsync-pull-secret-{{ inventory_hostname | regex_replace('[^a-z0-9]', '-') }}.json"
+    mode: '0600'
+  no_log: true
+
+- name: Resolve cli image from the cluster's own release payload
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc adm release info --image-for=cli
+    --kubeconfig {{ target_kubeconfig }}
+    --registry-config=/tmp/groupsync-pull-secret-{{ inventory_hostname | regex_replace('[^a-z0-9]', '-') }}.json
+  register: _groupsync_cli_image
+  changed_when: false
+
+- name: Clean up temp pull-secret file
+  ansible.builtin.file:
+    path: "/tmp/groupsync-pull-secret-{{ inventory_hostname | regex_replace('[^a-z0-9]', '-') }}.json"
+    state: absent
+
 - name: Create LDAPSyncConfig ConfigMap
   ansible.builtin.shell:
     cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
