@@ -562,13 +562,25 @@
   register: _ingress_lb_type
   changed_when: false
 
+#
+# JSON merge patch (--type=merge) only overwrites keys actually present in
+# the patch body and leaves sibling keys untouched -- there is no need to
+# (and this must NOT) restate `scope`/`dnsManagementPolicy` here. Confirmed
+# live: an earlier version of this patch hardcoded
+# "scope":"External","dnsManagementPolicy":"Managed", silently overwriting
+# this disconnected cluster's install-time Internal/Unmanaged settings (set
+# by aws_provision_disconnected_ocp_ipi for network-lockdown clusters). That
+# sent the ingress operator looking for a public Route53 zone it can never
+# reach post-lockdown, leaving co/ingress permanently Degraded/Available=False
+# and ClusterVersion Failing=True. Only patch the one field this task is
+# actually here for.
 - name: Raise Classic ELB idle timeout for large blob uploads
   ansible.builtin.shell: >
     {{ bin_dir }}/oc patch ingresscontroller/default
     -n openshift-ingress-operator
     --kubeconfig {{ target_kubeconfig }}
     --type=merge
-    --patch '{"spec":{"endpointPublishingStrategy":{"type":"LoadBalancerService","loadBalancer":{"scope":"External","dnsManagementPolicy":"Managed","providerParameters":{"type":"AWS","aws":{"type":"Classic","classicLoadBalancer":{"connectionIdleTimeout":"{{ quay_mirror_ingress_idle_timeout }}"}}}}}}}'
+    --patch '{"spec":{"endpointPublishingStrategy":{"type":"LoadBalancerService","loadBalancer":{"providerParameters":{"type":"AWS","aws":{"type":"Classic","classicLoadBalancer":{"connectionIdleTimeout":"{{ quay_mirror_ingress_idle_timeout }}"}}}}}}}'
   changed_when: true
   when: _ingress_lb_type.stdout == "Classic"
 
