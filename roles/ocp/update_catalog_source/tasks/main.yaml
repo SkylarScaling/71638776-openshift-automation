@@ -150,6 +150,17 @@
     label: "{{ hostvars[item].ocp_cluster.name }}"
   changed_when: true
 
+# Reuse the exact ManifestWork name ("-disconnected-config") that
+# aws_provision_disconnected_cluster_via_acm originally created for this
+# CatalogSource, instead of creating a second ManifestWork for the same
+# object under a different name. Confirmed live: a prior version of this
+# role (and patch_cluster_idms) pushed a differently-named ManifestWork
+# ("-quay-catalog") that fought with "-disconnected-config" over ownership
+# of CatalogSource/redhat-operators, with OCM flipping spec.image back and
+# forth between the jumphost and Quay roughly every 100s depending on which
+# ManifestWork's controller last reconciled. See patch_cluster_idms for the
+# full root cause. Applying under the same name makes OCM replace the
+# manifest in place -- a single owner, no flapping.
 - name: Push updated CatalogSource and OperatorHub config to spokes via ManifestWork
   ansible.builtin.shell:
     cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
@@ -157,7 +168,7 @@
       apiVersion: work.open-cluster-management.io/v1
       kind: ManifestWork
       metadata:
-        name: "{{ hostvars[item].ocp_cluster.name }}-quay-catalog"
+        name: "{{ hostvars[item].ocp_cluster.name }}-disconnected-config"
         namespace: "{{ hostvars[item].ocp_cluster.name }}"
       spec:
         workload:
@@ -206,7 +217,7 @@
 
 - name: Wait for CatalogSource ManifestWork to apply successfully on each spoke
   ansible.builtin.shell: >
-    {{ bin_dir }}/oc get manifestwork {{ hostvars[item].ocp_cluster.name }}-quay-catalog
+    {{ bin_dir }}/oc get manifestwork {{ hostvars[item].ocp_cluster.name }}-disconnected-config
     -n {{ hostvars[item].ocp_cluster.name }}
     --kubeconfig {{ target_kubeconfig }}
     -o jsonpath='{.status.conditions[?(@.type=="Applied")].status}'
@@ -215,6 +226,24 @@
     label: "{{ hostvars[item].ocp_cluster.name }}"
   register: _update_catalog_manifestwork_applied
   until: _update_catalog_manifestwork_applied.stdout == "True"
+  retries: 12
+  delay: 15
+  changed_when: false
+
+# Applied=True only means OCM successfully pushed the manifest -- it says
+# nothing about whether a LATER, competing write subsequently clobbered it.
+# Assert the live spoke CatalogSource actually holds the new image before
+# moving on, not just that some apply succeeded at some point.
+- name: Verify spoke CatalogSource image actually points at the updated catalog
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get catalogsource redhat-operators -n openshift-marketplace
+    --kubeconfig {{ install_dir }}/{{ hostvars[item].ocp_cluster.name }}/auth/kubeconfig
+    -o jsonpath='{.spec.image}'
+  loop: "{{ groups['managed_clusters'] | default([]) }}"
+  loop_control:
+    label: "{{ hostvars[item].ocp_cluster.name }}"
+  register: _update_catalog_live_image
+  until: _update_catalog_live_image.stdout == update_catalog_image
   retries: 12
   delay: 15
   changed_when: false

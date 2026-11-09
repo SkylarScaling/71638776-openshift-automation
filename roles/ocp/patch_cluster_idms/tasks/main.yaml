@@ -48,6 +48,87 @@
   changed_when: true
 
 # ------------------------------------------------------------------------------
+# SPOKE CLUSTERS: allow insecure pulls from the Quay route
+#
+# The hub-only patch above never reached spokes -- confirmed live: a spoke's
+# redhat-operators catalog pod sat ImagePullBackOff pulling the Quay-hosted
+# index image with "x509: certificate signed by unknown authority" even
+# after its CatalogSource correctly pointed at Quay, because the spoke's own
+# image.config.openshift.io/cluster never got the Quay hostname added to
+# insecureRegistries. Patch each spoke directly via its own kubeconfig
+# (already available under install_dir, same convention as the
+# klusterlet-work-sa RBAC grant below) rather than through a ManifestWork --
+# this is a cluster-scoped singleton object, so a plain oc apply here is
+# simpler than teaching klusterlet-work-sa to manage it.
+# ------------------------------------------------------------------------------
+- name: Get current insecureRegistries from each spoke's Image CR
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get image.config.openshift.io cluster
+    --kubeconfig {{ install_dir }}/{{ hostvars[item].ocp_cluster.name }}/auth/kubeconfig
+    -o jsonpath='{.spec.registrySources.insecureRegistries[*]}' 2>/dev/null || true
+  loop: "{{ groups['managed_clusters'] | default([]) }}"
+  loop_control:
+    label: "{{ hostvars[item].ocp_cluster.name }}"
+  register: _spoke_current_insecure
+  changed_when: false
+
+- name: Add Quay registry to insecureRegistries in each spoke's Image CR
+  ansible.builtin.shell: |
+    set -e
+    KCFG="{{ install_dir }}/{{ hostvars[item].ocp_cluster.name }}/auth/kubeconfig"
+    CURRENT=$({{ bin_dir }}/oc get image.config.openshift.io cluster --kubeconfig "$KCFG" -o json)
+    UPDATED=$(echo "$CURRENT" | jq -c \
+      --arg quay "{{ quay_registry_url }}" \
+      '.spec.registrySources.insecureRegistries = (
+        (.spec.registrySources.insecureRegistries // [])
+        + [$quay] | unique
+      )')
+    echo "$UPDATED" | {{ bin_dir }}/oc apply --kubeconfig "$KCFG" -f -
+  args:
+    executable: /bin/bash
+  loop: "{{ groups['managed_clusters'] | default([]) }}"
+  loop_control:
+    label: "{{ hostvars[item].ocp_cluster.name }}"
+  when: >-
+    quay_registry_url not in (
+      (_spoke_current_insecure.results | selectattr('item', 'equalto', item) | map(attribute='stdout') | first) | default('')
+    )
+  register: _spoke_image_cr_patch
+  changed_when: true
+
+- name: Wait for each spoke's master MachineConfigPool to finish updating (insecureRegistries roll)
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get mcp master
+    --kubeconfig {{ install_dir }}/{{ hostvars[item].ocp_cluster.name }}/auth/kubeconfig
+    -o jsonpath='{.status.conditions[?(@.type=="Updated")].status}'
+  loop: "{{ groups['managed_clusters'] | default([]) }}"
+  loop_control:
+    label: "{{ hostvars[item].ocp_cluster.name }}"
+  register: _spoke_master_mcp
+  until: _spoke_master_mcp.stdout == "True"
+  retries: 60
+  delay: 30
+  changed_when: false
+  when: >-
+    (_spoke_image_cr_patch.results | selectattr('item', 'equalto', item) | map(attribute='changed') | first) | default(false)
+
+- name: Wait for each spoke's worker MachineConfigPool to finish updating (insecureRegistries roll)
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get mcp worker
+    --kubeconfig {{ install_dir }}/{{ hostvars[item].ocp_cluster.name }}/auth/kubeconfig
+    -o jsonpath='{.status.conditions[?(@.type=="Updated")].status}'
+  loop: "{{ groups['managed_clusters'] | default([]) }}"
+  loop_control:
+    label: "{{ hostvars[item].ocp_cluster.name }}"
+  register: _spoke_worker_mcp
+  until: _spoke_worker_mcp.stdout == "True"
+  retries: 60
+  delay: 30
+  changed_when: false
+  when: >-
+    (_spoke_image_cr_patch.results | selectattr('item', 'equalto', item) | map(attribute='changed') | first) | default(false)
+
+# ------------------------------------------------------------------------------
 # HUB CLUSTER: apply new IDMS + CatalogSource
 #
 # oc-mirror v2 always names its generated IDMS/ITMS objects the same way
@@ -203,6 +284,20 @@
     label: "{{ hostvars[item].ocp_cluster.name }}"
   changed_when: true
 
+# Reuse the exact ManifestWork name
+# (aws_provision_disconnected_cluster_via_acm's "-disconnected-config")
+# that originally bootstrapped this CatalogSource on the spoke, instead of
+# creating a second ManifestWork for the same object under a different name.
+# Confirmed live: two ManifestWorks ("-disconnected-config" pointing at the
+# jumphost, this one previously named "-quay-catalog" pointing at Quay) both
+# owned CatalogSource/redhat-operators and fought over it -- OCM reconciled
+# whichever ManifestWork's controller last ran, flipping spec.image back and
+# forth roughly every 100s (observed via generation incrementing on live
+# polling). The jumphost image can never pull once network lockdown revokes
+# jumphost egress, so every flip to it broke the registry pod, which starved
+# every OLM install on the spoke (not just Quay migration) of a stable
+# catalog. Applying under the same name makes OCM replace the manifest in
+# place -- a single owner, no flapping.
 - name: Push updated CatalogSource and OperatorHub config to spokes via ManifestWork
   ansible.builtin.shell:
     cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
@@ -210,7 +305,7 @@
       apiVersion: work.open-cluster-management.io/v1
       kind: ManifestWork
       metadata:
-        name: "{{ hostvars[item].ocp_cluster.name }}-quay-catalog"
+        name: "{{ hostvars[item].ocp_cluster.name }}-disconnected-config"
         namespace: "{{ hostvars[item].ocp_cluster.name }}"
       spec:
         workload:
@@ -258,9 +353,9 @@
   delay: 15
   changed_when: false
 
-- name: Wait for Quay CatalogSource ManifestWork to apply successfully on each spoke
+- name: Wait for CatalogSource ManifestWork to apply successfully on each spoke
   ansible.builtin.shell: >
-    {{ bin_dir }}/oc get manifestwork {{ hostvars[item].ocp_cluster.name }}-quay-catalog
+    {{ bin_dir }}/oc get manifestwork {{ hostvars[item].ocp_cluster.name }}-disconnected-config
     -n {{ hostvars[item].ocp_cluster.name }}
     --kubeconfig {{ target_kubeconfig }}
     -o jsonpath='{.status.conditions[?(@.type=="Applied")].status}'
@@ -269,6 +364,26 @@
     label: "{{ hostvars[item].ocp_cluster.name }}"
   register: _quay_catalog_manifestwork_applied
   until: _quay_catalog_manifestwork_applied.stdout == "True"
+  retries: 12
+  delay: 15
+  changed_when: false
+
+# Applied=True only means OCM successfully pushed the manifest -- it says
+# nothing about whether a LATER, competing write subsequently clobbered it.
+# Confirmed live this was exactly how the flapping bug above went undetected:
+# this wait passed every time, on both ManifestWorks, while the live object
+# kept flipping. Assert the live spoke CatalogSource actually holds the Quay
+# image before moving on, not just that some apply succeeded at some point.
+- name: Verify spoke CatalogSource image actually points at Quay
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get catalogsource redhat-operators -n openshift-marketplace
+    --kubeconfig {{ install_dir }}/{{ hostvars[item].ocp_cluster.name }}/auth/kubeconfig
+    -o jsonpath='{.spec.image}'
+  loop: "{{ groups['managed_clusters'] | default([]) }}"
+  loop_control:
+    label: "{{ hostvars[item].ocp_cluster.name }}"
+  register: _quay_catalog_live_image
+  until: _quay_catalog_live_image.stdout == quay_catalog_image
   retries: 12
   delay: 15
   changed_when: false
