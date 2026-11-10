@@ -127,6 +127,45 @@
     - "'InvalidPermission.Duplicate' not in _nl_allow_cluster_cidr.stderr"
   changed_when: _nl_allow_cluster_cidr.rc == 0
 
+# The Cluster VPC CIDR allow-rule above covers east-west traffic and
+# INTERFACE-type VPC endpoints (their ENIs sit inside that CIDR), but not
+# GATEWAY-type endpoints like S3's: traffic to an S3 gateway endpoint still
+# leaves the node addressed to S3's public IPv4 ranges (the route table
+# just redirects it off-box to the endpoint instead of to an Internet
+# Gateway) -- so a security group scoped only to the VPC CIDR silently drops
+# it. Confirmed live: Quay's quay-app/quay-mirror pods and the OpenShift
+# internal image registry (both S3-backed) crashlooped identically with
+# "context deadline exceeded" HEAD-ing their bucket the moment this lockdown
+# ran, even though create_vpc_endpoints' S3 gateway endpoint and its route
+# table association were both healthy -- it's an SG problem, not a routing
+# problem. Must be unconditional (not gated on network_lockdown_allow_jumphost_egress):
+# Quay is the PERMANENT mirror registry and the image registry needs S3
+# forever, not just during install.
+- name: Resolve the regional S3 managed prefix list (never hardcode -- it's region-specific)
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-prefix-lists
+    --filters Name=prefix-list-name,Values=com.amazonaws.{{ network_lockdown_region }}.s3
+    --query 'PrefixLists[0].PrefixListId'
+    --output text
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  register: _nl_s3_prefix_list
+  changed_when: false
+
+- name: Allow HTTPS egress to the S3 managed prefix list (gateway endpoint traffic)
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 authorize-security-group-egress
+    --group-id {{ item }}
+    --ip-permissions '[{"IpProtocol":"tcp","FromPort":443,"ToPort":443,"PrefixListIds":[{"PrefixListId":"{{ _nl_s3_prefix_list.stdout | trim }}"}]}]'
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  loop: "{{ _nl_cluster_sgs_list }}"
+  register: _nl_allow_s3_prefix_list
+  failed_when:
+    - _nl_allow_s3_prefix_list.rc != 0
+    - "'InvalidPermission.Duplicate' not in _nl_allow_s3_prefix_list.stderr"
+  changed_when: _nl_allow_s3_prefix_list.rc == 0
+
 - name: Allow egress to the jumphost VPC (mirror/LDAP, pre-migration only)
   ansible.builtin.command: >
     {{ bin_dir }}/aws ec2 authorize-security-group-egress
@@ -181,4 +220,4 @@
   ansible.builtin.debug:
     msg:
       - "Security groups locked down for {{ _nl_infra_name.stdout | trim }}: {{ _nl_cluster_sgs_list }}"
-      - "Egress allowed: {{ _nl_cluster_vpc_cidr.stdout | trim }}{{ (' and ' ~ _nl_jumphost_vpc_cidr.stdout | trim) if network_lockdown_allow_jumphost_egress | bool else '' }}"
+      - "Egress allowed: {{ _nl_cluster_vpc_cidr.stdout | trim }}, S3 prefix list {{ _nl_s3_prefix_list.stdout | trim }}{{ (' and ' ~ _nl_jumphost_vpc_cidr.stdout | trim) if network_lockdown_allow_jumphost_egress | bool else '' }}"

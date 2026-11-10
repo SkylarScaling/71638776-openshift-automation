@@ -128,6 +128,37 @@
     success_msg: "Cluster node could not reach the public internet, as expected"
   when: _niv_master_node.stdout | default('') != ''
 
+# Absence of a 0.0.0.0/0 route/SG rule only proves nothing can reach the
+# OPEN internet -- it says nothing about whether traffic to a GATEWAY-type
+# VPC endpoint (S3) still works. Confirmed live this exact gap let a lockdown
+# "pass" while S3 traffic was silently dropped at the security group (S3
+# gateway-endpoint traffic is still addressed to S3's public IPv4 ranges on
+# the wire, which a VPC-CIDR-only egress rule doesn't cover) -- Quay and the
+# OpenShift image registry (both S3-backed) crashlooped for over an hour
+# before anyone noticed, because nothing asserted S3 reachability positively.
+- name: "[NetIso] Positively verify a node CAN reach S3 (gateway endpoint traffic)"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc debug node/{{ _niv_master_node.stdout | trim }}
+    --kubeconfig {{ target_kubeconfig }}
+    -- chroot /host curl -m 5 -s -o /dev/null -w '%{http_code}'
+    https://s3.{{ network_lockdown_region }}.amazonaws.com/
+  register: _niv_s3_curl
+  changed_when: false
+  failed_when: false
+  when: _niv_master_node.stdout | default('') != ''
+
+- name: "[NetIso] Assert a node can reach S3"
+  ansible.builtin.assert:
+    that: _niv_s3_curl.rc == 0
+    fail_msg: >-
+      A cluster node could not reach S3 (curl rc={{ _niv_s3_curl.rc }},
+      http={{ _niv_s3_curl.stdout | trim }}) — this breaks Quay and the
+      OpenShift image registry, both S3-backed. Check that
+      aws/lockdown_cluster_security_groups' S3 prefix-list egress rule was
+      applied.
+    success_msg: "Cluster node can reach S3 (gateway endpoint egress is correctly allowed)"
+  when: _niv_master_node.stdout | default('') != ''
+
 - name: "[NetIso] Display verification summary"
   ansible.builtin.debug:
     msg: "Network isolation verified for {{ ocp_cluster.name }} ({{ _niv_infra_name.stdout | trim }})"
