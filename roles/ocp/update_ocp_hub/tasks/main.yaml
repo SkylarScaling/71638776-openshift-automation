@@ -25,6 +25,47 @@
   register: _hub_cv_current
   changed_when: false
 
+# ocp/disable_telemetry marks insights-operator unmanaged via a ClusterVersion
+# override -- the CVO refuses minor-version upgrades on any cluster with
+# overrides set ("Disabling ownership via cluster version overrides prevents
+# upgrades"), confirmed live via the Upgradeable condition's own message.
+# This is the one Upgradeable-blocking cause this repo's own code
+# introduces (the other two -- the 4.21 Sigstore admin-ack and the
+# cloud-credential upgradeable-to annotation -- are left as manual
+# preflight-surfaced steps deliberately, see ocp/verify_cluster_update).
+# Temporarily remove it for the duration of a minor-version upgrade and
+# restore it once the update completes, rather than relying on --force to
+# paper over it as an accidental side effect.
+- name: Determine if this run is a minor version bump
+  ansible.builtin.set_fact:
+    _hub_is_minor_bump: >-
+      {{ (_hub_cv_current.stdout | regex_replace('^(\d+\.\d+)\..*$', '\1')) != (openshift_version | string) }}
+
+- name: Check if the insights-operator ClusterVersion override is currently set
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get clusterversion version
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.spec.overrides[?(@.name=="insights-operator")].unmanaged}'
+  register: _hub_insights_override_check
+  changed_when: false
+  when: _hub_is_minor_bump | bool
+
+- name: Temporarily remove the insights-operator override for the minor version upgrade
+  ansible.builtin.shell: |
+    set -e
+    CURRENT=$({{ bin_dir }}/oc get clusterversion version \
+      --kubeconfig {{ target_kubeconfig }} -o json)
+    UPDATED=$(echo "$CURRENT" | jq -c \
+      '.spec.overrides = ((.spec.overrides // []) | map(select(.name != "insights-operator")))')
+    echo "$UPDATED" | {{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -
+  args:
+    executable: /bin/bash
+  register: _hub_insights_override_removed
+  changed_when: true
+  when:
+    - _hub_is_minor_bump | bool
+    - _hub_insights_override_check.stdout | default('') | trim == "true"
+
 - name: Look for an oc-mirror release signature ConfigMap for this version
   ansible.builtin.find:
     paths: "{{ update_mirror_workspace }}/working-dir/cluster-resources"
@@ -107,6 +148,46 @@
   retries: "{{ update_ocp_hub_mcp_settle_retries }}"
   delay: "{{ update_ocp_hub_mcp_settle_delay }}"
   changed_when: false
+
+# Restore the insights-operator override that was temporarily removed above
+# so the cluster goes back to its steady-state telemetry-disabled posture
+# (the Deployment itself is still scaled to 0 by ocp/disable_telemetry;
+# re-marking it unmanaged just stops the CVO from fighting that scale-down
+# again).
+- name: Restore the insights-operator override after the minor version upgrade
+  ansible.builtin.shell: |
+    set -e
+    CURRENT=$({{ bin_dir }}/oc get clusterversion version \
+      --kubeconfig {{ target_kubeconfig }} -o json)
+    UPDATED=$(echo "$CURRENT" | jq -c \
+      '.spec.overrides = ((.spec.overrides // []) + [{
+        "kind": "Deployment",
+        "group": "apps",
+        "name": "insights-operator",
+        "namespace": "openshift-insights",
+        "unmanaged": true
+      }])')
+    echo "$UPDATED" | {{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -
+  args:
+    executable: /bin/bash
+  changed_when: true
+  when: _hub_insights_override_removed is changed
+
+# Removing the override during the upgrade handed the Deployment back to
+# CVO management, which will have reconciled it back to its normal replica
+# count as part of the upgrade -- re-marking it unmanaged above does not
+# retroactively re-scale it, so do that explicitly, same as
+# ocp/disable_telemetry's own steady-state action.
+- name: Re-scale the Insights Operator Deployment to zero after the upgrade
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc scale deployment insights-operator
+    -n openshift-insights
+    --kubeconfig {{ target_kubeconfig }}
+    --replicas=0
+  register: _hub_insights_rescale
+  changed_when: "'scaled' in _hub_insights_rescale.stdout"
+  failed_when: false
+  when: _hub_insights_override_removed is changed
 
 - name: Display hub update summary
   ansible.builtin.debug:

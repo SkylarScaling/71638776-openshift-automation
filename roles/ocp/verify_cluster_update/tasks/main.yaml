@@ -47,6 +47,55 @@
     success_msg: "MachineConfigPool '{{ item.item }}' is settled"
   loop: "{{ _mcp_settled.results }}"
 
+# OCP only gates the Upgradeable precondition on MINOR version bumps, not
+# patch bumps within the same minor -- confirmed via the CVO's own condition
+# message ("should not be upgraded between minor versions"). Only check this
+# when the target is actually a different minor than what's currently
+# installed, so routine patch-level runs of this playbook aren't blocked by
+# it. Confirmed live this condition is routinely False on these clusters
+# (ClusterVersionOverridesSet from ocp/disable_telemetry, AdminAckRequired
+# for 4.21 Sigstore signatures on mirrored clusters, and
+# MissingUpgradeableAnnotation on cloud-credential for manual-mode/STS
+# clusters) and that nothing in this update path previously checked it --
+# a minor-version run would sail through preflight and fail later, mid-mirror
+# or mid-upgrade, with update_ocp_hub only avoiding it as an accidental side
+# effect of a --force flag added for an unrelated signature-verification
+# reason, and update_ocp_spoke's ClusterCurator having no force option at
+# all. Surfacing the CVO's own condition message here (rather than silently
+# working around each cause) is deliberate: AdminAckRequired and the
+# cloud-credential annotation exist specifically to require a human to read
+# release notes and act before a minor bump, and auto-acknowledging them
+# would defeat that.
+- name: "[Update] Get current and desired ClusterVersion for minor-bump detection"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get clusterversion version
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.desired.version}'
+  register: _cv_current_for_minor_check
+  changed_when: false
+  when: verify_cluster_update_mode | default('preflight') == 'preflight'
+
+- name: "[Update] Check ClusterVersion Upgradeable condition if this run is a minor version bump"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get clusterversion version
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.conditions[?(@.type=="Upgradeable")]}'
+  register: _cv_upgradeable
+  changed_when: false
+  when:
+    - verify_cluster_update_mode | default('preflight') == 'preflight'
+    - (_cv_current_for_minor_check.stdout | default('') | regex_replace('^(\d+\.\d+)\..*$', '\1')) != (openshift_version | string)
+
+- name: "[Update] Assert cluster is Upgradeable before a minor version bump"
+  ansible.builtin.assert:
+    that: (_cv_upgradeable.stdout | default('{}') | from_json).status | default('True') != "False"
+    fail_msg: >-
+      This is a minor version bump ({{ _cv_current_for_minor_check.stdout }} ->
+      {{ openshift_version }}.{{ ocp_patch_version }}) but the cluster is not
+      Upgradeable: {{ (_cv_upgradeable.stdout | from_json).message }}
+    success_msg: "Cluster is Upgradeable for this minor version bump"
+  when: _cv_upgradeable is not skipped
+
 - name: "[Update] Postflight — check ClusterVersion reports the target version"
   ansible.builtin.shell: >
     {{ bin_dir }}/oc get clusterversion version

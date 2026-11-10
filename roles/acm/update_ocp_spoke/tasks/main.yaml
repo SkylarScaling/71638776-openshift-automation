@@ -24,6 +24,45 @@
   register: _spoke_current_version
   changed_when: false
 
+# Same insights-operator ClusterVersion-override gap as update_ocp_hub, but
+# unlike the hub, ClusterCurator has no --force equivalent at all (confirmed
+# via `oc explain clustercurator.spec.upgrade --recursive`: channel,
+# desiredUpdate, intermediateUpdate, monitorTimeout, nodePoolNames,
+# overrideJob, posthook, prehook -- no force field) -- a spoke minor upgrade
+# would have no way around "Disabling ownership via cluster version
+# overrides prevents upgrades" otherwise. Operate on the spoke's own
+# kubeconfig directly (same convention as ocp/patch_cluster_idms's per-spoke
+# tasks), not target_kubeconfig (the hub).
+- name: Determine if this run is a minor version bump for this spoke
+  ansible.builtin.set_fact:
+    _spoke_is_minor_bump: >-
+      {{ (_spoke_current_version.stdout | trim | regex_replace('^(\d+\.\d+)\..*$', '\1')) != (openshift_version | string) }}
+
+- name: Check if the insights-operator ClusterVersion override is currently set on the spoke
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get clusterversion version
+    --kubeconfig {{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig
+    -o jsonpath='{.spec.overrides[?(@.name=="insights-operator")].unmanaged}'
+  register: _spoke_insights_override_check
+  changed_when: false
+  when: _spoke_is_minor_bump | bool
+
+- name: Temporarily remove the insights-operator override on the spoke for the minor version upgrade
+  ansible.builtin.shell: |
+    set -e
+    KCFG="{{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig"
+    CURRENT=$({{ bin_dir }}/oc get clusterversion version --kubeconfig "$KCFG" -o json)
+    UPDATED=$(echo "$CURRENT" | jq -c \
+      '.spec.overrides = ((.spec.overrides // []) | map(select(.name != "insights-operator")))')
+    echo "$UPDATED" | {{ bin_dir }}/oc apply --kubeconfig "$KCFG" -f -
+  args:
+    executable: /bin/bash
+  register: _spoke_insights_override_removed
+  changed_when: true
+  when:
+    - _spoke_is_minor_bump | bool
+    - _spoke_insights_override_check.stdout | default('') | trim == "true"
+
 - name: Create ClusterImageSet pointing at the mirrored release in Quay
   ansible.builtin.shell:
     cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
@@ -73,6 +112,38 @@
   retries: "{{ update_ocp_spoke_poll_retries }}"
   delay: "{{ update_ocp_spoke_poll_delay }}"
   changed_when: false
+
+# Restore the override and re-scale insights-operator back to 0, same
+# reasoning as update_ocp_hub's equivalent steps.
+- name: Restore the insights-operator override on the spoke after the minor version upgrade
+  ansible.builtin.shell: |
+    set -e
+    KCFG="{{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig"
+    CURRENT=$({{ bin_dir }}/oc get clusterversion version --kubeconfig "$KCFG" -o json)
+    UPDATED=$(echo "$CURRENT" | jq -c \
+      '.spec.overrides = ((.spec.overrides // []) + [{
+        "kind": "Deployment",
+        "group": "apps",
+        "name": "insights-operator",
+        "namespace": "openshift-insights",
+        "unmanaged": true
+      }])')
+    echo "$UPDATED" | {{ bin_dir }}/oc apply --kubeconfig "$KCFG" -f -
+  args:
+    executable: /bin/bash
+  changed_when: true
+  when: _spoke_insights_override_removed is changed
+
+- name: Re-scale the Insights Operator Deployment to zero on the spoke after the upgrade
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc scale deployment insights-operator
+    -n openshift-insights
+    --kubeconfig {{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig
+    --replicas=0
+  register: _spoke_insights_rescale
+  changed_when: "'scaled' in _spoke_insights_rescale.stdout"
+  failed_when: false
+  when: _spoke_insights_override_removed is changed
 
 - name: Display spoke update summary
   ansible.builtin.debug:
