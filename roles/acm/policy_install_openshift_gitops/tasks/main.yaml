@@ -1,4 +1,11 @@
 ---
+- name: Assert gitops_version was passed to this role
+  ansible.builtin.assert:
+    that: gitops_version is defined and gitops_version | string | length > 0
+    fail_msg: >-
+      policy_install_openshift_gitops requires gitops_version to be passed by
+      the caller (one invocation per distinct version found in inventory).
+
 - name: Wait for ACM CRDs to be fully registered by the Operator
   ansible.builtin.shell: >
     {{ bin_dir }}/oc get crd managedclustersetbindings.cluster.open-cluster-management.io
@@ -15,3 +22,9 @@
     cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
     stdin: "{{ lookup('template', 'argocd-policy.yaml.j2') }}"
   changed_when: true
+
+# No placement-selection check here: this role runs on the hub before
+# spokes exist (they're provisioned and imported in a later play), so a
+# Placement genuinely has nothing to select yet at this point in a fresh
+# build. See acm/verify_gitops_policies for the post-spoke-provisioning
+# check that this gap actually needs.

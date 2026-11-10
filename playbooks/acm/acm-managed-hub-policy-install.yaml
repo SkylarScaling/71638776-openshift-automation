@@ -7,16 +7,23 @@
   gather_facts: false
 
   tasks:
-    - name: Deploy ACM Policy - OpenShift GitOps 1.18
-      ansible.builtin.include_role:
-        name: acm/policy_install_openshift_gitops_1.18
-      vars:
-        target_kubeconfig: "{{ install_dir }}/{{ cluster_name }}/auth/kubeconfig"
-        spokes_clusterset: "{{ spokes_clusterset | default('default') }}"
+    - name: Determine distinct gitops_version values across all managed clusters
+      ansible.builtin.set_fact:
+        _gitops_versions: >-
+          {{
+            groups['managed_clusters'] | default([])
+            | map('extract', hostvars, 'gitops_version')
+            | select('defined')
+            | unique
+            | list
+          }}
 
-    - name: Deploy ACM Policy - OpenShift GitOps 1.19
+    - name: Deploy ACM Policy - OpenShift GitOps
       ansible.builtin.include_role:
-        name: acm/policy_install_openshift_gitops_1.19
+        name: acm/policy_install_openshift_gitops
+      loop: "{{ _gitops_versions }}"
+      loop_control:
+        loop_var: gitops_version
       vars:
         target_kubeconfig: "{{ install_dir }}/{{ cluster_name }}/auth/kubeconfig"
         spokes_clusterset: "{{ spokes_clusterset | default('default') }}"

@@ -354,13 +354,29 @@
 
     # ------------------------------------------------------------------
     # ACM Policies for Spoke Configuration
+    #
+    # One invocation per distinct gitops_version actually present across
+    # managed_clusters in inventory, rather than a hardcoded version list --
+    # see acm/policy_install_openshift_gitops for why that hardcoding went
+    # stale in the past.
     # ------------------------------------------------------------------
+    - name: Determine distinct gitops_version values across all managed clusters
+      ansible.builtin.set_fact:
+        _gitops_versions: >-
+          {{
+            groups['managed_clusters'] | default([])
+            | map('extract', hostvars, 'gitops_version')
+            | select('defined')
+            | unique
+            | list
+          }}
+
     - name: Install ACM Policies
       ansible.builtin.include_role:
-        name: "{{ item }}"
-      loop:
-        - acm/policy_install_openshift_gitops_1.18
-        - acm/policy_install_openshift_gitops_1.19
+        name: acm/policy_install_openshift_gitops
+      loop: "{{ _gitops_versions }}"
+      loop_control:
+        loop_var: gitops_version
       vars:
         spokes_clusterset: "{{ ocp_cluster.spokes_clusterset }}"
         target_kubeconfig: "{{ hub_kubeconfig }}"
@@ -871,6 +887,22 @@
       vars:
         target_kubeconfig: "{{ spoke_kubeconfig }}"
       when: disconnected.network_lockdown.enabled | default(true)
+
+- name: Verify GitOps Policies
+  hosts: hub_cluster
+  connection: local
+  gather_facts: false
+  tags: ['verify']
+  tasks:
+    - name: Set Hub Kubeconfig
+      ansible.builtin.set_fact:
+        hub_kubeconfig: "{{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig"
+
+    - name: Verify each gitops_version's Placement selected at least one cluster
+      ansible.builtin.include_role:
+        name: acm/verify_gitops_policies
+      vars:
+        target_kubeconfig: "{{ hub_kubeconfig }}"
 
 - name: Verification Summary
   hosts: hub_cluster

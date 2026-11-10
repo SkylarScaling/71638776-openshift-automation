@@ -1,0 +1,45 @@
+---
+# ==============================================================================
+# VERIFY GITOPS POLICIES
+#
+# acm/policy_install_openshift_gitops's Policy/PolicySet/PlacementBinding
+# applying cleanly says nothing about whether the Placement it's bound to
+# actually selected any cluster. Confirmed live this is exactly how a
+# version mismatch went undetected for a long time: the old per-version
+# roles (policy_install_openshift_gitops_1.18/1.19) applied "successfully"
+# on every run while their Placement sat at NoManagedClusterMatched because
+# inventory had already moved every spoke's gitops_version to 1.21 -- no
+# _1.21 role existed, so every spoke silently ended up with no GitOps
+# installed at all. Run this after spokes are provisioned and imported
+# (their argocd.version label exists by then), once per distinct
+# gitops_version actually present in inventory.
+# ==============================================================================
+- name: Determine distinct gitops_version values across all managed clusters
+  ansible.builtin.set_fact:
+    _verify_gitops_versions: >-
+      {{
+        groups['managed_clusters'] | default([])
+        | map('extract', hostvars, 'gitops_version')
+        | select('defined')
+        | unique
+        | list
+      }}
+
+- name: Verify each gitops_version's Placement selected at least one cluster
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get placement openshift-gitops-placement-{{ item }}
+    -n default
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.status.numberOfSelectedClusters}'
+  loop: "{{ _verify_gitops_versions }}"
+  register: _gitops_placement_selected
+  until: (_gitops_placement_selected.stdout | default('0') | int) > 0
+  retries: 12
+  delay: 10
+  changed_when: false
+
+- name: Display GitOps policy verification summary
+  ansible.builtin.debug:
+    msg: >-
+      All gitops_version Placements ({{ _verify_gitops_versions | join(', ') }})
+      selected at least one cluster.

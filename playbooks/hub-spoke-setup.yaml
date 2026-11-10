@@ -138,12 +138,23 @@
         target_kubeconfig: "{{ hub_kubeconfig }}"
       when: ssl is defined
 
+    - name: Determine distinct gitops_version values across all managed clusters
+      ansible.builtin.set_fact:
+        _gitops_versions: >-
+          {{
+            groups['managed_clusters'] | default([])
+            | map('extract', hostvars, 'gitops_version')
+            | select('defined')
+            | unique
+            | list
+          }}
+
     - name: Install ACM Policies
       ansible.builtin.include_role:
-        name: "{{ item }}"
-      loop:
-        - acm/policy_install_openshift_gitops_1.18
-        - acm/policy_install_openshift_gitops_1.19
+        name: acm/policy_install_openshift_gitops
+      loop: "{{ _gitops_versions }}"
+      loop_control:
+        loop_var: gitops_version
       vars:
         spokes_clusterset: "{{ ocp_cluster.spokes_clusterset }}"
         target_kubeconfig: "{{ hub_kubeconfig }}"

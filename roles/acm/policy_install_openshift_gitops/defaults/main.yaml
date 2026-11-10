@@ -1,0 +1,30 @@
+---
+# gitops_version has no default -- the caller must pass it explicitly (one
+# invocation per distinct version found in inventory). This role used to be
+# duplicated per-version (policy_install_openshift_gitops_1.18, _1.19,
+# byte-identical apart from this default) -- confirmed live that approach
+# silently went stale the moment a spoke's gitops_version moved past the
+# hardcoded set (inventory moved to 1.21, no _1.21 role was ever added), so
+# the Placement for that spoke matched zero clusters and it got no GitOps at
+# all. A single parameterized role invoked once per version actually present
+# in inventory can't go stale the same way.
+gitops_operator_channel: >-
+  {{
+    ((disconnected | default({})).operators | default([])
+     | selectattr('name', 'equalto', 'openshift-gitops-operator')
+     | first
+     | default({'channels': [{'name': 'gitops-' ~ gitops_version}]})
+    ).channels[0].name
+  }}
+
+# The name of the CatalogSource
+gitops_operator_source: "redhat-operators"
+
+# The namespace of the CatalogSource
+gitops_operator_source_namespace: "openshift-marketplace"
+
+# The namespace to install the operator into
+gitops_operator_namespace: "openshift-gitops-operator"
+
+# Target Cluster Set for Policies
+spokes_clusterset: default

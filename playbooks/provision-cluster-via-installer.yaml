@@ -60,10 +60,10 @@
 
 #    - name: Install ACM Policies
 #      include_role:
-#        name: "{{ item }}"
-#      loop:
-#        - acm/policy_install_openshift_gitops_1.18
-#        - acm/policy_install_openshift_gitops_1.19
+#        name: acm/policy_install_openshift_gitops
+#      loop: "{{ <distinct gitops_version list from inventory> }}"
+#      loop_control:
+#        loop_var: gitops_version
 
     - name: Fetch kubeadmin password from install directory
       ansible.builtin.slurp:
