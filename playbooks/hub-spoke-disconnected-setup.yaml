@@ -937,6 +937,27 @@
   gather_facts: false
   tags: ['verify']
   tasks:
+    # jumphost_public_ip is only ever set as a fact by provision-jumphost.yaml --
+    # a separate, earlier ansible-playbook invocation (often run from a laptop,
+    # before this playbook or even the jumphost's SSH access exists), not
+    # something this playbook's own process ever inherits. It is never set in
+    # inventory either (only jumphost_private_ip is required there, for the
+    # cluster-facing side). Confirmed: the summary below printed the "not
+    # known" placeholder on every single run, unconditionally, not just
+    # sometimes -- this playbook genuinely has no other source for it. Since
+    # this playbook runs with connection: local, and per the documented
+    # workflow that's on the jumphost itself, ask the jumphost's own EC2
+    # instance metadata for it (IMDSv2) rather than relying on a fact that can
+    # never be populated here.
+    - name: Discover this jumphost's own public IP via EC2 instance metadata (best-effort)
+      ansible.builtin.shell: |
+        TOKEN=$(curl -s -m 2 -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+        curl -s -m 2 -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4
+      register: _jumphost_public_ip_discovered
+      changed_when: false
+      failed_when: false
+      when: jumphost_public_ip is not defined
+
     - name: Build per-cluster connection info
       ansible.builtin.set_fact:
         _summary_lines: "{{ _summary_lines | default([]) + _entry }}"
@@ -988,7 +1009,11 @@
              'Browser console access (from your own machine):',
              '  1. Open a SOCKS proxy to this jumphost over the same SSH',
              '     connection you used to reach it:',
-             '       ssh -D 8080 -N ' ~ (jumphost_ssh_user | default('ec2-user')) ~ '@' ~ (jumphost_public_ip | default('<this jumphost public IP -- not known this run, check your AWS console or how you originally reached it>')),
+             '       ssh -D 8080 -N ' ~ (jumphost_ssh_user | default('ec2-user')) ~ '@' ~ (
+               jumphost_public_ip
+               | default(_jumphost_public_ip_discovered.stdout | default('') | trim, true)
+               | default('<this jumphost public IP -- not known this run, check your AWS console or how you originally reached it>', true)
+             ),
              '  2. Point your browser at localhost:8080 as a SOCKS5 proxy with',
              '     remote/proxy DNS resolution enabled (required -- the console',
              '     hostnames only resolve inside this VPC). In Firefox:',
