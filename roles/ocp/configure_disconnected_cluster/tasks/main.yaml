@@ -42,12 +42,39 @@
   register: _existing_itms
   changed_when: false
 
+# ocp/patch_cluster_idms (run by the separate migrate_mirror phase) renames
+# every IDMS/ITMS object it creates with a "-quay" suffix so they coexist
+# with this role's jumphost-pointed originals (see that role for why) --
+# their presence is unambiguous, independent evidence that migrate_mirror
+# has already run on this cluster, regardless of whether mirror_registry_url
+# facts from that phase are even in memory for THIS invocation (they won't
+# be on a `--tags hub`-only re-run, since migrate_mirror is a separate play
+# that wasn't selected).
+#
+# Confirmed live this gap caused a real regression: a `--tags hub` re-run
+# against an already-migrated cluster saw mirror_registry_url (the jumphost)
+# missing from the CatalogSource's spec.image -- because patch_cluster_idms
+# had long since repointed it at Quay -- concluded "not configured yet", and
+# proceeded to overwrite the healthy Quay-backed redhat-operators
+# CatalogSource with the jumphost's URL. The cluster's network lockdown had
+# already permanently revoked egress to the jumphost VPC by then, so the
+# catalog pod went into a pull timeout it could never recover from on its
+# own. Two roles, same object name, opposite values, no arbitration --
+# whichever phase ran last won.
+- name: Check if the cluster has already migrated to Quay (migrate_mirror marker)
+  ansible.builtin.set_fact:
+    _disconnected_cluster_migrated_to_quay: >-
+      {{ _existing_idms.stdout.split() | select('match', '.*-quay$') | list | length > 0 }}
+
 - name: Set cluster already configured flag
   ansible.builtin.set_fact:
     _disconnected_cluster_already_configured: >-
-      {{ (mirror_registry_url in _existing_catalogsources.stdout)
-         and (_existing_idms.stdout | trim != '')
-         and (_existing_itms.stdout | trim != '') }}
+      {{
+        ((mirror_registry_url in _existing_catalogsources.stdout)
+           and (_existing_idms.stdout | trim != '')
+           and (_existing_itms.stdout | trim != ''))
+        or _disconnected_cluster_migrated_to_quay
+      }}
 
 - name: Apply ImageDigestMirrorSet / ImageTagMirrorSet / ImageContentSourcePolicy manifests
   ansible.builtin.shell:
