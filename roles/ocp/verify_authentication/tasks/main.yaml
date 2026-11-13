@@ -34,6 +34,88 @@
   when: ldap is defined
 
 # --------------------------------------------------------------------------
+# Live LDAP reachability (TCP connect from an actual cluster node).
+#
+# Everything above only checks that the IdP/secret OBJECTS exist on the
+# OAuth CR -- it says nothing about whether the cluster can actually reach
+# the LDAP server right now. That gap let a real incident pass silently:
+# the post-migrate_mirror network lockdown revoked ALL cluster egress to the
+# jumphost VPC, including LDAP's tcp/389, and this role still reported
+# failed=0 while every login was failing. See the permanent /32 exception in
+# roles/aws/lockdown_cluster_security_groups and
+# playbooks/DISCONNECTED-NETWORK-LOCKDOWN.md for the fix; this check exists
+# so a regression of that fix (or any other SG/routing change that blocks
+# LDAP) fails loudly here instead of being discovered via broken user logins.
+#
+# This only proves network reachability (TCP connect), not a successful
+# bind/auth -- RHCOS nodes have no LDAP client tooling to shell out to for a
+# real bind, but reachability is exactly what broke in the incident above,
+# and bind_dn/bind_password correctness is already exercised by every actual
+# login attempt against this IdP.
+- name: "[Auth] Parse ldap.url into scheme, host, and port"
+  ansible.builtin.set_fact:
+    _ldap_url_parts: >-
+      {{ ldap.url | regex_search('^(ldaps?)://([^:/?]+)(?::(\d+))?', '\1', '\2', '\3')
+         | default([], true) }}
+  when: ldap is defined
+
+- name: "[Auth] Assert ldap.url could be parsed"
+  ansible.builtin.assert:
+    that: _ldap_url_parts | length == 3
+    fail_msg: "Could not parse scheme/host out of ldap.url: '{{ ldap.url }}' — expected ldap(s)://host[:port]/..."
+  when: ldap is defined
+
+# regex_search returns None (not '') for a non-participating optional group
+# (no :port in the URL) -- default('', true) is required, plain default('')
+# only catches undefined, not None. Port falls back by scheme (ldaps -> 636)
+# since ldap.url commonly omits it when non-standard.
+- name: "[Auth] Set LDAP host and port from parsed URL"
+  ansible.builtin.set_fact:
+    _ldap_host: "{{ _ldap_url_parts[1] | default('', true) }}"
+    _ldap_port: >-
+      {{ _ldap_url_parts[2] | default('', true)
+         or ('636' if (_ldap_url_parts[0] | default('ldap', true)) == 'ldaps' else '389') }}
+  when: ldap is defined
+
+- name: "[Auth] Find a master node to test LDAP reachability from"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get nodes
+    --kubeconfig {{ target_kubeconfig }}
+    -l node-role.kubernetes.io/master
+    -o jsonpath='{.items[0].metadata.name}'
+  register: _auth_master_node
+  changed_when: false
+  failed_when: false
+  when: ldap is defined
+
+- name: "[Auth] Check LDAP port is reachable from a cluster node"
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc debug node/{{ _auth_master_node.stdout | trim }}
+    --kubeconfig {{ target_kubeconfig }}
+    -- chroot /host timeout 5 bash -c
+    "echo > /dev/tcp/{{ _ldap_host }}/{{ _ldap_port }}"
+  register: _ldap_reachable
+  changed_when: false
+  failed_when: false
+  when:
+    - ldap is defined
+    - _auth_master_node.stdout | default('') != ''
+
+- name: "[Auth] Assert LDAP server is reachable from the cluster"
+  ansible.builtin.assert:
+    that: _ldap_reachable.rc == 0
+    fail_msg: >-
+      Cluster node could not open a TCP connection to the LDAP server
+      ({{ _ldap_host }}:{{ _ldap_port }}, rc={{ _ldap_reachable.rc }}). The
+      OAuth IdP and bind secret exist, but logins will fail. Check security
+      group egress from the cluster to the LDAP host and that the LDAP
+      server (389 DS on the jumphost) is actually running.
+    success_msg: "LDAP server {{ _ldap_host }}:{{ _ldap_port }} is reachable from a cluster node"
+  when:
+    - ldap is defined
+    - _auth_master_node.stdout | default('') != ''
+
+# --------------------------------------------------------------------------
 # ClusterRoleBindings
 # --------------------------------------------------------------------------
 - name: "[Auth] Check ClusterRoleBindings exist"
