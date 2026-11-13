@@ -7,8 +7,13 @@
 # scoped to the Cluster VPC (east-west + VPC endpoints) and, while
 # network_lockdown_allow_jumphost_egress is true, the jumphost VPC (mirror
 # registry/LDAP during install). Idempotent — safe to re-run in either mode;
-# re-running with allow_jumphost_egress: false is how migrate_mirror finally
-# cuts the clusters off from the jumphost entirely.
+# re-running with allow_jumphost_egress: false is how migrate_mirror cuts the
+# clusters off from the jumphost for mirror/install traffic. It does NOT cut
+# them off entirely: a narrow, permanent tcp/389-to-jumphost-private-IP
+# exception is kept (and the jumphost's own LDAP ingress is narrowed to the
+# Cluster VPC, in place of its original 0.0.0.0/0), because OCP OAuth/
+# GroupSync depend on the jumphost-hosted 389 DS indefinitely, not just
+# during install. See playbooks/DISCONNECTED-NETWORK-LOCKDOWN.md.
 #
 # Runs against target_kubeconfig to discover the cluster's infrastructure
 # name, which every AWS resource the installer created is tagged with
@@ -166,6 +171,30 @@
     - "'InvalidPermission.Duplicate' not in _nl_allow_s3_prefix_list.stderr"
   changed_when: _nl_allow_s3_prefix_list.rc == 0
 
+# LDAP (389 DS on the jumphost) must stay reachable from the cluster
+# PERMANENTLY -- OCP OAuth and GroupSync (roles/ocp/configure_authentication,
+# roles/ocp/configure_ldap_group_sync) are hardcoded to bind against the
+# jumphost's private IP indefinitely, not just during install. The "final
+# lockdown, post-migration" revoke further down only removes the broad
+# jumphost-VPC-CIDR rule used for mirror/install traffic -- this narrower
+# /32, LDAP-port-only rule is a deliberate, permanent exception to that
+# cutover (not an oversight): the jumphost is never actually "fully
+# unreachable" post-migration, only unreachable for everything except LDAP.
+# See playbooks/DISCONNECTED-NETWORK-LOCKDOWN.md.
+- name: Allow permanent egress to the jumphost's private IP for LDAP (389 DS)
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 authorize-security-group-egress
+    --group-id {{ item }}
+    --ip-permissions '[{"IpProtocol":"tcp","FromPort":{{ jumphost_ldap_port | default(389) }},"ToPort":{{ jumphost_ldap_port | default(389) }},"IpRanges":[{"CidrIp":"{{ jumphost_private_ip }}/32"}]}]'
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  loop: "{{ _nl_cluster_sgs_list }}"
+  register: _nl_allow_ldap
+  failed_when:
+    - _nl_allow_ldap.rc != 0
+    - "'InvalidPermission.Duplicate' not in _nl_allow_ldap.stderr"
+  changed_when: _nl_allow_ldap.rc == 0
+
 - name: Allow egress to the jumphost VPC (mirror/LDAP, pre-migration only)
   ansible.builtin.command: >
     {{ bin_dir }}/aws ec2 authorize-security-group-egress
@@ -216,8 +245,56 @@
   changed_when: _nl_revoke_jumphost_ingress.rc == 0
   when: not (network_lockdown_allow_jumphost_egress | bool)
 
+# aws/aws_provision_jumphost originally authorized the jumphost's own LDAP
+# ingress rule against 0.0.0.0/0, since at the time it was written there was
+# no isolated Cluster VPC yet to scope it to. Narrow it here instead of in
+# that role, since this role is what knows the Cluster VPC CIDR -- cluster
+# nodes are the only legitimate source for this port now. Re-run safe: runs
+# once per invocation of this role (hub provision, spokes provision, and
+# both migrate_mirror calls) but is idempotent either way.
+- name: Find the jumphost's own security group (to scope its LDAP ingress rule)
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 describe-security-groups
+    --filters Name=group-name,Values={{ jumphost_security_group | default('disconnected-jumphost-sg') }}
+    --query 'SecurityGroups[0].GroupId'
+    --output text
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  register: _nl_jumphost_sg
+  changed_when: false
+  failed_when: false
+
+- name: Revoke the jumphost's open-to-the-internet LDAP ingress rule
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 revoke-security-group-ingress
+    --group-id {{ _nl_jumphost_sg.stdout | trim }}
+    --ip-permissions '[{"IpProtocol":"tcp","FromPort":{{ jumphost_ldap_port | default(389) }},"ToPort":{{ jumphost_ldap_port | default(389) }},"IpRanges":[{"CidrIp":"0.0.0.0/0"}]}]'
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  register: _nl_revoke_ldap_ingress
+  failed_when:
+    - _nl_revoke_ldap_ingress.rc != 0
+    - "'InvalidPermission.NotFound' not in _nl_revoke_ldap_ingress.stderr"
+  changed_when: _nl_revoke_ldap_ingress.rc == 0
+  when: (_nl_jumphost_sg.stdout | default('') | trim) not in ['', 'None']
+
+- name: Scope the jumphost's LDAP ingress rule to the Cluster VPC
+  ansible.builtin.command: >
+    {{ bin_dir }}/aws ec2 authorize-security-group-ingress
+    --group-id {{ _nl_jumphost_sg.stdout | trim }}
+    --ip-permissions '[{"IpProtocol":"tcp","FromPort":{{ jumphost_ldap_port | default(389) }},"ToPort":{{ jumphost_ldap_port | default(389) }},"IpRanges":[{"CidrIp":"{{ _nl_cluster_vpc_cidr.stdout | trim }}"}]}]'
+    --region {{ network_lockdown_region }}
+  environment: "{{ _aws_env }}"
+  register: _nl_allow_ldap_ingress
+  failed_when:
+    - _nl_allow_ldap_ingress.rc != 0
+    - "'InvalidPermission.Duplicate' not in _nl_allow_ldap_ingress.stderr"
+  changed_when: _nl_allow_ldap_ingress.rc == 0
+  when: (_nl_jumphost_sg.stdout | default('') | trim) not in ['', 'None']
+
 - name: Display lockdown summary
   ansible.builtin.debug:
     msg:
       - "Security groups locked down for {{ _nl_infra_name.stdout | trim }}: {{ _nl_cluster_sgs_list }}"
-      - "Egress allowed: {{ _nl_cluster_vpc_cidr.stdout | trim }}, S3 prefix list {{ _nl_s3_prefix_list.stdout | trim }}{{ (' and ' ~ _nl_jumphost_vpc_cidr.stdout | trim) if network_lockdown_allow_jumphost_egress | bool else '' }}"
+      - "Egress allowed: {{ _nl_cluster_vpc_cidr.stdout | trim }}, S3 prefix list {{ _nl_s3_prefix_list.stdout | trim }}, jumphost LDAP ({{ jumphost_private_ip }}/32 tcp/{{ jumphost_ldap_port | default(389) }}, permanent){{ (' and ' ~ _nl_jumphost_vpc_cidr.stdout | trim) if network_lockdown_allow_jumphost_egress | bool else '' }}"
+      - "Jumphost LDAP ingress scoped to Cluster VPC {{ _nl_cluster_vpc_cidr.stdout | trim }}"

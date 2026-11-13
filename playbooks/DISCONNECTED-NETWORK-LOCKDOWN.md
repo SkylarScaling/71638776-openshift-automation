@@ -23,9 +23,23 @@ the existing jumphost-mirrors-then-migrate-to-hub workflow. Set
   Gateway attached, ever. Houses the hub and every spoke.
 - **VPC Peering Connection** between the two VPCs, so cluster nodes reach the
   jumphost's mirror registry and LDAP over private AWS networking instead of
-  the public internet. The peering route (and the security-group egress that
-  allows it) is only needed until `migrate_mirror` runs — at that point it's
-  revoked, so the clusters become fully unreachable to/from the jumphost.
+  the public internet. The peering route (and the broad security-group egress
+  that allows it) is only needed until `migrate_mirror` runs — at that point
+  it's revoked. The clusters are **not** fully unreachable from the jumphost
+  after that, though: OCP OAuth and GroupSync (`ocp/configure_authentication`,
+  `ocp/configure_ldap_group_sync`) are hardcoded to bind against the
+  jumphost's 389 DS container indefinitely, not just during install — cutting
+  LDAP off at the same point as mirror/install traffic breaks cluster
+  authentication outright (confirmed live; `ocp/verify_authentication` only
+  checks object existence, not a live bind, so this failed silently). A
+  narrow, permanent exception is kept instead: `aws/lockdown_cluster_security_groups`
+  authorizes egress from the cluster security groups to
+  `{{ jumphost_private_ip }}/32` on tcp/389 unconditionally (not revoked by
+  the final-cutover task), and narrows the jumphost's own LDAP ingress rule
+  from 0.0.0.0/0 down to the Cluster VPC CIDR at the same time. If the
+  customer's own LDAP/AD or an in-cluster LDAP replaces the jumphost-hosted
+  389 DS in the future, this exception becomes unnecessary and should be
+  removed along with it.
 - **Private hosted zone / jumphost VPC association**: `publish: Internal`
   clusters get a private Route53 zone associated only with the Cluster VPC —
   but `openshift-install` for the hub runs *on the jumphost*, outside that
