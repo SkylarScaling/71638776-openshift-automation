@@ -123,38 +123,74 @@
     label: "{{ item.name }}"
   when: disconnected.community_operators | default([]) | length > 0
 
-- name: "[Report] redhat-operators channel compatibility for target OCP {{ target_ocp_version }}"
-  ansible.builtin.debug:
-    msg: >-
-      {%- set target_channels = item.stdout | from_json -%}
-      {%- set configured = item.item.channels | default([]) | map(attribute='name') | list -%}
-      {%- set missing = configured | difference(target_channels) -%}
-      {{ item.item.name }}: configured {{ configured }} --
-      {%- if missing | length > 0 %} NOT FOUND in the v{{ target_ocp_version }} catalog: {{ missing }}.
-      Available channels for {{ item.item.name }}: {{ target_channels }}. Pick a replacement before upgrading.
-      {%- else %} still present in the v{{ target_ocp_version }} catalog (channel presence only --
-      this does not confirm the operator itself supports OCP {{ target_ocp_version }}; check its
-      release notes).
-      {%- endif %}
+- name: Initialize compatibility rows accumulator
+  ansible.builtin.set_fact:
+    _compat_rows: []
+
+- name: Build compatibility rows for redhat operators
+  ansible.builtin.set_fact:
+    _compat_rows: "{{ _compat_rows + [_compat_row] }}"
+  vars:
+    _configured: "{{ item.item.channels | default([]) | map(attribute='name') | list }}"
+    _available: "{{ item.stdout | from_json }}"
+    _compat_row:
+      name: "{{ item.item.name }}"
+      configured: "{{ _configured }}"
+      available: "{{ _available }}"
+      missing: "{{ _configured | difference(_available) }}"
   loop: "{{ _redhat_operator_channels.results | default([]) }}"
   loop_control:
     label: "{{ item.item.name }}"
   when: disconnected.operators | default([]) | length > 0
 
-- name: "[Report] community-operators channel compatibility for target OCP {{ target_ocp_version }}"
-  ansible.builtin.debug:
-    msg: >-
-      {%- set target_channels = item.stdout | from_json -%}
-      {%- set configured = item.item.channels | default([]) | map(attribute='name') | list -%}
-      {%- set missing = configured | difference(target_channels) -%}
-      {{ item.item.name }}: configured {{ configured }} --
-      {%- if missing | length > 0 %} NOT FOUND in the v{{ target_ocp_version }} catalog: {{ missing }}.
-      Available channels for {{ item.item.name }}: {{ target_channels }}. Pick a replacement before upgrading.
-      {%- else %} still present in the v{{ target_ocp_version }} catalog (channel presence only --
-      this does not confirm the operator itself supports OCP {{ target_ocp_version }}; check its
-      release notes).
-      {%- endif %}
+- name: Build compatibility rows for community operators
+  ansible.builtin.set_fact:
+    _compat_rows: "{{ _compat_rows + [_compat_row] }}"
+  vars:
+    _configured: "{{ item.item.channels | default([]) | map(attribute='name') | list }}"
+    _available: "{{ item.stdout | from_json }}"
+    _compat_row:
+      name: "{{ item.item.name }}"
+      configured: "{{ _configured }}"
+      available: "{{ _available }}"
+      missing: "{{ _configured | difference(_available) }}"
   loop: "{{ _community_operator_channels.results | default([]) }}"
   loop_control:
     label: "{{ item.item.name }}"
   when: disconnected.community_operators | default([]) | length > 0
+
+- name: Split compatibility rows into needs-update vs ok
+  ansible.builtin.set_fact:
+    _compat_needs_update: "{{ _compat_rows | selectattr('missing', '!=', []) | list }}"
+    _compat_ok: "{{ _compat_rows | selectattr('missing', '==', []) | list }}"
+
+- name: "[Summary] Operator channel compatibility for target OCP {{ target_ocp_version }}"
+  ansible.builtin.debug:
+    msg: |-
+      ==================================================================
+      Operator Channel Compatibility Summary -- target OCP {{ target_ocp_version }}
+      ==================================================================
+      {% if _compat_needs_update | length > 0 %}
+      INVENTORY UPDATE NEEDED ({{ _compat_needs_update | length }} operator{{ 's' if _compat_needs_update | length != 1 else '' }}):
+      {% for row in _compat_needs_update %}
+        - {{ row.name }}
+            Configured channel(s) not found for OCP {{ target_ocp_version }}: {{ row.missing | join(', ') }}
+            Available channels in the v{{ target_ocp_version }} catalog: {{ row.available | join(', ') if row.available | length > 0 else '(none -- package may have been removed/renamed)' }}
+            Update disconnected.operators[].channels (or disconnected.community_operators[].channels) for '{{ row.name }}' in your inventory.
+      {% endfor %}
+      {% else %}
+      No channel renames detected -- every configured channel still exists in the v{{ target_ocp_version }} catalog. No inventory changes required.
+      {% endif %}
+      {% if _compat_ok | length > 0 %}
+
+      No channel-name change needed ({{ _compat_ok | length }} operator{{ 's' if _compat_ok | length != 1 else '' }}, still verify release notes):
+      {% for row in _compat_ok %}
+        - {{ row.name }}: {{ row.configured | join(', ') }}
+      {% endfor %}
+      {% endif %}
+      ==================================================================
+      Reminder: "present in catalog" only proves the channel name still exists
+      for OCP {{ target_ocp_version }} -- it does not confirm the operator's
+      bundle on that channel is certified for OCP {{ target_ocp_version }}.
+      Always cross-check the operator's own release notes before upgrading.
+      ==================================================================
