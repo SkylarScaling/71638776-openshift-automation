@@ -46,6 +46,33 @@ graph and are out of scope here.
 | `ocp/update_ocp_hub` | hub only | Self-managed upgrade: `oc adm upgrade --to-image=<mirrored release tag> --allow-explicit-upgrade`, then the MCO-safe wait pattern until `ClusterVersion` reports the target version and is no longer `Progressing`. |
 | `acm/update_ocp_spoke` | spokes (via hub) | Hive/ACM-managed upgrade: creates/reuses a `ClusterImageSet` pointing at the Quay-mirrored release image for the target version, then applies a `ClusterCurator` (`desiredCuration: upgrade`) and waits for it to report success and for the spoke's reported version to match. |
 
+## Standalone: `check-operator-channels.yaml`
+
+Before bumping `openshift_version` for a minor update, it's useful to know
+which of the currently-configured `disconnected.operators[].channels` /
+`disconnected.community_operators[].channels` entries are still valid for the
+OCP minor you're moving to — channel names get renamed/retired across minors.
+This playbook answers that without touching any cluster or mirroring
+anything:
+
+```bash
+cd playbooks
+ansible-playbook check-operator-channels.yaml -i inventory-disconnected.yaml \
+  -e operator_compat_target_openshift_version=4.22
+```
+
+It renders (`opm render`) the `redhat-operator-index`/`community-operator-index`
+catalog for the *target* minor and reports, per operator, whether the
+currently-configured channel name still exists in that catalog, listing the
+available alternatives if not. This is advisory, not authoritative: "channel
+still present" is the one compatibility signal reliably available for every
+operator — OLM catalogs don't consistently expose a machine-readable "supports
+OCP X.Y" property, so always cross-check the operator's own release notes
+before committing to a channel bump. Uses `opm`, downloaded on demand from the
+same `mirror.openshift.com` client-tools layout `oc`/`oc-mirror` already come
+from (not one of the usual `install_disconnected_prerequisites` binaries,
+since it's only needed for this check).
+
 ## New playbook: `disconnected-update.yaml`
 
 ```bash

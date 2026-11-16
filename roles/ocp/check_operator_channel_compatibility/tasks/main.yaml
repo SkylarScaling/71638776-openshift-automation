@@ -1,0 +1,160 @@
+---
+- name: Assert target OCP version is set
+  ansible.builtin.assert:
+    that: operator_compat_target_openshift_version | default('') != ''
+    fail_msg: >-
+      operator_compat_target_openshift_version must be set, e.g.
+      -e operator_compat_target_openshift_version=4.22
+
+- name: Assert there are operators configured to check
+  ansible.builtin.assert:
+    that: >-
+      (disconnected.operators | default([]) | length > 0) or
+      (disconnected.community_operators | default([]) | length > 0)
+    fail_msg: "No disconnected.operators or disconnected.community_operators found in inventory — nothing to check."
+
+- name: Create scratch workspace
+  ansible.builtin.file:
+    path: "{{ operator_compat_workspace }}"
+    state: directory
+    mode: '0755'
+
+- name: Build auth.json from the Red Hat pull secret (opm needs to read registry.redhat.io)
+  ansible.builtin.copy:
+    content: "{{ pull_secret | to_nice_json }}"
+    dest: "{{ operator_compat_workspace }}/auth.json"
+    mode: '0600'
+  no_log: true
+
+- name: Check installed opm version
+  ansible.builtin.command: "{{ bin_dir }}/opm version"
+  register: _opm_version_check
+  changed_when: false
+  failed_when: false
+
+# opm isn't part of this repo's usual prerequisites (only oc-mirror is) -- it's
+# only needed for this standalone compatibility check, so it's downloaded here
+# rather than added to install_disconnected_prerequisites. Matches the target
+# OCP minor's client tools, same mirror.openshift.com layout oc/oc-mirror/
+# openshift-install already come from (install_ocp_prerequisites,
+# install_disconnected_prerequisites).
+- name: Download and extract opm matching the target OCP minor's client tools
+  ansible.builtin.unarchive:
+    src: "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/latest-{{ operator_compat_target_openshift_version }}/opm-linux.tar.gz"
+    dest: "{{ bin_dir }}"
+    remote_src: yes
+    mode: '0755'
+  when: >
+    force_update | default(false) | bool or
+    _opm_version_check.rc != 0
+
+# `opm render` has no "just this package" flag -- it renders the whole
+# catalog's declarative config as NDJSON, filtered per-package below with jq.
+# This can take a few minutes for the full redhat-operator-index.
+- name: Render the target redhat-operator-index catalog (can take a few minutes)
+  ansible.builtin.command: >
+    {{ bin_dir }}/opm render
+    registry.redhat.io/redhat/redhat-operator-index{{
+      (':v' ~ operator_compat_target_openshift_version)
+      if redhat_operator_index_digest | default('') == ''
+      else ('@sha256:' ~ redhat_operator_index_digest)
+    }}
+    -o json
+  environment:
+    REGISTRY_AUTH_FILE: "{{ operator_compat_workspace }}/auth.json"
+  register: _redhat_catalog_render
+  changed_when: false
+  when: disconnected.operators | default([]) | length > 0
+
+- name: Write rendered redhat-operators catalog to disk
+  ansible.builtin.copy:
+    content: "{{ _redhat_catalog_render.stdout }}"
+    dest: "{{ operator_compat_workspace }}/redhat-operator-index.json"
+    mode: '0644'
+  when: disconnected.operators | default([]) | length > 0
+
+- name: Render the target community-operator-index catalog (if configured)
+  ansible.builtin.command: >
+    {{ bin_dir }}/opm render
+    registry.redhat.io/redhat/community-operator-index{{
+      (':v' ~ operator_compat_target_openshift_version)
+      if community_operator_index_digest | default('') == ''
+      else ('@sha256:' ~ community_operator_index_digest)
+    }}
+    -o json
+  environment:
+    REGISTRY_AUTH_FILE: "{{ operator_compat_workspace }}/auth.json"
+  register: _community_catalog_render
+  changed_when: false
+  when: disconnected.community_operators | default([]) | length > 0
+
+- name: Write rendered community-operators catalog to disk
+  ansible.builtin.copy:
+    content: "{{ _community_catalog_render.stdout }}"
+    dest: "{{ operator_compat_workspace }}/community-operator-index.json"
+    mode: '0644'
+  when: disconnected.community_operators | default([]) | length > 0
+
+- name: Look up each configured redhat operator's channels in the target catalog
+  ansible.builtin.shell: >
+    set -o pipefail;
+    jq -s '[.[] | select(.schema=="olm.channel" and .package=="{{ item.name }}") | .name] | unique | sort'
+    {{ operator_compat_workspace }}/redhat-operator-index.json
+  args:
+    executable: /bin/bash
+  register: _redhat_operator_channels
+  changed_when: false
+  loop: "{{ disconnected.operators | default([]) }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: disconnected.operators | default([]) | length > 0
+
+- name: Look up each configured community operator's channels in the target catalog
+  ansible.builtin.shell: >
+    set -o pipefail;
+    jq -s '[.[] | select(.schema=="olm.channel" and .package=="{{ item.name }}") | .name] | unique | sort'
+    {{ operator_compat_workspace }}/community-operator-index.json
+  args:
+    executable: /bin/bash
+  register: _community_operator_channels
+  changed_when: false
+  loop: "{{ disconnected.community_operators | default([]) }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: disconnected.community_operators | default([]) | length > 0
+
+- name: "[Report] redhat-operators channel compatibility for target OCP {{ operator_compat_target_openshift_version }}"
+  ansible.builtin.debug:
+    msg: >-
+      {%- set target_channels = item.stdout | from_json -%}
+      {%- set configured = item.item.channels | default([]) | map(attribute='name') | list -%}
+      {%- set missing = configured | difference(target_channels) -%}
+      {{ item.item.name }}: configured {{ configured }} --
+      {%- if missing | length > 0 %} NOT FOUND in the v{{ operator_compat_target_openshift_version }} catalog: {{ missing }}.
+      Available channels for {{ item.item.name }}: {{ target_channels }}. Pick a replacement before upgrading.
+      {%- else %} still present in the v{{ operator_compat_target_openshift_version }} catalog (channel presence only --
+      this does not confirm the operator itself supports OCP {{ operator_compat_target_openshift_version }}; check its
+      release notes).
+      {%- endif %}
+  loop: "{{ _redhat_operator_channels.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+  when: disconnected.operators | default([]) | length > 0
+
+- name: "[Report] community-operators channel compatibility for target OCP {{ operator_compat_target_openshift_version }}"
+  ansible.builtin.debug:
+    msg: >-
+      {%- set target_channels = item.stdout | from_json -%}
+      {%- set configured = item.item.channels | default([]) | map(attribute='name') | list -%}
+      {%- set missing = configured | difference(target_channels) -%}
+      {{ item.item.name }}: configured {{ configured }} --
+      {%- if missing | length > 0 %} NOT FOUND in the v{{ operator_compat_target_openshift_version }} catalog: {{ missing }}.
+      Available channels for {{ item.item.name }}: {{ target_channels }}. Pick a replacement before upgrading.
+      {%- else %} still present in the v{{ operator_compat_target_openshift_version }} catalog (channel presence only --
+      this does not confirm the operator itself supports OCP {{ operator_compat_target_openshift_version }}; check its
+      release notes).
+      {%- endif %}
+  loop: "{{ _community_operator_channels.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+  when: disconnected.community_operators | default([]) | length > 0

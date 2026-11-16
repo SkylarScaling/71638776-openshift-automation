@@ -1,0 +1,29 @@
+---
+# ==============================================================================
+# STANDALONE: Check operator channel compatibility ahead of an OCP minor bump
+#
+# Read-only -- does not touch any cluster, does not mirror anything, does not
+# require migrate_mirror to have run. Renders the operator catalog index for
+# the OCP minor you're about to upgrade TO (not the version currently
+# installed) and reports, for every operator/channel already configured in
+# this inventory's disconnected.operators[]/disconnected.community_operators[],
+# whether that exact channel name still exists in the target catalog -- so you
+# know which disconnected.operators[].channels entries need to change BEFORE
+# running disconnected-update.yaml.
+#
+# Usage:
+#   cd playbooks
+#   ansible-playbook check-operator-channels.yaml -i inventory-disconnected.yaml \
+#     -e operator_compat_target_openshift_version=4.22
+#
+# See DISCONNECTED-UPDATES.md for how this fits into the overall update flow.
+# ==============================================================================
+
+- name: Check operator channel compatibility for an upcoming OCP upgrade
+  hosts: hub_cluster
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Check operator channel compatibility against the target catalog
+      ansible.builtin.include_role:
+        name: ocp/check_operator_channel_compatibility
