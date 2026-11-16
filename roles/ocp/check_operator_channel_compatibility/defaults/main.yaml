@@ -12,7 +12,7 @@
 # present in the target catalog" is the one signal reliably present for
 # every operator, so that's all this checks. Never mutates a cluster --
 # only renders catalog index images into a local scratch workspace.
-operator_compat_target_openshift_version: ""
+target_ocp_version: ""
 operator_compat_workspace: "{{ tmp_dir }}/operator-compat-check"
 redhat_operator_index_digest: ""
 community_operator_index_digest: ""

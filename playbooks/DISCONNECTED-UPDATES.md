@@ -58,7 +58,7 @@ anything:
 ```bash
 cd playbooks
 ansible-playbook check-operator-channels.yaml -i inventory-disconnected.yaml \
-  -e operator_compat_target_openshift_version=4.22
+  -e target_ocp_version=4.22
 ```
 
 It renders (`opm render`) the `redhat-operator-index`/`community-operator-index`

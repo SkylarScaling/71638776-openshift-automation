@@ -1,10 +1,10 @@
 ---
 - name: Assert target OCP version is set
   ansible.builtin.assert:
-    that: operator_compat_target_openshift_version | default('') != ''
+    that: target_ocp_version | default('') != ''
     fail_msg: >-
-      operator_compat_target_openshift_version must be set, e.g.
-      -e operator_compat_target_openshift_version=4.22
+      target_ocp_version must be set, e.g.
+      -e target_ocp_version=4.22
 
 - name: Assert there are operators configured to check
   ansible.builtin.assert:
@@ -40,7 +40,7 @@
 # install_disconnected_prerequisites).
 - name: Download and extract opm matching the target OCP minor's client tools
   ansible.builtin.unarchive:
-    src: "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/latest-{{ operator_compat_target_openshift_version }}/opm-linux.tar.gz"
+    src: "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/latest-{{ target_ocp_version }}/opm-linux.tar.gz"
     dest: "{{ bin_dir }}"
     remote_src: yes
     mode: '0755'
@@ -55,7 +55,7 @@
   ansible.builtin.command: >
     {{ bin_dir }}/opm render
     registry.redhat.io/redhat/redhat-operator-index{{
-      (':v' ~ operator_compat_target_openshift_version)
+      (':v' ~ target_ocp_version)
       if redhat_operator_index_digest | default('') == ''
       else ('@sha256:' ~ redhat_operator_index_digest)
     }}
@@ -77,7 +77,7 @@
   ansible.builtin.command: >
     {{ bin_dir }}/opm render
     registry.redhat.io/redhat/community-operator-index{{
-      (':v' ~ operator_compat_target_openshift_version)
+      (':v' ~ target_ocp_version)
       if community_operator_index_digest | default('') == ''
       else ('@sha256:' ~ community_operator_index_digest)
     }}
@@ -123,17 +123,17 @@
     label: "{{ item.name }}"
   when: disconnected.community_operators | default([]) | length > 0
 
-- name: "[Report] redhat-operators channel compatibility for target OCP {{ operator_compat_target_openshift_version }}"
+- name: "[Report] redhat-operators channel compatibility for target OCP {{ target_ocp_version }}"
   ansible.builtin.debug:
     msg: >-
       {%- set target_channels = item.stdout | from_json -%}
       {%- set configured = item.item.channels | default([]) | map(attribute='name') | list -%}
       {%- set missing = configured | difference(target_channels) -%}
       {{ item.item.name }}: configured {{ configured }} --
-      {%- if missing | length > 0 %} NOT FOUND in the v{{ operator_compat_target_openshift_version }} catalog: {{ missing }}.
+      {%- if missing | length > 0 %} NOT FOUND in the v{{ target_ocp_version }} catalog: {{ missing }}.
       Available channels for {{ item.item.name }}: {{ target_channels }}. Pick a replacement before upgrading.
-      {%- else %} still present in the v{{ operator_compat_target_openshift_version }} catalog (channel presence only --
-      this does not confirm the operator itself supports OCP {{ operator_compat_target_openshift_version }}; check its
+      {%- else %} still present in the v{{ target_ocp_version }} catalog (channel presence only --
+      this does not confirm the operator itself supports OCP {{ target_ocp_version }}; check its
       release notes).
       {%- endif %}
   loop: "{{ _redhat_operator_channels.results | default([]) }}"
@@ -141,17 +141,17 @@
     label: "{{ item.item.name }}"
   when: disconnected.operators | default([]) | length > 0
 
-- name: "[Report] community-operators channel compatibility for target OCP {{ operator_compat_target_openshift_version }}"
+- name: "[Report] community-operators channel compatibility for target OCP {{ target_ocp_version }}"
   ansible.builtin.debug:
     msg: >-
       {%- set target_channels = item.stdout | from_json -%}
       {%- set configured = item.item.channels | default([]) | map(attribute='name') | list -%}
       {%- set missing = configured | difference(target_channels) -%}
       {{ item.item.name }}: configured {{ configured }} --
-      {%- if missing | length > 0 %} NOT FOUND in the v{{ operator_compat_target_openshift_version }} catalog: {{ missing }}.
+      {%- if missing | length > 0 %} NOT FOUND in the v{{ target_ocp_version }} catalog: {{ missing }}.
       Available channels for {{ item.item.name }}: {{ target_channels }}. Pick a replacement before upgrading.
-      {%- else %} still present in the v{{ operator_compat_target_openshift_version }} catalog (channel presence only --
-      this does not confirm the operator itself supports OCP {{ operator_compat_target_openshift_version }}; check its
+      {%- else %} still present in the v{{ target_ocp_version }} catalog (channel presence only --
+      this does not confirm the operator itself supports OCP {{ target_ocp_version }}; check its
       release notes).
       {%- endif %}
   loop: "{{ _community_operator_channels.results | default([]) }}"
