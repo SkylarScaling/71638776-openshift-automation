@@ -169,6 +169,12 @@
     - not _oc_mirror_complete
     - oc_mirror_retry_final is defined
 
+- name: Mirror the release image's Sigstore signature artifact
+  ansible.builtin.include_tasks: mirror-release-signature.yaml
+  vars:
+    _sig_mirror_workspace: "{{ oc_mirror_workspace }}"
+    _sig_mirror_dest_prefix: "{{ mirror_registry_url }}/{{ mirror_base_path }}"
+
 # ==============================================================================
 # WORKAROUND: oc-mirror v2 manifest format bug
 #

@@ -99,6 +99,12 @@
     - not _update_mirror_complete
     - oc_mirror_retry_final is defined
 
+- name: Mirror the release image's Sigstore signature artifact
+  ansible.builtin.include_tasks: "{{ role_path }}/../mirror_ocp_content/tasks/mirror-release-signature.yaml"
+  vars:
+    _sig_mirror_workspace: "{{ update_mirror_workspace }}"
+    _sig_mirror_dest_prefix: "{{ quay_registry_url }}/{{ quay_mirror_org }}"
+
 # Same Quay repo-creation push-token race documented in
 # remirror_to_quay/tasks/converge_unauthorized.yml (see project memory Bug 7).
 # Reuse it directly rather than duplicating the fix — it only depends on

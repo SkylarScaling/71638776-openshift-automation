@@ -1,0 +1,66 @@
+---
+# Shared by ocp/mirror_ocp_content (initial install) and ocp/mirror_update_content
+# (Day 2 updates). OCP 4.21 requires a Sigstore signature artifact for
+# quay.io/openshift-release-dev/ocp-release release images to be present in
+# any configured mirror before upgrading to it (AdminAckRequired gate,
+# admin-acks key ack-4.20-sigstore-in-4.21, confirmed live). oc-mirror v2 has
+# no documented or working way to mirror this: confirmed live that the 4.20
+# and 4.21 builds are identical (v2.0.0), neither exposes a --sigstore/
+# --cosign/--attach* flag or an ImageSetConfiguration field for it, and both
+# only ever produce the older simple-signing ConfigMap
+# (release.openshift.io/verification-signatures).
+#
+# The signature itself is a plain, confirmed-reachable OCI artifact at
+# <repo>:sha256-<release-digest>.sig (cosign's tag-based discovery
+# convention) -- mirror it explicitly with the same `oc image mirror`
+# pattern already used for Gitea (ocp/deploy_internal_gitserver). Runs
+# unconditionally on every mirror, not gated on openshift_version, so this
+# doesn't silently stop working at whatever version boundary starts
+# requiring it next; best-effort (a warning, not a hard failure) since very
+# old releases may predate Sigstore signing entirely and have no .sig to
+# mirror at all.
+#
+# Caller must set before including this file:
+#   _sig_mirror_workspace   - directory containing containers/auth.json
+#   _sig_mirror_dest_prefix - registry/org the release image itself is
+#                             mirrored under (release images land at
+#                             <dest_prefix>/openshift/release-images)
+
+- name: Discover the release image digest for the Sigstore signature artifact
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc adm release info
+    quay.io/openshift-release-dev/ocp-release:{{ openshift_version }}.{{ ocp_patch_version }}-x86_64
+    --registry-config={{ _sig_mirror_workspace }}/containers/auth.json
+    -o jsonpath='{.digest}'
+  register: _release_digest_for_sig
+  changed_when: false
+  failed_when: false
+
+- name: Mirror the release image's Sigstore signature artifact
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc image mirror
+    --insecure=true
+    -a {{ _sig_mirror_workspace }}/containers/auth.json
+    quay.io/openshift-release-dev/ocp-release:{{ _sig_tag }}
+    {{ _sig_mirror_dest_prefix }}/openshift/release-images:{{ _sig_tag }}
+  vars:
+    _sig_tag: "{{ _release_digest_for_sig.stdout | trim | regex_replace('^sha256:', 'sha256-') }}.sig"
+  register: _sig_mirror_result
+  changed_when: true
+  failed_when: false
+  when: _release_digest_for_sig.stdout | default('') | trim != ''
+
+- name: Warn if the Sigstore signature artifact could not be mirrored
+  ansible.builtin.debug:
+    msg: >-
+      Could not mirror the Sigstore signature for release
+      {{ openshift_version }}.{{ ocp_patch_version }} ({{
+        'failed to resolve release digest' if (_release_digest_for_sig.stdout | default('') | trim == '')
+        else 'rc=' ~ _sig_mirror_result.rc
+      }}). This release may predate Sigstore signing, or this may block an
+      AdminAckRequired upgrade gate on clusters moving to an OCP version that
+      requires it (e.g. the 4.20->4.21 boundary). stderr:
+      {{ _sig_mirror_result.stderr | default(_release_digest_for_sig.stderr | default('')) }}
+  when: >-
+    (_release_digest_for_sig.stdout | default('') | trim == '')
+    or (_sig_mirror_result.rc | default(0) != 0)
