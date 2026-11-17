@@ -115,7 +115,7 @@
 - name: "[Update] Assert cluster is Upgradeable before a minor version bump"
   ansible.builtin.assert:
     that: >-
-      (_cv_upgradeable.stdout | from_json).status | default('True') != "False"
+      _cv_upgradeable_json.status | default('True') != "False"
       or (_cv_upgradeable_remaining_reasons | length == 0)
     fail_msg: >-
       This is a minor version bump ({{ _cv_current_for_minor_check.stdout }} ->
@@ -125,11 +125,22 @@
       update_ocp_hub / ocp/update_manual_cloud_credentials /
       ocp/ack_release_signature_gate handle those automatically):
       {{ _cv_upgradeable_remaining_reasons | join(', ') }}.
-      Full CVO message: {{ (_cv_upgradeable.stdout | from_json).message }}
+      Full CVO message: {{ _cv_upgradeable_json.message | default('') }}
     success_msg: >-
       Cluster is Upgradeable for this minor version bump (or only blocked by
       reasons this update path already handles automatically)
   vars:
+    # jsonpath on a condition that doesn't currently exist in
+    # .status.conditions (e.g. Upgradeable cleared/absent once nothing is
+    # blocking it -- confirmed live, not just "False" vs "True") returns an
+    # empty string, which from_json can't parse at all. Treat that as the
+    # implicit "nothing blocking" case rather than erroring.
+    _cv_upgradeable_json: >-
+      {{
+        (_cv_upgradeable.stdout | default('') | trim | from_json)
+        if (_cv_upgradeable.stdout | default('') | trim != '')
+        else {'status': 'True'}
+      }}
     # The CVO's `.reason` is a single CamelCase token, not a comma-joined
     # list of the individual causes -- when more than one applies it's
     # literally the string "MultipleReasons", and the real per-cause names
@@ -138,14 +149,14 @@
     # MissingUpgradeableAnnotation\n* ..."). Extract that comma-joined list
     # from the message when reason is the "MultipleReasons" placeholder;
     # otherwise `.reason` itself is already the one real cause.
-    _cv_upgradeable_reason: "{{ (_cv_upgradeable.stdout | from_json).reason | default('') }}"
+    _cv_upgradeable_reason: "{{ _cv_upgradeable_json.reason | default('') }}"
     # regex_search with one backref group returns a one-element list (not a
     # bare string) on this Ansible version -- confirmed live via a scratch
     # playbook. `first` unwraps it; `default('', true)` covers both "no
     # match" (None) and an empty list.
     _cv_upgradeable_all_reasons: >-
       {{
-        (((_cv_upgradeable.stdout | from_json).message
+        ((_cv_upgradeable_json.message
           | default('')
           | regex_search('for multiple reasons:\s*([A-Za-z,]+)', '\1')
           | default([], true)
