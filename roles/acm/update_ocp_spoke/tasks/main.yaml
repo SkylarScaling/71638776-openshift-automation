@@ -63,6 +63,13 @@
     - _spoke_is_minor_bump | bool
     - _spoke_insights_override_check.stdout | default('') | trim == "true"
 
+- name: Refresh Manual-mode cloud credentials for the minor version upgrade
+  ansible.builtin.include_role:
+    name: ocp/update_manual_cloud_credentials
+  vars:
+    target_kubeconfig: "{{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig"
+  when: _spoke_is_minor_bump | bool
+
 - name: Create ClusterImageSet pointing at the mirrored release in Quay
   ansible.builtin.shell:
     cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"

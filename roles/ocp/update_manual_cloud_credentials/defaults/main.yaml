@@ -1,0 +1,2 @@
+---
+update_manual_cloud_credentials_workspace: "{{ tmp_dir }}/cco-update-credrequests"

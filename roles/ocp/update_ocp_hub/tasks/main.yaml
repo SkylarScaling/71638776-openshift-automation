@@ -66,6 +66,11 @@
     - _hub_is_minor_bump | bool
     - _hub_insights_override_check.stdout | default('') | trim == "true"
 
+- name: Refresh Manual-mode cloud credentials for the minor version upgrade
+  ansible.builtin.include_role:
+    name: ocp/update_manual_cloud_credentials
+  when: _hub_is_minor_bump | bool
+
 - name: Look for an oc-mirror release signature ConfigMap for this version
   ansible.builtin.find:
     paths: "{{ update_mirror_workspace }}/working-dir/cluster-resources"

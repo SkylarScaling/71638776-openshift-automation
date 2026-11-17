@@ -1,0 +1,169 @@
+---
+# ==============================================================================
+# DAY 2: REFRESH MANUAL-MODE CLOUD CREDENTIALS FOR A MINOR VERSION BUMP
+#
+# Day 2 counterpart to ocp/create_manual_cloud_credentials (install-time).
+# A credentialsMode: Manual cluster reports MissingUpgradeableAnnotation on
+# the ClusterVersion Upgradeable condition until the cloud-credential
+# ClusterOperator is annotated cloudcredential.openshift.io/upgradeable-to:
+# "<target-minor>" -- confirmed live blocking the 4.20->4.21 bump on this
+# repo's hub. Red Hat's documented process before setting that annotation is
+# to re-extract CredentialsRequests from the TARGET release image and make
+# sure a Secret exists for any that are new. This repo's Manual mode reuses
+# the same long-lived AWS admin credentials for every CredentialsRequest
+# (see ocp/create_manual_cloud_credentials) rather than per-component scoped
+# IAM policies, so there is no IAM permission diff to compute -- the only
+# thing that can actually be "new" is a CredentialsRequest (and therefore a
+# namespace/Secret) that didn't exist in the previous release. Every new one
+# found is created and named in the summary output before the annotation is
+# set, so what changed is always visible even though this runs unattended.
+#
+# No-op on clusters that aren't credentialsMode: Manual (mint/passthrough
+# clusters have no such annotation to set).
+#
+# Caller must set target_kubeconfig to the cluster being upgraded (the hub's
+# own kubeconfig for the hub, or the spoke's own kubeconfig for a spoke --
+# NOT the hub's kubeconfig when operating on a spoke).
+
+- name: Check CCO credentialsMode on the target cluster
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get cloudcredential cluster
+    --kubeconfig {{ target_kubeconfig }}
+    -o jsonpath='{.spec.credentialsMode}'
+  register: _cco_mode
+  changed_when: false
+
+- name: Refresh CredentialsRequests and set upgradeable-to annotation (Manual mode only)
+  when: _cco_mode.stdout | default('') == 'Manual'
+  block:
+    - name: Create workspace for target-release CredentialsRequests
+      ansible.builtin.file:
+        path: "{{ update_manual_cloud_credentials_workspace }}/credrequests"
+        state: directory
+        mode: '0755'
+
+    # The cluster's own pull-secret already has Quay robot credentials merged
+    # in by this point (ocp/configure_quay_mirror ran earlier in the same
+    # play) -- extract it rather than re-deriving Quay auth separately.
+    - name: Extract the cluster's own merged pull secret
+      ansible.builtin.command: >
+        {{ bin_dir }}/oc extract secret/pull-secret
+        -n openshift-config
+        --kubeconfig {{ target_kubeconfig }}
+        --to={{ update_manual_cloud_credentials_workspace }}
+        --confirm
+      changed_when: true
+
+    - name: Extract CredentialsRequest manifests from the target release image
+      ansible.builtin.command: >
+        {{ bin_dir }}/oc adm release extract
+        --credentials-requests
+        --cloud=aws
+        --to={{ update_manual_cloud_credentials_workspace }}/credrequests
+        --registry-config={{ update_manual_cloud_credentials_workspace }}/.dockerconfigjson
+        --insecure=true
+        {{ quay_registry_url }}/{{ quay_mirror_org }}/openshift/release-images:{{ openshift_version }}.{{ ocp_patch_version }}-x86_64
+      changed_when: true
+
+    - name: Find extracted CredentialsRequest manifests
+      ansible.builtin.find:
+        paths: "{{ update_manual_cloud_credentials_workspace }}/credrequests"
+        patterns: "*.yaml"
+      register: _update_cred_requests_files
+
+    # Same feature-gate exclusion as ocp/create_manual_cloud_credentials --
+    # these target namespaces that don't exist on a default-featureSet
+    # cluster and creating their Secret would just be dead weight (no
+    # bootstrap-wedge risk here since the cluster is already up, but no
+    # reason to create Secrets OLM/CVO will never reconcile against).
+    - name: Check whether a Secret already exists for each non-feature-gated CredentialsRequest
+      vars:
+        _cr: "{{ (lookup('ansible.builtin.file', item.path) | from_yaml) }}"
+        _feature_gated: >-
+          {{ (_cr.metadata.annotations | default({}) | list
+              | select('match', '^release\.openshift\.io/feature-(gate|set)$')
+              | list) | length > 0 }}
+      ansible.builtin.command: >
+        {{ bin_dir }}/oc get secret {{ _cr.spec.secretRef.name }}
+        -n {{ _cr.spec.secretRef.namespace }}
+        --kubeconfig {{ target_kubeconfig }}
+      register: _update_cred_secret_check
+      changed_when: false
+      failed_when: false
+      loop: "{{ _update_cred_requests_files.files }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+      when: not _feature_gated
+
+    - name: Record newly-introduced CredentialsRequests
+      ansible.builtin.set_fact:
+        _update_cred_requests_new: >-
+          {{
+            _update_cred_requests_new | default([]) + [{
+              'name': (lookup('ansible.builtin.file', item.item.path) | from_yaml).metadata.name,
+              'namespace': (lookup('ansible.builtin.file', item.item.path) | from_yaml).spec.secretRef.namespace,
+              'secret_name': (lookup('ansible.builtin.file', item.item.path) | from_yaml).spec.secretRef.name,
+            }]
+          }}
+      loop: "{{ _update_cred_secret_check.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.path | basename }}"
+      when:
+        - item.rc is defined
+        - item.rc != 0
+
+    - name: Create a long-lived credentials Secret for each new CredentialsRequest
+      kubernetes.core.k8s:
+        kubeconfig: "{{ target_kubeconfig }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          type: Opaque
+          metadata:
+            name: "{{ item.secret_name }}"
+            namespace: "{{ item.namespace }}"
+          stringData:
+            aws_access_key_id: "{{ aws.aws_access_key_id }}"
+            aws_secret_access_key: "{{ aws.aws_secret_access_key }}"
+      loop: "{{ _update_cred_requests_new | default([]) }}"
+      loop_control:
+        label: "{{ item.namespace }}/{{ item.secret_name }}"
+      no_log: true
+
+    - name: Display new CredentialsRequests summary
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            ['New CredentialsRequest(s) introduced by '
+             ~ openshift_version ~ '.' ~ ocp_patch_version ~ ':']
+            + (
+                (_update_cred_requests_new | default([]) | map(attribute='name') | list)
+                if (_update_cred_requests_new | default([]) | length > 0)
+                else ['  (none -- no new CredentialsRequests, existing credentials cover this release)']
+              )
+          }}
+
+    - name: Check current cloud-credential upgradeable-to annotation
+      ansible.builtin.shell: >
+        {{ bin_dir }}/oc get cloudcredential cluster
+        --kubeconfig {{ target_kubeconfig }}
+        -o jsonpath='{.metadata.annotations.cloudcredential\.openshift\.io/upgradeable-to}'
+      register: _cco_upgradeable_to
+      changed_when: false
+
+    - name: Annotate cloud-credential as upgradeable to the target version
+      ansible.builtin.command: >
+        {{ bin_dir }}/oc annotate cloudcredential cluster
+        --kubeconfig {{ target_kubeconfig }}
+        --overwrite
+        cloudcredential.openshift.io/upgradeable-to={{ openshift_version }}.{{ ocp_patch_version }}
+      changed_when: true
+      when: _cco_upgradeable_to.stdout | default('') != (openshift_version ~ '.' ~ ocp_patch_version)
+
+    - name: Display cloud-credential upgradeable-to summary
+      ansible.builtin.debug:
+        msg: >-
+          cloudcredential.openshift.io/cluster annotated
+          cloudcredential.openshift.io/upgradeable-to={{ openshift_version }}.{{ ocp_patch_version }}
+          ({{ _update_cred_requests_new | default([]) | length }} new CredentialsRequest(s) handled)

@@ -87,15 +87,17 @@
     - (_cv_current_for_minor_check.stdout | default('') | regex_replace('^(\d+\.\d+)\..*$', '\1')) != (openshift_version | string)
 
 # ClusterVersionOverridesSet (the insights-operator override disable_telemetry
-# sets) is the one Upgradeable=False reason this update path already handles
-# on its own, in update_ocp_hub -- don't fail preflight over it, or every
-# minor bump looks blocked by something that isn't actually a blocker.
-# AdminAckRequired and MissingUpgradeableAnnotation are deliberately NOT
-# filtered here (see the comment above): those require a human to read
-# release notes and take a real action (ack a release-specific warning,
-# regenerate CredentialsRequests in Manual credentials mode) before this
-# tool proceeds -- silently working around them would defeat the point of
-# the gate.
+# sets) and MissingUpgradeableAnnotation (the cloud-credential upgradeable-to
+# annotation, Manual credentials mode) are the two Upgradeable=False reasons
+# this update path already handles on its own -- update_ocp_hub removes the
+# override automatically, and ocp/update_manual_cloud_credentials (called
+# from update_ocp_hub and acm/update_ocp_spoke) re-extracts CredentialsRequests
+# from the target release and sets the annotation automatically. Don't fail
+# preflight over either, or every minor bump looks blocked by something
+# that isn't actually a blocker. AdminAckRequired is deliberately NOT
+# filtered here: it requires a human to read release notes and take a real
+# action (e.g. ack the 4.21 Sigstore admin-ack) before this tool proceeds --
+# silently working around it would defeat the point of the gate.
 - name: "[Update] Assert cluster is Upgradeable before a minor version bump"
   ansible.builtin.assert:
     that: >-
@@ -105,18 +107,20 @@
       This is a minor version bump ({{ _cv_current_for_minor_check.stdout }} ->
       {{ openshift_version }}.{{ ocp_patch_version }}) but the cluster is not
       Upgradeable for reason(s) requiring action (ClusterVersionOverridesSet
-      is excluded here -- update_ocp_hub removes that automatically):
+      and MissingUpgradeableAnnotation are excluded here -- update_ocp_hub /
+      ocp/update_manual_cloud_credentials handle those automatically):
       {{ _cv_upgradeable_remaining_reasons | join(', ') }}.
       Full CVO message: {{ (_cv_upgradeable.stdout | from_json).message }}
     success_msg: >-
       Cluster is Upgradeable for this minor version bump (or only blocked by
-      ClusterVersionOverridesSet, which update_ocp_hub removes automatically)
+      reasons this update path already handles automatically)
   vars:
     _cv_upgradeable_remaining_reasons: >-
       {{
         (((_cv_upgradeable.stdout | from_json).reason | default(''))
           .split(','))
         | reject('equalto', 'ClusterVersionOverridesSet')
+        | reject('equalto', 'MissingUpgradeableAnnotation')
         | reject('equalto', '')
         | list
       }}
