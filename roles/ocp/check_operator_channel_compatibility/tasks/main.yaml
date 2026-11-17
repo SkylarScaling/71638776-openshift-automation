@@ -19,6 +19,27 @@
     state: directory
     mode: '0755'
 
+# Same mirror.openshift.com host/path layout already used below for opm --
+# release.txt's "Name:" line is the openshift-install binary's preconfigured
+# release for this minor, i.e. the latest z-stream. Must use
+# `args: executable: /bin/bash` so `set -o pipefail` actually applies --
+# without it, a bad/nonexistent minor silently "succeeds" with empty stdout
+# instead of failing on curl's non-zero rc.
+- name: Discover the latest available OCP patch version for the target minor
+  ansible.builtin.shell: >
+    set -o pipefail;
+    curl -fsSL https://mirror.openshift.com/pub/openshift-v4/clients/ocp/latest-{{ target_ocp_version }}/release.txt
+    | awk '/^Name:/ {print $2; exit}'
+  args:
+    executable: /bin/bash
+  register: _latest_ocp_patch
+  changed_when: false
+  failed_when: false
+
+- name: Set latest OCP patch version fact
+  ansible.builtin.set_fact:
+    _latest_ocp_patch_version: "{{ _latest_ocp_patch.stdout | trim }}"
+
 # `opm render` ignores REGISTRY_AUTH_FILE entirely (unlike oc/skopeo) --
 # confirmed live: with only REGISTRY_AUTH_FILE set it falls through to
 # anonymous auth and registry.redhat.io 401s, even though the exact same
@@ -276,6 +297,13 @@
     _compat_summary_text: |-
       ==================================================================
       Operator Channel Compatibility Summary -- target OCP {{ target_ocp_version }}
+      ==================================================================
+      {% if _latest_ocp_patch_version %}
+      Latest available OCP patch for {{ target_ocp_version }}: {{ _latest_ocp_patch_version }}
+        -> set openshift_version: "{{ target_ocp_version }}", ocp_patch_version: "{{ _latest_ocp_patch_version[(target_ocp_version | length + 1):] }}" in your inventory
+      {% else %}
+      Could not determine the latest OCP patch version for {{ target_ocp_version }} (mirror.openshift.com lookup failed -- check connectivity or that {{ target_ocp_version }} is a real, released minor).
+      {% endif %}
       ==================================================================
       {% if _compat_needs_update | length > 0 %}
       INVENTORY UPDATE NEEDED ({{ _compat_needs_update | length }} operator{{ 's' if _compat_needs_update | length != 1 else '' }}):
