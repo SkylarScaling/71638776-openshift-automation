@@ -2,3 +2,9 @@
 mirror_base_path: "{{ disconnected.mirror_base_path | default('ocp4') }}"
 oc_mirror_workspace: "{{ working_dir }}/oc-mirror-workspace"
 mirror_registry_dir: "{{ working_dir }}/mirror-registry"
+# run-oc-mirror-with-retry.yaml (shared with ocp/mirror_update_content):
+# how many times to re-run the whole oc-mirror invocation when it fails with
+# a transient collection-phase network error, and how long to wait between
+# attempts.
+oc_mirror_retry_max_attempts: 3
+oc_mirror_retry_delay_seconds: 30

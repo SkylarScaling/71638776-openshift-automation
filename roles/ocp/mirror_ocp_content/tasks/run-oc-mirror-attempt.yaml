@@ -1,0 +1,81 @@
+---
+# One attempt within run-oc-mirror-with-retry.yaml's loop. See that file for
+# the full rationale/contract.
+
+- name: "Run oc-mirror (attempt {{ _oc_mirror_attempt }}/{{ oc_mirror_retry_max_attempts | default(3) }})"
+  ansible.builtin.command: "{{ oc_mirror_retry_cmd }}"
+  environment: "{{ oc_mirror_retry_env | default({'XDG_RUNTIME_DIR': oc_mirror_retry_workspace}) }}"
+  args:
+    chdir: "{{ oc_mirror_retry_workspace }}"
+  async: 7200
+  poll: 0
+  register: _oc_mirror_retry_job
+  when: not _oc_mirror_retry_succeeded
+
+- name: "Wait for oc-mirror to complete (attempt {{ _oc_mirror_attempt }}, up to 2 hours)"
+  ansible.builtin.async_status:
+    jid: "{{ _oc_mirror_retry_job.ansible_job_id }}"
+  register: oc_mirror_retry_final
+  until: oc_mirror_retry_final.finished
+  retries: 240
+  delay: 30
+  when:
+    - not _oc_mirror_retry_succeeded
+    - _oc_mirror_retry_job is defined
+    - _oc_mirror_retry_job.ansible_job_id is defined
+
+# rc=4: partial success — manifest format incompatibility with certain multi-arch images.
+# rc=12/14: partial failure — transient network errors or auth issues for a subset of images.
+#           IDMS is still generated; failed images are retried by the caller afterward.
+- name: Mark oc-mirror as succeeded
+  ansible.builtin.set_fact:
+    _oc_mirror_retry_succeeded: true
+  when:
+    - not _oc_mirror_retry_succeeded
+    - oc_mirror_retry_final is defined
+    - oc_mirror_retry_final.finished | default(false)
+    - oc_mirror_retry_final.rc in [0, 4, 12, 14]
+
+- name: Determine if this failure looks like a transient collection-phase network error
+  ansible.builtin.set_fact:
+    _oc_mirror_retry_transient: >-
+      {{
+        (oc_mirror_retry_final.rc | default(0)) == 2
+        and (oc_mirror_retry_final.stdout | default('') is search('(?i)(connection reset|: eof|i/o timeout|tls handshake timeout)'))
+      }}
+  when:
+    - not _oc_mirror_retry_succeeded
+    - oc_mirror_retry_final is defined
+    - oc_mirror_retry_final.finished | default(false)
+
+- name: "Fail if oc-mirror hit a non-transient error (attempt {{ _oc_mirror_attempt }})"
+  ansible.builtin.fail:
+    msg: >-
+      oc-mirror failed with rc={{ oc_mirror_retry_final.rc }}, which doesn't
+      match the narrow transient-network class this retry handles (connection
+      reset/EOF/timeout during collection). stdout:
+      {{ oc_mirror_retry_final.stdout }}
+  when:
+    - not _oc_mirror_retry_succeeded
+    - oc_mirror_retry_final is defined
+    - oc_mirror_retry_final.finished | default(false)
+    - not (_oc_mirror_retry_transient | default(false))
+
+- name: "Fail if oc-mirror exhausted all transient-retry attempts"
+  ansible.builtin.fail:
+    msg: >-
+      oc-mirror failed with a transient-looking network error on all
+      {{ oc_mirror_retry_max_attempts | default(3) }} attempts. Last stdout:
+      {{ oc_mirror_retry_final.stdout }}
+  when:
+    - not _oc_mirror_retry_succeeded
+    - _oc_mirror_retry_transient | default(false)
+    - _oc_mirror_attempt == (oc_mirror_retry_max_attempts | default(3) | int)
+
+- name: Pause before retrying oc-mirror after a transient error
+  ansible.builtin.pause:
+    seconds: "{{ oc_mirror_retry_delay_seconds | default(30) }}"
+  when:
+    - not _oc_mirror_retry_succeeded
+    - _oc_mirror_retry_transient | default(false)
+    - _oc_mirror_attempt < (oc_mirror_retry_max_attempts | default(3) | int)

@@ -1,0 +1,35 @@
+---
+# Shared by ocp/mirror_ocp_content (initial install) and ocp/mirror_update_content
+# (Day 2 updates) -- a single-shot HTTP GET inside oc-mirror's collection phase
+# (e.g. a release-signature fetch from mirror.openshift.com's CDN) has no
+# retry/backoff of its own. Confirmed live 2026-11-16: a one-off CDN edge
+# connection reset aborted an entire run in under 2 seconds with rc=2, on a
+# brand-new jumphost with otherwise rock-solid connectivity (8/8 immediate
+# manual retries of the same URL succeeded right after). Retry the WHOLE
+# oc-mirror invocation (oc-mirror exposes no control over retrying that one
+# internal HTTP call) when the failure looks like this narrow transient-
+# network class; anything else reproduces identically on every attempt and
+# correctly exhausts all retries without wasting hours of async wait time.
+#
+# Caller must set before including this file:
+#   oc_mirror_retry_cmd       - the full oc-mirror command line (string)
+#   oc_mirror_retry_workspace - chdir for the command
+# Optional:
+#   oc_mirror_retry_env              - environment dict (default: {XDG_RUNTIME_DIR: oc_mirror_retry_workspace})
+#   oc_mirror_retry_already_complete - skip entirely if true (idempotency guard)
+#   oc_mirror_retry_max_attempts / oc_mirror_retry_delay_seconds - see defaults/main.yaml
+#
+# Sets on completion: oc_mirror_retry_final (same shape async_status returns:
+# .rc / .finished / .stdout), for the caller's own downstream rc checks.
+
+- name: Initialize oc-mirror retry state
+  ansible.builtin.set_fact:
+    _oc_mirror_retry_succeeded: false
+  when: not (oc_mirror_retry_already_complete | default(false))
+
+- name: Run oc-mirror with transient-network-error retry
+  ansible.builtin.include_tasks: run-oc-mirror-attempt.yaml
+  loop: "{{ range(1, (oc_mirror_retry_max_attempts | default(3) | int) + 1) | list }}"
+  loop_control:
+    loop_var: _oc_mirror_attempt
+  when: not (oc_mirror_retry_already_complete | default(false))

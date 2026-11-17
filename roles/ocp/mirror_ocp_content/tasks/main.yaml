@@ -145,37 +145,29 @@
     mode: '0600'
   when: not _oc_mirror_complete
 
-- name: Run oc-mirror to mirror content to registry
-  ansible.builtin.command: >
-    {{ bin_dir }}/oc-mirror
-    --v2
-    --config {{ oc_mirror_workspace }}/imageset-config.yaml
-    --workspace file://{{ oc_mirror_workspace }}
-    docker://{{ mirror_registry_url }}/{{ mirror_base_path }}
-  environment:
-    XDG_RUNTIME_DIR: "{{ oc_mirror_workspace }}"
-  args:
-    chdir: "{{ oc_mirror_workspace }}"
-  async: 7200
-  poll: 0
-  register: oc_mirror_job
+- name: Run oc-mirror to mirror content to registry (with transient-network-error retry)
+  ansible.builtin.include_tasks: run-oc-mirror-with-retry.yaml
+  vars:
+    oc_mirror_retry_cmd: >-
+      {{ bin_dir }}/oc-mirror
+      --v2
+      --config {{ oc_mirror_workspace }}/imageset-config.yaml
+      --workspace file://{{ oc_mirror_workspace }}
+      docker://{{ mirror_registry_url }}/{{ mirror_base_path }}
+    oc_mirror_retry_workspace: "{{ oc_mirror_workspace }}"
+    oc_mirror_retry_already_complete: "{{ _oc_mirror_complete }}"
   when: not _oc_mirror_complete
 
-- name: Wait for oc-mirror to complete (up to 2 hours)
-  ansible.builtin.async_status:
-    jid: "{{ oc_mirror_job.ansible_job_id }}"
-  register: oc_mirror_result
-  until: oc_mirror_result.finished
-  retries: 240
-  delay: 30
-  when: oc_mirror_job is defined and oc_mirror_job.ansible_job_id is defined
-  # rc=4: partial success — manifest format incompatibility with certain multi-arch images.
-  # rc=12/14: partial failure — transient network errors or auth issues for a subset of images.
-  #           IDMS is still generated; failed images are retried below with oc image mirror.
-  # All are handled by the retry block below. Check working-dir/logs/mirroring_errors_*.txt.
-  failed_when:
-    - oc_mirror_result.finished
-    - oc_mirror_result.rc not in [0, 4, 12, 14]
+# rc=4: partial success — manifest format incompatibility with certain multi-arch images.
+# rc=12/14: partial failure — transient network errors or auth issues for a subset of images.
+#           IDMS is still generated; failed images are retried below with oc image mirror.
+# All are handled by the retry block below. Check working-dir/logs/mirroring_errors_*.txt.
+- name: Alias final oc-mirror result for downstream rc checks
+  ansible.builtin.set_fact:
+    oc_mirror_result: "{{ oc_mirror_retry_final }}"
+  when:
+    - not _oc_mirror_complete
+    - oc_mirror_retry_final is defined
 
 # ==============================================================================
 # WORKAROUND: oc-mirror v2 manifest format bug
