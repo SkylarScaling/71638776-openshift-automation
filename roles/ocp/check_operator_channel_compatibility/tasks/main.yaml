@@ -35,13 +35,29 @@
 # opm isn't part of this repo's usual prerequisites (only oc-mirror is) -- it's
 # only needed for this standalone compatibility check, so it's downloaded here
 # rather than added to install_disconnected_prerequisites. Matches the target
-# OCP minor's client tools, same mirror.openshift.com layout oc/oc-mirror/
-# openshift-install already come from (install_ocp_prerequisites,
-# install_disconnected_prerequisites).
+# OCP minor's client tools, from the same mirror.openshift.com layout oc/
+# oc-mirror/openshift-install already come from -- but UNLIKE those, opm's
+# tarball is not a flat single binary named `opm`: it ships OS-suffixed
+# (opm-linux.tar.gz -> opm-rhel8, opm-linux-rhel9.tar.gz -> opm-rhel9).
+# Confirmed live (control node is RHEL 9): extracting opm-linux.tar.gz
+# "succeeds" but silently leaves {{ bin_dir }}/opm-rhel8 on disk, not
+# {{ bin_dir }}/opm, so the very next task calling `opm` fails with ENOENT
+# despite the download reporting no error. Use the rhel9 tarball and rename
+# explicitly rather than relying on `tar --transform` inside unarchive.
 - name: Download and extract opm matching the target OCP minor's client tools
   ansible.builtin.unarchive:
-    src: "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/latest-{{ target_ocp_version }}/opm-linux.tar.gz"
+    src: "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/latest-{{ target_ocp_version }}/opm-linux-rhel9.tar.gz"
     dest: "{{ bin_dir }}"
+    remote_src: yes
+    mode: '0755'
+  when: >
+    force_update | default(false) | bool or
+    _opm_version_check.rc != 0
+
+- name: Rename extracted opm-rhel9 binary to opm
+  ansible.builtin.copy:
+    src: "{{ bin_dir }}/opm-rhel9"
+    dest: "{{ bin_dir }}/opm"
     remote_src: yes
     mode: '0755'
   when: >
