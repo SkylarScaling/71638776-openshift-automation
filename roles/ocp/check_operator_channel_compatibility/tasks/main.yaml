@@ -180,9 +180,13 @@
     _compat_needs_update: "{{ _compat_rows | selectattr('missing', '!=', []) | list }}"
     _compat_ok: "{{ _compat_rows | selectattr('missing', '==', []) | list }}"
 
-- name: "[Summary] Operator channel compatibility for target OCP {{ target_ocp_version }}"
-  ansible.builtin.debug:
-    msg: |-
+# debug's `msg:` as a single multi-line string gets JSON-escaped (literal
+# \n) by Ansible's default output callback, unreadable in the terminal.
+# Split into a list of lines instead -- debug prints each list element on
+# its own line with no escaping.
+- name: Build summary text
+  ansible.builtin.set_fact:
+    _compat_summary_text: |-
       ==================================================================
       Operator Channel Compatibility Summary -- target OCP {{ target_ocp_version }}
       ==================================================================
@@ -210,3 +214,7 @@
       bundle on that channel is certified for OCP {{ target_ocp_version }}.
       Always cross-check the operator's own release notes before upgrading.
       ==================================================================
+
+- name: "[Summary] Operator channel compatibility for target OCP {{ target_ocp_version }}"
+  ansible.builtin.debug:
+    msg: "{{ _compat_summary_text.split('\n') }}"
