@@ -111,6 +111,35 @@
   changed_when: true
   when: disconnected.community_operators | default([]) | length > 0
 
+# Used below as a best-effort "did this package get renamed/merged" signal
+# when a configured operator has zero channels in the target catalog. OLM
+# catalogs have no "this package was renamed to X" field -- Red Hat does
+# rename/merge operators across OCP minors (ODF packages in particular) with
+# no catalog-level pointer to the replacement -- so this is name-similarity
+# only, not authoritative. Always confirm manually via the operator's release
+# notes.
+- name: Get full package list from the target redhat-operator-index catalog
+  ansible.builtin.shell: >
+    set -o pipefail;
+    jq -s '[.[] | select(.schema=="olm.package") | .name] | unique | sort'
+    {{ operator_compat_workspace }}/redhat-operator-index.json
+  args:
+    executable: /bin/bash
+  register: _redhat_catalog_all_packages
+  changed_when: false
+  when: disconnected.operators | default([]) | length > 0
+
+- name: Get full package list from the target community-operator-index catalog
+  ansible.builtin.shell: >
+    set -o pipefail;
+    jq -s '[.[] | select(.schema=="olm.package") | .name] | unique | sort'
+    {{ operator_compat_workspace }}/community-operator-index.json
+  args:
+    executable: /bin/bash
+  register: _community_catalog_all_packages
+  changed_when: false
+  when: disconnected.community_operators | default([]) | length > 0
+
 - name: Look up each configured redhat operator's channels in the target catalog
   ansible.builtin.shell: >
     set -o pipefail;
@@ -149,11 +178,22 @@
   vars:
     _configured: "{{ item.item.channels | default([]) | map(attribute='name') | list }}"
     _available: "{{ item.stdout | from_json }}"
+    _all_packages: "{{ _redhat_catalog_all_packages.stdout | from_json }}"
+    _name_tokens: "{{ item.item.name.split('-') | reject('in', ['operator', 'csi', 'addons']) | list }}"
     _compat_row:
       name: "{{ item.item.name }}"
       configured: "{{ _configured }}"
       available: "{{ _available }}"
       missing: "{{ _configured | difference(_available) }}"
+      candidates: >-
+        {{
+          (_all_packages
+            | reject('equalto', item.item.name)
+            | select('search', '(' ~ (_name_tokens | map('regex_escape') | join('|')) ~ ')')
+            | list)
+          if (_available | length == 0 and _name_tokens | length > 0)
+          else []
+        }}
   loop: "{{ _redhat_operator_channels.results | default([]) }}"
   loop_control:
     label: "{{ item.item.name }}"
@@ -165,11 +205,22 @@
   vars:
     _configured: "{{ item.item.channels | default([]) | map(attribute='name') | list }}"
     _available: "{{ item.stdout | from_json }}"
+    _all_packages: "{{ _community_catalog_all_packages.stdout | from_json }}"
+    _name_tokens: "{{ item.item.name.split('-') | reject('in', ['operator', 'csi', 'addons']) | list }}"
     _compat_row:
       name: "{{ item.item.name }}"
       configured: "{{ _configured }}"
       available: "{{ _available }}"
       missing: "{{ _configured | difference(_available) }}"
+      candidates: >-
+        {{
+          (_all_packages
+            | reject('equalto', item.item.name)
+            | select('search', '(' ~ (_name_tokens | map('regex_escape') | join('|')) ~ ')')
+            | list)
+          if (_available | length == 0 and _name_tokens | length > 0)
+          else []
+        }}
   loop: "{{ _community_operator_channels.results | default([]) }}"
   loop_control:
     label: "{{ item.item.name }}"
@@ -196,6 +247,13 @@
         - {{ row.name }}
             Configured channel(s) not found for OCP {{ target_ocp_version }}: {{ row.missing | join(', ') }}
             Available channels in the v{{ target_ocp_version }} catalog: {{ row.available | join(', ') if row.available | length > 0 else '(none -- package may have been removed/renamed)' }}
+      {% if row.available | length == 0 %}
+      {% if row.candidates | default([]) | length > 0 %}
+            Possible replacement package(s) (name similarity only, NOT confirmed -- verify manually): {{ row.candidates | join(', ') }}
+      {% else %}
+            No similarly-named package found in the target catalog either -- check the operator's release notes directly.
+      {% endif %}
+      {% endif %}
             Update disconnected.operators[].channels (or disconnected.community_operators[].channels) for '{{ row.name }}' in your inventory.
       {% endfor %}
       {% else %}
