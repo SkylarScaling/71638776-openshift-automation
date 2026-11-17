@@ -19,10 +19,17 @@
     state: directory
     mode: '0755'
 
-- name: Build auth.json from the Red Hat pull secret (opm needs to read registry.redhat.io)
+# `opm render` ignores REGISTRY_AUTH_FILE entirely (unlike oc/skopeo) --
+# confirmed live: with only REGISTRY_AUTH_FILE set it falls through to
+# anonymous auth and registry.redhat.io 401s, even though the exact same
+# credentials file works fine for `oc image info ... -a <file>`. opm's
+# underlying resolver only reads Docker-style config, i.e.
+# $DOCKER_CONFIG/config.json -- the filename must be exactly config.json,
+# not just any file pointed to by an env var.
+- name: Build config.json from the Red Hat pull secret (opm only reads DOCKER_CONFIG/config.json)
   ansible.builtin.copy:
     content: "{{ pull_secret | to_nice_json }}"
-    dest: "{{ operator_compat_workspace }}/auth.json"
+    dest: "{{ operator_compat_workspace }}/config.json"
     mode: '0600'
   no_log: true
 
@@ -77,7 +84,7 @@
     }}
     -o json
   environment:
-    REGISTRY_AUTH_FILE: "{{ operator_compat_workspace }}/auth.json"
+    DOCKER_CONFIG: "{{ operator_compat_workspace }}"
   register: _redhat_catalog_render
   changed_when: false
   when: disconnected.operators | default([]) | length > 0
@@ -99,7 +106,7 @@
     }}
     -o json
   environment:
-    REGISTRY_AUTH_FILE: "{{ operator_compat_workspace }}/auth.json"
+    DOCKER_CONFIG: "{{ operator_compat_workspace }}"
   register: _community_catalog_render
   changed_when: false
   when: disconnected.community_operators | default([]) | length > 0
