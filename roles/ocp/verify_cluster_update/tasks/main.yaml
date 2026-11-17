@@ -115,10 +115,32 @@
       Cluster is Upgradeable for this minor version bump (or only blocked by
       reasons this update path already handles automatically)
   vars:
+    # The CVO's `.reason` is a single CamelCase token, not a comma-joined
+    # list of the individual causes -- when more than one applies it's
+    # literally the string "MultipleReasons", and the real per-cause names
+    # only appear inline in `.message` (confirmed live: "...for multiple
+    # reasons: ClusterVersionOverridesSet,AdminAckRequired,
+    # MissingUpgradeableAnnotation\n* ..."). Extract that comma-joined list
+    # from the message when reason is the "MultipleReasons" placeholder;
+    # otherwise `.reason` itself is already the one real cause.
+    _cv_upgradeable_reason: "{{ (_cv_upgradeable.stdout | from_json).reason | default('') }}"
+    # regex_search with one backref group returns a one-element list (not a
+    # bare string) on this Ansible version -- confirmed live via a scratch
+    # playbook. `first` unwraps it; `default('', true)` covers both "no
+    # match" (None) and an empty list.
+    _cv_upgradeable_all_reasons: >-
+      {{
+        (((_cv_upgradeable.stdout | from_json).message
+          | default('')
+          | regex_search('for multiple reasons:\s*([A-Za-z,]+)', '\1')
+          | default([], true)
+        ) | first | default('', true)).split(',')
+        if _cv_upgradeable_reason == 'MultipleReasons'
+        else [_cv_upgradeable_reason]
+      }}
     _cv_upgradeable_remaining_reasons: >-
       {{
-        (((_cv_upgradeable.stdout | from_json).reason | default(''))
-          .split(','))
+        _cv_upgradeable_all_reasons
         | reject('equalto', 'ClusterVersionOverridesSet')
         | reject('equalto', 'MissingUpgradeableAnnotation')
         | reject('equalto', '')
