@@ -267,7 +267,7 @@
       {% endfor %}
       {% endif %}
       ==================================================================
-      Reminder: "present in catalog" only proves the channel name still exists
+      Reminder: 'present in catalog' only proves the channel name still exists
       for OCP {{ target_ocp_version }} -- it does not confirm the operator's
       bundle on that channel is certified for OCP {{ target_ocp_version }}.
       Always cross-check the operator's own release notes before upgrading.
