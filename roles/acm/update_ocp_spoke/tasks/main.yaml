@@ -70,6 +70,20 @@
     target_kubeconfig: "{{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig"
   when: _spoke_is_minor_bump | bool
 
+# Registry-config is a control-node-local read against quay.io/the mirror
+# registry (oc adm release info / oc image info), not an in-cluster call --
+# any cluster's mirror-workspace auth.json works for verifying any other
+# cluster's Sigstore artifact, so reuse the hub's update workspace rather
+# than standing up a spoke-specific one.
+- name: Acknowledge the Sigstore admin-gate for this spoke's minor version upgrade
+  ansible.builtin.include_role:
+    name: ocp/ack_release_signature_gate
+  vars:
+    target_kubeconfig: "{{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig"
+    _release_registry_config: "{{ working_dir }}/oc-mirror-workspace-update/containers/auth.json"
+    _release_sig_mirror_dest_prefix: "{{ quay_registry_url }}/{{ quay_mirror_org }}"
+  when: _spoke_is_minor_bump | bool
+
 - name: Create ClusterImageSet pointing at the mirrored release in Quay
   ansible.builtin.shell:
     cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"

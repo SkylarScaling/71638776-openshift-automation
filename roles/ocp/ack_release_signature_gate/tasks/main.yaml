@@ -1,0 +1,135 @@
+---
+# ==============================================================================
+# DAY 2: AUTO-ACKNOWLEDGE THE SIGSTORE RELEASE-SIGNATURE ADMIN-ACK GATE
+#
+# OCP 4.21 introduced an admin-ack gate (confirmed live: key
+# ack-4.20-sigstore-in-4.21, sourced from the target cluster's
+# openshift-config-managed/admin-gates ConfigMap) requiring a human to
+# confirm any configured mirror actually contains the Sigstore signature
+# artifact for the release being upgraded to, before a minor bump is
+# allowed. ocp/mirror_ocp_content's mirror-release-signature.yaml task
+# already mirrors that artifact on every mirror run.
+#
+# CAUTION: admin-ack gates exist specifically so a human reads the release
+# notes for what they're acknowledging before a minor bump proceeds --
+# auto-acking defeats that safety purpose in general. This role only
+# auto-acks gate keys matching the well-understood "ack-*-sigstore-in-*"
+# naming pattern, and only after independently re-verifying (a live registry
+# read against the mirror, not trusting the mirror step's own earlier exit
+# code) that the target release's .sig artifact actually resolves there --
+# it never acks a key it doesn't recognize/can't verify itself, and it hard
+# FAILS (rather than silently skipping) if a recognized key is pending but
+# the signature isn't actually mirrored yet. Automated at the user's
+# explicit request, on the stated understanding that this pipeline is
+# tested/verified in lower environments before being pointed at production
+# clusters -- if that assumption ever stops holding, this is the role to
+# remove/gate back to manual (and ocp/verify_cluster_update's preflight
+# assert, which no longer hard-fails on AdminAckRequired, would need the
+# exclusion reverted too).
+#
+# Caller must set before including:
+#   target_kubeconfig                - cluster whose admin-acks gate is being
+#                                       acknowledged
+#   _release_registry_config         - local auth.json usable against
+#                                       quay.io and the mirror registry
+#                                       (control-node command, not run
+#                                       in-cluster -- any cluster's mirror
+#                                       workspace auth.json works for any
+#                                       cluster's ack)
+#   _release_sig_mirror_dest_prefix  - registry/org prefix the release
+#                                       image's Sigstore artifact was
+#                                       mirrored under (see
+#                                       mirror-release-signature.yaml)
+# ==============================================================================
+
+- name: Get Sigstore-related admin-gate keys required on the target cluster
+  ansible.builtin.shell: >
+    set -o pipefail;
+    {{ bin_dir }}/oc get configmap admin-gates -n openshift-config-managed
+    --kubeconfig {{ target_kubeconfig }} -o json
+    | jq -r '(.data // {}) | keys[] | select(test("^ack-.*-sigstore-in-.*$"))'
+  args:
+    executable: /bin/bash
+  register: _sigstore_gate_keys_raw
+  changed_when: false
+  failed_when: false
+
+- name: Set Sigstore gate keys fact
+  ansible.builtin.set_fact:
+    _sigstore_gate_keys: "{{ _sigstore_gate_keys_raw.stdout_lines | default([]) }}"
+
+- name: Get currently-acknowledged admin-acks keys
+  ansible.builtin.shell: >
+    set -o pipefail;
+    {{ bin_dir }}/oc get configmap admin-acks -n openshift-config
+    --kubeconfig {{ target_kubeconfig }} -o json
+    | jq -r '(.data // {}) | to_entries[] | select(.value=="true") | .key'
+  args:
+    executable: /bin/bash
+  register: _acked_gate_keys_raw
+  changed_when: false
+  failed_when: false
+  when: _sigstore_gate_keys | length > 0
+
+- name: Determine pending (not yet acknowledged) Sigstore gate keys
+  ansible.builtin.set_fact:
+    _sigstore_gate_keys_pending: "{{ _sigstore_gate_keys | difference(_acked_gate_keys_raw.stdout_lines | default([])) }}"
+  when: _sigstore_gate_keys | length > 0
+
+- name: Resolve the target release image digest
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc adm release info
+    quay.io/openshift-release-dev/ocp-release:{{ openshift_version }}.{{ ocp_patch_version }}-x86_64
+    --registry-config={{ _release_registry_config }}
+    -o jsonpath='{.digest}'
+  register: _ack_release_digest
+  changed_when: false
+  failed_when: false
+  when: _sigstore_gate_keys_pending | default([]) | length > 0
+
+- name: Verify the release's Sigstore signature artifact is actually mirrored
+  ansible.builtin.command: >
+    {{ bin_dir }}/oc image info
+    {{ _release_sig_mirror_dest_prefix }}/openshift/release-images:{{ _sig_tag }}
+    --registry-config={{ _release_registry_config }}
+    --insecure=true
+  vars:
+    _sig_tag: "{{ _ack_release_digest.stdout | trim | regex_replace('^sha256:', 'sha256-') }}.sig"
+  register: _ack_sig_check
+  changed_when: false
+  failed_when: false
+  when:
+    - _sigstore_gate_keys_pending | default([]) | length > 0
+    - _ack_release_digest.stdout | default('') | trim != ''
+
+- name: Fail if Sigstore admin-gate keys are pending but the signature isn't mirrored yet
+  ansible.builtin.fail:
+    msg: >-
+      Sigstore admin-gate key(s) {{ _sigstore_gate_keys_pending | join(', ') }}
+      are required for this minor bump, but the release signature artifact
+      ({{ _release_sig_mirror_dest_prefix }}/openshift/release-images:sha256-<digest>.sig)
+      could not be verified in the mirror. Run the mirror phase (--tags mirror)
+      first so ocp/mirror_ocp_content's signature-mirroring step has a chance
+      to run, then retry.
+  when:
+    - _sigstore_gate_keys_pending | default([]) | length > 0
+    - _ack_sig_check.rc | default(1) != 0
+
+- name: Acknowledge Sigstore admin-gate key(s) now confirmed mirrored
+  ansible.builtin.command: >
+    {{ bin_dir }}/oc patch configmap admin-acks -n openshift-config
+    --kubeconfig {{ target_kubeconfig }}
+    --type=merge
+    -p {{ ('{"data":{"' ~ item ~ '":"true"}}') | quote }}
+  loop: "{{ _sigstore_gate_keys_pending | default([]) }}"
+  changed_when: true
+  when: _ack_sig_check.rc | default(1) == 0
+
+- name: Display Sigstore admin-gate acknowledgement summary
+  ansible.builtin.debug:
+    msg: >-
+      {{
+        'Acknowledged Sigstore admin-gate key(s): ' ~ (_sigstore_gate_keys_pending | join(', '))
+        if (_sigstore_gate_keys_pending | default([]) | length > 0)
+        else 'No pending Sigstore admin-gate keys to acknowledge.'
+      }}

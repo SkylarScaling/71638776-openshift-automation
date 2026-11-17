@@ -71,6 +71,14 @@
     name: ocp/update_manual_cloud_credentials
   when: _hub_is_minor_bump | bool
 
+- name: Acknowledge the Sigstore admin-gate for the minor version upgrade
+  ansible.builtin.include_role:
+    name: ocp/ack_release_signature_gate
+  vars:
+    _release_registry_config: "{{ update_mirror_workspace }}/containers/auth.json"
+    _release_sig_mirror_dest_prefix: "{{ quay_registry_url }}/{{ quay_mirror_org }}"
+  when: _hub_is_minor_bump | bool
+
 - name: Look for an oc-mirror release signature ConfigMap for this version
   ansible.builtin.find:
     paths: "{{ update_mirror_workspace }}/working-dir/cluster-resources"

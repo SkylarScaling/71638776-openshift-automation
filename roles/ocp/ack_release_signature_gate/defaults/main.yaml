@@ -1,0 +1,3 @@
+---
+# Nothing to default -- target_kubeconfig, _release_registry_config, and
+# _release_sig_mirror_dest_prefix must be set by the caller (see tasks/main.yaml).

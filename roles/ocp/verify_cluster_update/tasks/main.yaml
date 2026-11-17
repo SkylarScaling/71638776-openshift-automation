@@ -86,18 +86,32 @@
     - verify_cluster_update_mode | default('preflight') == 'preflight'
     - (_cv_current_for_minor_check.stdout | default('') | regex_replace('^(\d+\.\d+)\..*$', '\1')) != (openshift_version | string)
 
-# ClusterVersionOverridesSet (the insights-operator override disable_telemetry
-# sets) and MissingUpgradeableAnnotation (the cloud-credential upgradeable-to
-# annotation, Manual credentials mode) are the two Upgradeable=False reasons
-# this update path already handles on its own -- update_ocp_hub removes the
-# override automatically, and ocp/update_manual_cloud_credentials (called
-# from update_ocp_hub and acm/update_ocp_spoke) re-extracts CredentialsRequests
-# from the target release and sets the annotation automatically. Don't fail
-# preflight over either, or every minor bump looks blocked by something
-# that isn't actually a blocker. AdminAckRequired is deliberately NOT
-# filtered here: it requires a human to read release notes and take a real
-# action (e.g. ack the 4.21 Sigstore admin-ack) before this tool proceeds --
-# silently working around it would defeat the point of the gate.
+# ClusterVersionOverridesSet (insights-operator override),
+# MissingUpgradeableAnnotation (cloud-credential upgradeable-to annotation,
+# Manual credentials mode), and AdminAckRequired (the well-understood
+# Sigstore-signature gate) are the three Upgradeable=False reasons this
+# update path now handles on its own: update_ocp_hub removes the override
+# automatically, ocp/update_manual_cloud_credentials re-extracts
+# CredentialsRequests and sets the annotation, and
+# ocp/ack_release_signature_gate re-verifies the mirrored signature and acks
+# the specific "ack-*-sigstore-in-*" key -- all called from update_ocp_hub /
+# acm/update_ocp_spoke before the actual upgrade is triggered. Don't fail
+# preflight over any of the three, or every minor bump looks blocked by
+# something that isn't actually a blocker.
+#
+# CAUTION: excluding AdminAckRequired here means this preflight check no
+# longer protects against an admin-ack reason this pipeline doesn't actually
+# know how to handle (future OCP releases may add unrelated admin-ack
+# gates). ocp/ack_release_signature_gate only acks the specific Sigstore key
+# pattern it can independently verify and hard-fails rather than silently
+# skipping an unmirrored signature, and the actual upgrade trigger
+# (update_ocp_hub's ClusterVersion wait / update_ocp_spoke's ClusterCurator
+# wait) will still eventually time out and fail if some other admin-ack
+# reason is left blocking the CVO in-cluster -- but that failure now surfaces
+# much later (after mirror/catalog/operators have already run) than it would
+# at this preflight check. Automated at the user's explicit request, on the
+# understanding this pipeline is tested/verified in lower environments
+# first; revert this exclusion if that assumption stops holding.
 - name: "[Update] Assert cluster is Upgradeable before a minor version bump"
   ansible.builtin.assert:
     that: >-
@@ -106,9 +120,10 @@
     fail_msg: >-
       This is a minor version bump ({{ _cv_current_for_minor_check.stdout }} ->
       {{ openshift_version }}.{{ ocp_patch_version }}) but the cluster is not
-      Upgradeable for reason(s) requiring action (ClusterVersionOverridesSet
-      and MissingUpgradeableAnnotation are excluded here -- update_ocp_hub /
-      ocp/update_manual_cloud_credentials handle those automatically):
+      Upgradeable for reason(s) requiring action (ClusterVersionOverridesSet,
+      MissingUpgradeableAnnotation, and AdminAckRequired are excluded here --
+      update_ocp_hub / ocp/update_manual_cloud_credentials /
+      ocp/ack_release_signature_gate handle those automatically):
       {{ _cv_upgradeable_remaining_reasons | join(', ') }}.
       Full CVO message: {{ (_cv_upgradeable.stdout | from_json).message }}
     success_msg: >-
@@ -143,6 +158,7 @@
         _cv_upgradeable_all_reasons
         | reject('equalto', 'ClusterVersionOverridesSet')
         | reject('equalto', 'MissingUpgradeableAnnotation')
+        | reject('equalto', 'AdminAckRequired')
         | reject('equalto', '')
         | list
       }}
