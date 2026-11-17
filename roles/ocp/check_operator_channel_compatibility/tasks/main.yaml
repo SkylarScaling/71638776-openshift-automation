@@ -74,8 +74,15 @@
 # `opm render` has no "just this package" flag -- it renders the whole
 # catalog's declarative config as NDJSON, filtered per-package below with jq.
 # This can take a few minutes for the full redhat-operator-index.
+#
+# MUST redirect straight to disk, never `register:` this output. The
+# rendered redhat-operator-index is ~200MB/3.2M lines -- confirmed live this
+# OOM-killed the Ansible worker (opm itself peaks under 300MB; `register`
+# capturing stdout/stdout_lines plus the shared-memory round-trip to the
+# parent process ballooned that to ~2.9GB on a 7.4GB jumphost with no swap,
+# "ERROR! A worker was found in a dead state" ~6.5 minutes into the task).
 - name: Render the target redhat-operator-index catalog (can take a few minutes)
-  ansible.builtin.command: >
+  ansible.builtin.shell: >
     {{ bin_dir }}/opm render
     registry.redhat.io/redhat/redhat-operator-index{{
       (':v' ~ target_ocp_version)
@@ -83,21 +90,14 @@
       else ('@sha256:' ~ redhat_operator_index_digest)
     }}
     -o json
+    > {{ operator_compat_workspace }}/redhat-operator-index.json
   environment:
     DOCKER_CONFIG: "{{ operator_compat_workspace }}"
-  register: _redhat_catalog_render
-  changed_when: false
-  when: disconnected.operators | default([]) | length > 0
-
-- name: Write rendered redhat-operators catalog to disk
-  ansible.builtin.copy:
-    content: "{{ _redhat_catalog_render.stdout }}"
-    dest: "{{ operator_compat_workspace }}/redhat-operator-index.json"
-    mode: '0644'
+  changed_when: true
   when: disconnected.operators | default([]) | length > 0
 
 - name: Render the target community-operator-index catalog (if configured)
-  ansible.builtin.command: >
+  ansible.builtin.shell: >
     {{ bin_dir }}/opm render
     registry.redhat.io/redhat/community-operator-index{{
       (':v' ~ target_ocp_version)
@@ -105,17 +105,10 @@
       else ('@sha256:' ~ community_operator_index_digest)
     }}
     -o json
+    > {{ operator_compat_workspace }}/community-operator-index.json
   environment:
     DOCKER_CONFIG: "{{ operator_compat_workspace }}"
-  register: _community_catalog_render
-  changed_when: false
-  when: disconnected.community_operators | default([]) | length > 0
-
-- name: Write rendered community-operators catalog to disk
-  ansible.builtin.copy:
-    content: "{{ _community_catalog_render.stdout }}"
-    dest: "{{ operator_compat_workspace }}/community-operator-index.json"
-    mode: '0644'
+  changed_when: true
   when: disconnected.community_operators | default([]) | length > 0
 
 - name: Look up each configured redhat operator's channels in the target catalog
