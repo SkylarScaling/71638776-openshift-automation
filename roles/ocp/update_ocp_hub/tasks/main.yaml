@@ -12,9 +12,9 @@
 # (release image + its signature, if any, now live in Quay).
 # ==============================================================================
 
-- name: Set target release image reference
+- name: Set target release image tag reference
   ansible.builtin.set_fact:
-    _hub_update_release_image: >-
+    _hub_update_release_image_tag: >-
       {{ quay_registry_url }}/{{ quay_mirror_org }}/openshift-release-dev/ocp-release:{{ openshift_version }}.{{ ocp_patch_version }}-x86_64
 
 - name: Check if ClusterVersion already reports the target version
@@ -31,8 +31,9 @@
 # upgrades"), confirmed live via the Upgradeable condition's own message.
 # This is the one Upgradeable-blocking cause this repo's own code
 # introduces (the other two -- the 4.21 Sigstore admin-ack and the
-# cloud-credential upgradeable-to annotation -- are left as manual
-# preflight-surfaced steps deliberately, see ocp/verify_cluster_update).
+# cloud-credential upgradeable-to annotation -- are now also handled
+# automatically below, see ocp/ack_release_signature_gate and
+# ocp/update_manual_cloud_credentials).
 # Temporarily remove it for the duration of a minor-version upgrade and
 # restore it once the update completes, rather than relying on --force to
 # paper over it as an accidental side effect.
@@ -78,6 +79,34 @@
     _release_registry_config: "{{ update_mirror_workspace }}/containers/auth.json"
     _release_sig_mirror_dest_prefix: "{{ quay_registry_url }}/{{ quay_mirror_org }}"
   when: _hub_is_minor_bump | bool
+
+# `oc adm upgrade --to-image` refuses ANY tag-based pull spec unless --force
+# is also set ("--to-image must be a by-digest pull spec, unless --force is
+# also set..."), confirmed live -- independent of whether a signature
+# ConfigMap exists below. Resolve the tag to its real digest up front so the
+# normal (non---force) path works whenever the image is reachable, rather
+# than relying on --force (a verification bypass) just to get past a
+# client-side tag-format check.
+- name: Resolve the target release image's digest
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc adm release info
+    {{ _hub_update_release_image_tag }}
+    --registry-config={{ update_mirror_workspace }}/containers/auth.json
+    --insecure=true
+    -o jsonpath='{.digest}'
+  register: _hub_update_release_digest
+  changed_when: false
+  failed_when: false
+  when: _hub_cv_current.stdout != (openshift_version ~ '.' ~ ocp_patch_version)
+
+- name: Set target release image reference (by digest when resolvable, else the tag)
+  ansible.builtin.set_fact:
+    _hub_update_release_image: >-
+      {{
+        (_hub_update_release_image_tag.split(':')[:-1] | join(':') ~ '@' ~ (_hub_update_release_digest.stdout | trim))
+        if (_hub_update_release_digest.stdout | default('') | trim != '')
+        else _hub_update_release_image_tag
+      }}
 
 - name: Look for an oc-mirror release signature ConfigMap for this version
   ansible.builtin.find:
