@@ -172,6 +172,13 @@
   ansible.builtin.set_fact:
     _compat_rows: []
 
+# Detects operators whose channel name is OCP-version-pinned by convention
+# (e.g. "stable-4.20") rather than tracking the operator's own release
+# numbering (e.g. ACM's "release-2.17", Quay's "stable-3.18") -- those never
+# contain the current OCP minor as a substring, so the substitution below is
+# a no-op for them and they correctly get no recommendation. Only the first
+# configured channel is considered, matching the defaultChannel convention
+# imageset-config.yaml.j2 already uses (channels[0]).
 - name: Build compatibility rows for redhat operators
   ansible.builtin.set_fact:
     _compat_rows: "{{ _compat_rows + [_compat_row] }}"
@@ -180,11 +187,19 @@
     _available: "{{ item.stdout | from_json }}"
     _all_packages: "{{ _redhat_catalog_all_packages.stdout | from_json }}"
     _name_tokens: "{{ item.item.name.split('-') | reject('in', ['operator', 'csi', 'addons']) | list }}"
+    _current_channel: "{{ _configured[0] | default('') }}"
+    _recommended_candidate: "{{ _current_channel | regex_replace('(?<![0-9])' ~ (openshift_version | regex_escape) ~ '(?![0-9])', target_ocp_version) }}"
     _compat_row:
       name: "{{ item.item.name }}"
       configured: "{{ _configured }}"
       available: "{{ _available }}"
       missing: "{{ _configured | difference(_available) }}"
+      recommended_channel: >-
+        {{
+          _recommended_candidate
+          if (_recommended_candidate != _current_channel and _recommended_candidate in _available)
+          else ''
+        }}
       candidates: >-
         {{
           (_all_packages
@@ -207,11 +222,19 @@
     _available: "{{ item.stdout | from_json }}"
     _all_packages: "{{ _community_catalog_all_packages.stdout | from_json }}"
     _name_tokens: "{{ item.item.name.split('-') | reject('in', ['operator', 'csi', 'addons']) | list }}"
+    _current_channel: "{{ _configured[0] | default('') }}"
+    _recommended_candidate: "{{ _current_channel | regex_replace('(?<![0-9])' ~ (openshift_version | regex_escape) ~ '(?![0-9])', target_ocp_version) }}"
     _compat_row:
       name: "{{ item.item.name }}"
       configured: "{{ _configured }}"
       available: "{{ _available }}"
       missing: "{{ _configured | difference(_available) }}"
+      recommended_channel: >-
+        {{
+          _recommended_candidate
+          if (_recommended_candidate != _current_channel and _recommended_candidate in _available)
+          else ''
+        }}
       candidates: >-
         {{
           (_all_packages
@@ -226,10 +249,23 @@
     label: "{{ item.item.name }}"
   when: disconnected.community_operators | default([]) | length > 0
 
-- name: Split compatibility rows into needs-update vs ok
+- name: Split compatibility rows into needs-update / recommended-bump / ok
   ansible.builtin.set_fact:
     _compat_needs_update: "{{ _compat_rows | selectattr('missing', '!=', []) | list }}"
-    _compat_ok: "{{ _compat_rows | selectattr('missing', '==', []) | list }}"
+    _compat_recommended: >-
+      {{
+        _compat_rows
+        | selectattr('missing', '==', [])
+        | selectattr('recommended_channel', '!=', '')
+        | list
+      }}
+    _compat_ok: >-
+      {{
+        _compat_rows
+        | selectattr('missing', '==', [])
+        | selectattr('recommended_channel', '==', '')
+        | list
+      }}
 
 # debug's `msg:` as a single multi-line string gets JSON-escaped (literal
 # \n) by Ansible's default output callback, unreadable in the terminal.
@@ -246,6 +282,9 @@
       {% for row in _compat_needs_update %}
         - {{ row.name }}
             Configured channel(s) not found for OCP {{ target_ocp_version }}: {{ row.missing | join(', ') }}
+      {% if row.recommended_channel %}
+            Recommended channel: {{ row.recommended_channel }} (confirmed present in the v{{ target_ocp_version }} catalog)
+      {% else %}
             Available channels in the v{{ target_ocp_version }} catalog: {{ row.available | join(', ') if row.available | length > 0 else '(none -- package may have been removed/renamed)' }}
       {% if row.available | length == 0 %}
       {% if row.candidates | default([]) | length > 0 %}
@@ -254,10 +293,18 @@
             No similarly-named package found in the target catalog either -- check the operator's release notes directly.
       {% endif %}
       {% endif %}
+      {% endif %}
             Update disconnected.operators[].channels (or disconnected.community_operators[].channels) for '{{ row.name }}' in your inventory.
       {% endfor %}
       {% else %}
       No channel renames detected -- every configured channel still exists in the v{{ target_ocp_version }} catalog. No inventory changes required.
+      {% endif %}
+      {% if _compat_recommended | length > 0 %}
+
+      RECOMMENDED CHANNEL BUMP ({{ _compat_recommended | length }} operator{{ 's' if _compat_recommended | length != 1 else '' }}, NOT required -- current channel still works, but a channel matching OCP {{ target_ocp_version }} is also available):
+      {% for row in _compat_recommended %}
+        - {{ row.name }}: {{ row.configured | join(', ') }} -> {{ row.recommended_channel }}
+      {% endfor %}
       {% endif %}
       {% if _compat_ok | length > 0 %}
 
