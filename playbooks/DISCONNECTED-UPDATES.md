@@ -20,9 +20,18 @@ graph and are out of scope here.
   components actually depend on each other. Each phase is its own tag, re-runnable
   independently, mirroring the existing `jumphost` / `hub` / `spokes` / `migrate_mirror`
   / `verify` tag structure in `hub-spoke-disconnected-setup.yaml`.
-- **Hub and spokes use the same split as initial provisioning**: the hub is
-  self-managed (direct `oc adm upgrade`), spokes are Hive/ACM-managed (`ClusterImageSet`
-  + `ClusterCurator`, the same primitives Hive/ACM already use to provision them).
+- **Hub and spokes both upgrade via a direct `oc adm upgrade --to-image=<digest>`**
+  against each cluster's own kubeconfig. Spokes initially also used ACM's
+  documented `ClusterCurator` (`desiredCuration: upgrade`) mechanism, but that
+  was found live to be fundamentally broken for a disconnected cluster:
+  curator validates `desiredUpdate` against the spoke's `availableUpdates`/
+  `conditionalUpdates`, both empty with no reachable Cincinnati graph, so the
+  curator job fails in seconds ("Provided version is not valid") while still
+  reporting `status: "True"` on its own `clustercurator-job` condition (only
+  `.reason` distinguishes success from `Job_failed`) — the real failure only
+  surfaced after a 2-hour poll timeout. `ClusterImageSet` is still created for
+  visibility/consistency with initial provisioning but is no longer
+  load-bearing for the upgrade itself.
 - **Reuse proven, bug-fixed logic** rather than re-implementing it: the new mirror
   role shares the `ImageSetConfiguration` template with `mirror_ocp_content` and
   the Quay repo-creation race workaround (`remirror_to_quay/tasks/converge_unauthorized.yml`,
@@ -43,8 +52,8 @@ graph and are out of scope here.
 | `ocp/update_catalog_source` | hub + spokes | Applies the new IDMS and patches the `redhat-operators` CatalogSource (hub directly, spokes via `ManifestWork`) to the freshly mirrored catalog digest. Reuses the same `ManifestWork` object names `patch_cluster_idms` created, so there is always exactly one steady-state object per cluster, not one per update. |
 | `ocp/approve_install_plans` | hub + spokes | Generic: finds OLM `Subscription`s in `UpgradePending` and approves their `InstallPlan` if `installPlanApproval: Manual`, then waits for the corresponding CSV to reach `Succeeded`. Not tied to any specific operator or version. |
 | `ocp/verify_cluster_update` | hub + spokes | Pre-flight (no ClusterOperator degraded, MCPs settled) and post-flight (ClusterVersion at target, ClusterOperators healthy, MCPs `Updated`) health gate. Mode selected by `verify_cluster_update_mode: preflight|postflight`. |
-| `ocp/update_ocp_hub` | hub only | Self-managed upgrade: `oc adm upgrade --to-image=<mirrored release tag> --allow-explicit-upgrade`, then the MCO-safe wait pattern until `ClusterVersion` reports the target version and is no longer `Progressing`. |
-| `acm/update_ocp_spoke` | spokes (via hub) | Hive/ACM-managed upgrade: creates/reuses a `ClusterImageSet` pointing at the Quay-mirrored release image for the target version, then applies a `ClusterCurator` (`desiredCuration: upgrade`) and waits for it to report success and for the spoke's reported version to match. |
+| `ocp/update_ocp_hub` | hub only | Self-managed upgrade: resolves the mirrored release's digest, `oc adm upgrade --to-image=<digest> --allow-explicit-upgrade`, then the MCO-safe wait pattern until `ClusterVersion` reports the target version and is no longer `Progressing`. |
+| `acm/update_ocp_spoke` | spokes (own kubeconfig) | Same direct `oc adm upgrade --to-image=<digest>` approach as the hub, run against the spoke's own kubeconfig (not ACM's `ClusterCurator`, which doesn't work in a disconnected environment — see above). Also still creates/reuses a `ClusterImageSet` for visibility/consistency with initial provisioning. |
 | `ocp/update_manual_cloud_credentials` | hub + spokes | Day 2 counterpart to `ocp/create_manual_cloud_credentials`. Minor bumps on a `credentialsMode: Manual` cluster are blocked by `MissingUpgradeableAnnotation` on the CVO `Upgradeable` condition until `cloudcredential.operator.openshift.io/cluster` is annotated `cloudcredential.openshift.io/upgradeable-to: "<target>"`. Re-extracts `CredentialsRequest`s from the target release image, creates a Secret for any that are new (this repo reuses the same long-lived AWS admin credentials for every `CredentialsRequest`, so there's no IAM policy to diff — just new namespaces/Secrets), prints what's new, then sets the annotation. No-op on non-Manual clusters. Called from `update_ocp_hub`/`update_ocp_spoke` only on a minor bump; `ocp/verify_cluster_update`'s preflight assertion excludes `MissingUpgradeableAnnotation` accordingly (same treatment as `ClusterVersionOverridesSet`). |
 
 ## Standalone: `check-operator-channels.yaml`

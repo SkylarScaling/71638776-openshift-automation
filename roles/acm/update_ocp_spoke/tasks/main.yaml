@@ -2,16 +2,24 @@
 # ==============================================================================
 # UPDATE OCP ON A HIVE/ACM-MANAGED SPOKE
 #
-# Spokes were provisioned via Hive/ACM, so they upgrade the same way: a
-# ClusterImageSet pointing at the mirrored release image, resolved by ACM's
-# curator controller via a ClusterCurator CR — the same disconnected-upgrade
-# pattern Red Hat documents for ACM-managed clusters, using the same
-# ClusterImageSet naming convention acm/configure_disconnected_hub already
-# uses for initial provisioning (img<version>-x86-64-appsub).
+# ClusterCurator (the Red Hat-documented ACM upgrade mechanism) does NOT work
+# for a disconnected spoke: confirmed live it validates spec.upgrade.
+# desiredUpdate against the spoke ClusterVersion's availableUpdates/
+# conditionalUpdates, which are both empty with no reachable Cincinnati graph
+# (RetrievedUpdates=False, RemoteFailed) -- the curator job fails in ~40s
+# with "Provided version is not valid" and the spoke's ClusterVersion is
+# never touched at all. Worse, the ClusterCurator's own
+# status.conditions[clustercurator-job].status is "True" even on that
+# failure (only .reason distinguishes success from Job_failed), so a status
+# == "True" wait silently "succeeds" and the real failure only surfaces
+# ~2 hours later when the managed-cluster-version poll times out.
 #
-# Runs against the hub (target_kubeconfig = hub_kubeconfig) — ClusterImageSet
-# and ClusterCurator are hub-side resources; ocp_cluster.name identifies which
-# spoke namespace to target.
+# Fixed by driving the spoke's own ClusterVersion directly instead, exactly
+# like ocp/update_ocp_hub does for the hub itself (an explicit
+# --to-image=<digest> bypasses the Cincinnati graph requirement entirely) --
+# just targeting the spoke's own kubeconfig rather than the hub's.
+# ClusterImageSet is still created below for visibility/consistency with
+# initial provisioning, but is not load-bearing for this upgrade path.
 #
 # Prerequisites: ocp/mirror_update_content must have run first in this play.
 # ==============================================================================
@@ -24,15 +32,9 @@
   register: _spoke_current_version
   changed_when: false
 
-# Same insights-operator ClusterVersion-override gap as update_ocp_hub, but
-# unlike the hub, ClusterCurator has no --force equivalent at all (confirmed
-# via `oc explain clustercurator.spec.upgrade --recursive`: channel,
-# desiredUpdate, intermediateUpdate, monitorTimeout, nodePoolNames,
-# overrideJob, posthook, prehook -- no force field) -- a spoke minor upgrade
-# would have no way around "Disabling ownership via cluster version
-# overrides prevents upgrades" otherwise. Operate on the spoke's own
-# kubeconfig directly (same convention as ocp/patch_cluster_idms's per-spoke
-# tasks), not target_kubeconfig (the hub).
+# Same insights-operator ClusterVersion-override gap as update_ocp_hub.
+# Operate on the spoke's own kubeconfig directly (same convention as
+# ocp/patch_cluster_idms's per-spoke tasks), not target_kubeconfig (the hub).
 - name: Determine if this run is a minor version bump for this spoke
   ansible.builtin.set_fact:
     _spoke_is_minor_bump: >-
@@ -91,33 +93,84 @@
   changed_when: true
   when: _spoke_current_version.stdout | trim != (openshift_version ~ '.' ~ ocp_patch_version)
 
-- name: Apply ClusterCurator to trigger the upgrade
-  ansible.builtin.shell:
-    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ target_kubeconfig }} -f -"
-    stdin: "{{ lookup('template', 'cluster-curator.yaml.j2') }}"
-  changed_when: true
-  when: _spoke_current_version.stdout | trim != (openshift_version ~ '.' ~ ocp_patch_version)
-
-- name: Wait for the ClusterCurator upgrade job to start
+- name: Resolve the target release image's digest
   ansible.builtin.shell: >
-    {{ bin_dir }}/oc get clustercurator {{ ocp_cluster.name }} -n {{ ocp_cluster.name }}
-    --kubeconfig {{ target_kubeconfig }}
-    -o jsonpath='{.status.conditions[?(@.type=="clustercurator-job")].status}' 2>/dev/null || true
-  register: _curator_job_started
-  until: _curator_job_started.stdout != ""
-  retries: 12
-  delay: 15
+    {{ bin_dir }}/oc adm release info
+    quay.io/openshift-release-dev/ocp-release:{{ openshift_version }}.{{ ocp_patch_version }}-x86_64
+    --registry-config={{ working_dir }}/oc-mirror-workspace-update/containers/auth.json
+    --insecure=true
+    -o jsonpath='{.digest}'
+  register: _spoke_update_release_digest
   changed_when: false
   failed_when: false
   when: _spoke_current_version.stdout | trim != (openshift_version ~ '.' ~ ocp_patch_version)
 
-- name: Wait for the ClusterCurator upgrade job to complete
+- name: Set target release image reference (by digest when resolvable, else the tag)
+  ansible.builtin.set_fact:
+    _spoke_update_release_image: >-
+      {{
+        (_spoke_update_release_image_tag.split(':')[:-1] | join(':') ~ '@' ~ (_spoke_update_release_digest.stdout | trim))
+        if (_spoke_update_release_digest.stdout | default('') | trim != '')
+        else _spoke_update_release_image_tag
+      }}
+  vars:
+    _spoke_update_release_image_tag: "{{ quay_registry_url }}/{{ quay_mirror_org }}/openshift/release-images:{{ openshift_version }}.{{ ocp_patch_version }}-x86_64"
+  when: _spoke_current_version.stdout | trim != (openshift_version ~ '.' ~ ocp_patch_version)
+
+- name: Look for an oc-mirror release signature ConfigMap for this version
+  ansible.builtin.find:
+    paths: "{{ working_dir }}/oc-mirror-workspace-update/working-dir/cluster-resources"
+    patterns: "*signature*.yaml"
+    file_type: file
+  register: _spoke_signature_files
+  when: _spoke_current_version.stdout | trim != (openshift_version ~ '.' ~ ocp_patch_version)
+
+- name: Apply release signature ConfigMap(s) to the spoke if oc-mirror generated any
+  ansible.builtin.shell:
+    cmd: "{{ bin_dir }}/oc apply --kubeconfig {{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig -f {{ item.path }}"
+  loop: "{{ _spoke_signature_files.files | default([]) }}"
+  loop_control:
+    label: "{{ item.path }}"
+  changed_when: true
+  when: _spoke_signature_files.files | default([]) | length > 0
+
+# Same Red Hat-documented --force fallback as ocp/update_ocp_hub when no
+# signature ConfigMap exists for this release -- the image's provenance is
+# already established by the mirroring chain.
+- name: Trigger ClusterVersion update on the spoke to the mirrored release image
   ansible.builtin.shell: >
-    {{ bin_dir }}/oc get clustercurator {{ ocp_cluster.name }} -n {{ ocp_cluster.name }}
-    --kubeconfig {{ target_kubeconfig }}
-    -o jsonpath='{.status.conditions[?(@.type=="clustercurator-job")].status}'
-  register: _curator_job_done
-  until: _curator_job_done.stdout == "True"
+    {{ bin_dir }}/oc adm upgrade
+    --kubeconfig {{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig
+    --allow-explicit-upgrade
+    --to-image={{ _spoke_update_release_image }}
+    {{ '' if _spoke_signature_files.files | default([]) | length > 0 else '--force' }}
+  register: _spoke_upgrade_trigger
+  changed_when: true
+  when: _spoke_current_version.stdout | trim != (openshift_version ~ '.' ~ ocp_patch_version)
+
+# Same MCO-safe wait pattern as ocp/update_ocp_hub: wait for Progressing=True
+# (detection window) before waiting for completion, so a stale condition
+# can't pass the completion check immediately.
+- name: Wait for the spoke's ClusterVersion to begin Progressing (CVO detection window)
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get clusterversion version
+    --kubeconfig {{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig
+    -o jsonpath='{.status.conditions[?(@.type=="Progressing")].status}'
+  register: _spoke_cv_progressing_start
+  until: _spoke_cv_progressing_start.stdout == "True"
+  retries: "{{ update_ocp_spoke_detect_retries }}"
+  delay: "{{ update_ocp_spoke_detect_delay }}"
+  changed_when: false
+  failed_when: false
+  when: _spoke_current_version.stdout | trim != (openshift_version ~ '.' ~ ocp_patch_version)
+
+- name: Wait for the spoke's ClusterVersion update to complete (this can take 60+ minutes)
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get clusterversion version
+    --kubeconfig {{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig
+    -o jsonpath='{.status.history[0].state}={.status.desired.version}'
+  register: _spoke_cv_complete
+  until: _spoke_cv_complete.stdout == ("Completed=" ~ openshift_version ~ "." ~ ocp_patch_version)
   retries: "{{ update_ocp_spoke_poll_retries }}"
   delay: "{{ update_ocp_spoke_poll_delay }}"
   changed_when: false

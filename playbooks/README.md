@@ -17,7 +17,7 @@
 |---|---|---|
 | `provision-jumphost.yaml` | Jumphost provisioning only | N/A |
 | `hub-spoke-disconnected-setup.yaml` | Two-tier Hub+Spoke (Disconnected) | Spokes via ACM/Hive on AWS |
-| `disconnected-update.yaml` | Day 2 OpenShift + operator updates (Disconnected) | Hub direct, Spokes via ACM ClusterCurator |
+| `disconnected-update.yaml` | Day 2 OpenShift + operator updates (Disconnected) | Hub and Spokes both via direct ClusterVersion upgrade (each cluster's own kubeconfig) |
 
 ### Nutanix AHV Playbooks
 

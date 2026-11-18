@@ -56,16 +56,11 @@
 # (ClusterVersionOverridesSet from ocp/disable_telemetry, AdminAckRequired
 # for 4.21 Sigstore signatures on mirrored clusters, and
 # MissingUpgradeableAnnotation on cloud-credential for manual-mode/STS
-# clusters) and that nothing in this update path previously checked it --
-# a minor-version run would sail through preflight and fail later, mid-mirror
-# or mid-upgrade, with update_ocp_hub only avoiding it as an accidental side
-# effect of a --force flag added for an unrelated signature-verification
-# reason, and update_ocp_spoke's ClusterCurator having no force option at
-# all. Surfacing the CVO's own condition message here (rather than silently
-# working around each cause) is deliberate: AdminAckRequired and the
-# cloud-credential annotation exist specifically to require a human to read
-# release notes and act before a minor bump, and auto-acknowledging them
-# would defeat that.
+# clusters). update_ocp_hub and acm/update_ocp_spoke now handle all three
+# causes automatically (see the exclusion list below) before triggering the
+# actual upgrade -- this preflight check mainly exists so the CVO's own
+# condition message is surfaced immediately if some other, unhandled reason
+# is blocking Upgradeable.
 - name: "[Update] Get current and desired ClusterVersion for minor-bump detection"
   ansible.builtin.shell: >
     {{ bin_dir }}/oc get clusterversion version
@@ -104,9 +99,9 @@
 # know how to handle (future OCP releases may add unrelated admin-ack
 # gates). ocp/ack_release_signature_gate only acks the specific Sigstore key
 # pattern it can independently verify and hard-fails rather than silently
-# skipping an unmirrored signature, and the actual upgrade trigger
-# (update_ocp_hub's ClusterVersion wait / update_ocp_spoke's ClusterCurator
-# wait) will still eventually time out and fail if some other admin-ack
+# skipping an unmirrored signature, and the actual upgrade trigger (both
+# update_ocp_hub and acm/update_ocp_spoke now drive ClusterVersion directly
+# and wait on it) will still eventually time out and fail if some other admin-ack
 # reason is left blocking the CVO in-cluster -- but that failure now surfaces
 # much later (after mirror/catalog/operators have already run) than it would
 # at this preflight check. Automated at the user's explicit request, on the
