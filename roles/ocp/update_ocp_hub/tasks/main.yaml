@@ -12,10 +12,16 @@
 # (release image + its signature, if any, now live in Quay).
 # ==============================================================================
 
+# Confirmed live against the real Quay layout post-migrate_mirror: oc-mirror v2
+# pushes the release image under openshift/release-images, not
+# openshift-release-dev/ocp-release (the cluster's own idms-release-0-quay
+# IDMS maps quay.io/openshift-release-dev/ocp-release -> .../openshift/release-images;
+# the old path 404s with "repository not found"). Same fix applied to
+# acm/update_ocp_spoke's cluster-image-set.yaml.j2.
 - name: Set target release image tag reference
   ansible.builtin.set_fact:
     _hub_update_release_image_tag: >-
-      {{ quay_registry_url }}/{{ quay_mirror_org }}/openshift-release-dev/ocp-release:{{ openshift_version }}.{{ ocp_patch_version }}-x86_64
+      {{ quay_registry_url }}/{{ quay_mirror_org }}/openshift/release-images:{{ openshift_version }}.{{ ocp_patch_version }}-x86_64
 
 - name: Check if ClusterVersion already reports the target version
   ansible.builtin.shell: >
