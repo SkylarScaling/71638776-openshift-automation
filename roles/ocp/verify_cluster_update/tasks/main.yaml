@@ -77,9 +77,17 @@
     -o jsonpath='{.status.conditions[?(@.type=="Upgradeable")]}'
   register: _cv_upgradeable
   changed_when: false
+  # Confirmed live: inside a bare `when:` expression (not wrapped in {{ }}),
+  # Jinja parses the single-backslash '\1' as the octal escape \x01, not a
+  # regex backreference -- regex_replace then returns \x01 instead of the
+  # extracted minor, which never equals openshift_version, so this condition
+  # was silently always true (minor-bump detection fired on every preflight,
+  # patch-level or not). The same expression works correctly inside {{ }}
+  # (see ocp/update_ocp_hub and acm/update_ocp_spoke, unaffected) -- avoid
+  # the escaping pitfall entirely here with a split-based minor extraction.
   when:
     - verify_cluster_update_mode | default('preflight') == 'preflight'
-    - (_cv_current_for_minor_check.stdout | default('') | regex_replace('^(\d+\.\d+)\..*$', '\1')) != (openshift_version | string)
+    - (_cv_current_for_minor_check.stdout | default('') | split('.'))[:2] != (openshift_version | string).split('.')
 
 # ClusterVersionOverridesSet (insights-operator override),
 # MissingUpgradeableAnnotation (cloud-credential upgradeable-to annotation,
