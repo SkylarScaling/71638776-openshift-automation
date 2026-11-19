@@ -357,15 +357,13 @@
              'Connecting to these clusters',
              '==================================================================',
              'These clusters have no public route (network lockdown is on by',
-             'default) -- the only path in is through this jumphost, where this',
-             'playbook just ran.',
+             'default) -- the only path in is through this jumphost.',
              '',
              'CLI (run directly here, no extra setup):',
              '  oc --kubeconfig <Kubeconfig path above> get clusterversion',
              '',
              'Browser console access (from your own machine):',
-             '  1. Open a SOCKS proxy to this jumphost over the same SSH',
-             '     connection you used to reach it:',
+             '  1. Open a SOCKS proxy to this jumphost over SSH:',
              '       ssh -D 8080 -N ' ~ (jumphost_ssh_user | default('ec2-user')) ~ '@' ~ (
                jumphost_public_ip
                | default(_update_jumphost_public_ip_discovered.stdout | default('') | trim, true)
