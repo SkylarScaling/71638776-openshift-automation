@@ -176,6 +176,34 @@
   changed_when: false
   when: _spoke_current_version.stdout | trim != (openshift_version ~ '.' ~ ocp_patch_version)
 
+# ClusterVersion reporting "Completed" doesn't guarantee every node has
+# finished rolling through MCO yet -- confirmed live (postflight MCP-settle
+# check failed immediately after this point with master/worker both
+# False=True, i.e. still mid-rollout). ocp/update_ocp_hub already waits for
+# both MCPs to settle after its own ClusterVersion-complete wait; this spoke
+# rewrite (commit 88db1d7) missed copying that step across. Add it here too.
+- name: Wait for the spoke's master MachineConfigPool to settle after the update
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get mcp master
+    --kubeconfig {{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig
+    -o jsonpath='{.status.conditions[?(@.type=="Updated")].status}={.status.conditions[?(@.type=="Updating")].status}'
+  register: _spoke_master_mcp_settled
+  until: _spoke_master_mcp_settled.stdout == "True=False"
+  retries: "{{ update_ocp_spoke_mcp_settle_retries }}"
+  delay: "{{ update_ocp_spoke_mcp_settle_delay }}"
+  changed_when: false
+
+- name: Wait for the spoke's worker MachineConfigPool to settle after the update
+  ansible.builtin.shell: >
+    {{ bin_dir }}/oc get mcp worker
+    --kubeconfig {{ install_dir }}/{{ ocp_cluster.name }}/auth/kubeconfig
+    -o jsonpath='{.status.conditions[?(@.type=="Updated")].status}={.status.conditions[?(@.type=="Updating")].status}'
+  register: _spoke_worker_mcp_settled
+  until: _spoke_worker_mcp_settled.stdout == "True=False"
+  retries: "{{ update_ocp_spoke_mcp_settle_retries }}"
+  delay: "{{ update_ocp_spoke_mcp_settle_delay }}"
+  changed_when: false
+
 - name: Wait for the managed cluster to report the target version
   ansible.builtin.shell: >
     {{ bin_dir }}/oc get managedclusterinfo {{ ocp_cluster.name }} -n {{ ocp_cluster.name }}
