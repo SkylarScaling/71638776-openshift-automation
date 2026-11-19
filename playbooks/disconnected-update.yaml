@@ -306,12 +306,81 @@
   gather_facts: false
   tags: ['verify']
   tasks:
+    # Same best-effort IMDSv2 lookup as hub-spoke-disconnected-setup.yaml's
+    # own final summary -- jumphost_public_ip is only ever set by the
+    # separate provision-jumphost.yaml run, never inherited here.
+    - name: Discover this jumphost's own public IP via EC2 instance metadata (best-effort)
+      ansible.builtin.shell: |
+        TOKEN=$(curl -s -m 2 -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+        curl -s -m 2 -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4
+      register: _update_jumphost_public_ip_discovered
+      changed_when: false
+      failed_when: false
+      when: jumphost_public_ip is not defined
+
+    # Same per-cluster connection-info block as hub-spoke-disconnected-setup.yaml's
+    # final summary, so a Day 2 update ends with the same at-a-glance access
+    # info as the initial install.
+    - name: Build per-cluster connection info
+      ansible.builtin.set_fact:
+        _update_summary_lines: "{{ _update_summary_lines | default([]) + _entry }}"
+      vars:
+        _name: "{{ hostvars[item]['ocp_cluster']['name'] }}"
+        _role: >-
+          {%- if item in groups['hub_cluster'] -%}Hub
+          {%- else -%}Managed Cluster{%- endif -%}
+        _pwd: "{{ lookup('file', install_dir + '/' + _name + '/auth/kubeadmin-password') }}"
+        _entry:
+          - ""
+          - "{{ _role }}:  {{ _name }}"
+          - "  Console:    https://console-openshift-console.apps.{{ _name }}.{{ base_domain }}/"
+          - "  Username:   kubeadmin"
+          - "  Password:   {{ _pwd }}"
+          - "  Kubeconfig: {{ install_dir }}/{{ _name }}/auth/kubeconfig"
+      loop: >-
+        {{
+          groups['hub_cluster'] +
+          (groups['managed_clusters'] | default([]))
+        }}
+
     - name: Print update summary
       ansible.builtin.debug:
-        msg:
-          - "=================================================================="
-          - "Disconnected Update Complete"
-          - "=================================================================="
-          - "Target OpenShift version: {{ openshift_version }}.{{ ocp_patch_version }}"
-          - "Re-run with --tags verify,preflight at any time to re-check health."
-          - "=================================================================="
+        msg: >-
+          {{
+            ['==================================================================',
+             'Disconnected Update Complete',
+             '==================================================================',
+             'Target OpenShift version: ' ~ openshift_version ~ '.' ~ ocp_patch_version] +
+            _update_summary_lines +
+            ['',
+             '==================================================================',
+             'Connecting to these clusters',
+             '==================================================================',
+             'These clusters have no public route (network lockdown is on by',
+             'default) -- the only path in is through this jumphost, where this',
+             'playbook just ran.',
+             '',
+             'CLI (run directly here, no extra setup):',
+             '  oc --kubeconfig <Kubeconfig path above> get clusterversion',
+             '',
+             'Browser console access (from your own machine):',
+             '  1. Open a SOCKS proxy to this jumphost over the same SSH',
+             '     connection you used to reach it:',
+             '       ssh -D 8080 -N ' ~ (jumphost_ssh_user | default('ec2-user')) ~ '@' ~ (
+               jumphost_public_ip
+               | default(_update_jumphost_public_ip_discovered.stdout | default('') | trim, true)
+               | default('<this jumphost public IP -- not known this run, check your AWS console or how you originally reached it>', true)
+             ),
+             '  2. Point your browser at localhost:8080 as a SOCKS5 proxy with',
+             '     remote/proxy DNS resolution enabled (required -- the console',
+             '     hostnames only resolve inside this VPC). In Firefox:',
+             '     Settings > Network Settings > Manual proxy configuration >',
+             '     SOCKS Host localhost:8080, SOCKS v5, "Proxy DNS when using',
+             '     SOCKS v5" checked.',
+             '  3. Browse to the Console URLs above and log in with the',
+             '     listed kubeadmin credentials.',
+             '',
+             '==================================================================',
+             'Re-run with --tags verify,preflight at any time to re-check health.',
+             '==================================================================']
+          }}
